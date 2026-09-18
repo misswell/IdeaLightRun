@@ -1,0 +1,18 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="UserApplication" type="SpringBootApplicationConfigurationType" factoryName="Spring Boot" nameIsGenerated="true">
+    <module name="lightrun-demo" />
+    <option name="SPRING_BOOT_MAIN_CLASS" value="com.example.user.UserApplication" />
+    <option name="VM_PARAMETERS" value="-Xms256m -Xmx1024m -Dfile.encoding=UTF-8" />
+    <option name="PROGRAM_PARAMETERS" value="--spring.profiles.active=dev" />
+    <option name="WORKING_DIRECTORY" value="$MODULE_WORKING_DIR$" />
+    <option name="ALTERNATIVE_JRE_PATH_ENABLED" value="false" />
+    <option name="SHORTEN_COMMAND_LINE" value="NONE" />
+    <envs>
+      <env name="NACOS_ADDR" value="http://localhost:8848" />
+      <env name="DB_PASSWORD" value="super-secret" />
+    </envs>
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

@@ -1,0 +1,753 @@
+import SwiftUI
+import AppKit
+import IdeaLightRunCore
+
+/// §66: 退出时默认 Stop services and quit。
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let store = AppStore.current else { return .terminateNow }
+        let running = store.sessions.values.filter { !$0.state.isTerminal }
+        for model in running {
+            model.session?.stop()
+        }
+        // 最多等 2 秒优雅退出，剩余强杀
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            let stillRunning = running.contains(where: { model in !model.state.isTerminal })
+            if !stillRunning { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        for model in running where !model.state.isTerminal {
+            model.session?.forceKill()
+        }
+        return .terminateNow
+    }
+}
+
+@main
+struct IdeaLightRunApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    var body: some Scene {
+        WindowGroup("IdeaLightRun") {
+            RootView()
+        }
+        .windowToolbarStyle(.unified)
+    }
+}
+
+struct RootView: View {
+    @StateObject private var store = AppStore()
+    @State private var showImporter = false
+
+    var body: some View {
+        NavigationSplitView {
+            SidebarView(store: store, showImporter: $showImporter)
+        } content: {
+            ConfigurationListView(store: store)
+        } detail: {
+            ConfigurationDetailView(store: store)
+        }
+        .frame(minWidth: 1000, minHeight: 620)
+        .fileImporter(
+            isPresented: $showImporter,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                store.addProject(url: url)
+            }
+        }
+        .alert(
+            "IdeaLightRun",
+            isPresented: Binding(
+                get: { store.alertMessage != nil },
+                set: { if !$0 { store.alertMessage = nil } }
+            )
+        ) {
+            Button("好", role: .cancel) {}
+        } message: {
+            Text(store.alertMessage ?? "")
+        }
+    }
+}
+
+// MARK: - 侧栏：项目列表（§50 第一栏）
+
+struct SidebarView: View {
+    @ObservedObject var store: AppStore
+    @Binding var showImporter: Bool
+
+    var body: some View {
+        List(selection: $store.selectedProjectID) {
+            Section("项目") {
+                ForEach(store.projects) { project in
+                    HStack(spacing: 8) {
+                        Image(systemName: "folder")
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(project.name)
+                                .lineLimit(1)
+                            subtitle(for: project)
+                        }
+                    }
+                    .tag(project.id)
+                    .contextMenu {
+                        Button("重新扫描") { store.rescan(entryID: project.id) }
+                        Divider()
+                        Button("移除", role: .destructive) { store.removeProject(id: project.id) }
+                    }
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom) {
+            HStack {
+                Spacer()
+                Button {
+                    showImporter = true
+                } label: {
+                    Label("添加项目", systemImage: "plus")
+                }
+                .buttonStyle(.bordered)
+                Spacer()
+            }
+            .padding(.vertical, 8)
+            .background(.bar)
+        }
+        .overlay {
+            if store.projects.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "square.and.arrow.down.on.square")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.secondary)
+                    Text("拖入项目文件夹，或点击下方“添加项目”")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first else { return false }
+            store.addProject(url: url)
+            return true
+        }
+    }
+
+    @ViewBuilder
+    private func subtitle(for project: ProjectEntry) -> some View {
+        if project.isScanning {
+            Text("扫描中…").font(.caption2)
+        } else if let count = project.result?.configurations.count {
+            Text("\(count) 个配置").font(.caption2)
+        } else if project.errorText != nil {
+            Text("扫描失败").font(.caption2).foregroundStyle(.red)
+        } else {
+            Text("待扫描").font(.caption2)
+        }
+    }
+}
+
+// MARK: - 中栏：配置列表（§50/§51）
+
+struct ConfigurationListView: View {
+    @ObservedObject var store: AppStore
+
+    var body: some View {
+        Group {
+            if let project = store.selectedProject {
+                VStack(spacing: 0) {
+                    ProjectSummaryView(project: project)
+                    Divider()
+                    configList(project: project)
+                }
+                .toolbar {
+                    ToolbarItemGroup {
+                        Button {
+                            store.rescan(entryID: project.id)
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .help("重新扫描")
+                        .disabled(project.isScanning)
+
+                        Button {
+                            NSWorkspace.shared.open(project.url)
+                        } label: {
+                            Image(systemName: "folder.badge.gearshape")
+                        }
+                        .help("在 Finder 中显示项目")
+
+                        Button(role: .destructive) {
+                            store.removeProject(id: project.id)
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .help("移除项目")
+                    }
+                }
+            } else {
+                Text("选择一个项目")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func configList(project: ProjectEntry) -> some View {
+        if let result = project.result {
+            if result.configurations.isEmpty {
+                emptyState(icon: "tray", text: "未发现 Run Configuration")
+            } else {
+                List(selection: $store.selectedConfigurationKey) {
+                    ForEach(result.configurations) { config in
+                        ConfigurationRow(
+                            config: config,
+                            runtimeState: store.sessions[config.uniqueKey]?.state
+                        )
+                        .tag(config.uniqueKey)
+                    }
+                }
+                .listStyle(.inset(alternatesRowBackgrounds: true))
+                .contextMenu(forSelectionType: String.self) { keys in
+                    if let key = keys.first {
+                        Button("运行 ▶") { store.run(configKey: key) }
+                        Button("重启 ↻") { store.restart(configKey: key) }
+                        Button("停止 ■", role: .destructive) { store.stop(configKey: key) }
+                    }
+                } primaryAction: { keys in
+                    if let key = keys.first {
+                        store.selectedConfigurationKey = key
+                    }
+                }
+            }
+        } else if project.isScanning {
+            VStack(spacing: 10) {
+                ProgressView()
+                Text("扫描中…").foregroundStyle(.secondary)
+            }
+        } else if let error = project.errorText {
+            emptyState(icon: "exclamationmark.triangle", text: error)
+        } else {
+            emptyState(icon: "tray", text: "待扫描")
+        }
+    }
+
+    private func emptyState(icon: String, text: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 32))
+                .foregroundStyle(.secondary)
+            Text(text)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+struct ProjectSummaryView: View {
+    let project: ProjectEntry
+
+    var body: some View {
+        HStack(spacing: 14) {
+            chip(icon: "wrench.and.screwdriver", text: buildSystemText)
+            if let jdk = project.projectJDK?.installation {
+                chip(icon: "cpu", text: "JDK \(jdk.majorVersion.map(String.init) ?? "?") · \(jdk.displayName ?? jdk.home.lastPathComponent)")
+            }
+            if let result = project.result {
+                chip(icon: "square.stack.3d.up", text: "\(result.modules.count) 模块")
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+    }
+
+    private var buildSystemText: String {
+        guard let result = project.result else { return "…" }
+        var parts: [String] = []
+        if result.buildSystem.maven != nil { parts.append("Maven") }
+        if result.buildSystem.gradle != nil { parts.append("Gradle") }
+        return parts.isEmpty ? "未知构建系统" : parts.joined(separator: " + ")
+    }
+
+    private func chip(icon: String, text: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .foregroundStyle(.secondary)
+            Text(text)
+                .font(.callout)
+                .lineLimit(1)
+        }
+    }
+}
+
+struct ConfigurationRow: View {
+    let config: RunConfiguration
+    let runtimeState: ProcessState?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 8, height: 8)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(config.name)
+                    .fontWeight(.medium)
+                    .lineLimit(1)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Text(statusLabel)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(statusColor)
+        }
+        .padding(.vertical, 3)
+    }
+
+    private var subtitle: String {
+        var parts: [String] = [config.type.displayName]
+        if let mainClass = config.mainClass {
+            parts.append(mainClass)
+        } else if !config.compoundMembers.isEmpty {
+            parts.append(config.compoundMembers.map(\.name).joined(separator: ", "))
+        }
+        if !config.springProfiles.isEmpty {
+            parts.append(config.springProfiles.joined(separator: ","))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var statusLabel: String {
+        if let runtimeState {
+            return runtimeState.displayText
+        }
+        switch config.readiness {
+        case .ready: return "READY"
+        case .warning: return "WARNING"
+        case .planned: return "PLANNED"
+        case .unsupported: return "UNSUPPORTED"
+        }
+    }
+
+    /// §51: 状态颜色克制。
+    private var statusColor: Color {
+        if let runtimeState {
+            switch runtimeState {
+            case .running: return .green
+            case .building, .resolvingClasspath, .preparing, .starting: return .orange
+            case .stopping: return .yellow
+            case .failed: return .red
+            case .exited: return .secondary
+            }
+        }
+        switch config.readiness {
+        case .ready: return .green
+        case .warning: return .orange
+        case .planned: return .blue
+        case .unsupported: return .secondary
+        }
+    }
+}
+
+// MARK: - 右栏：详情 + 运行操作 + 控制台
+
+struct ConfigurationDetailView: View {
+    @ObservedObject var store: AppStore
+    @State private var revealSecrets = false
+    @State private var resolvedJDK: JDKResolution?
+    @State private var resolvedModuleDirectory: URL?
+    @State private var resolvedWorkDir: String?
+    @State private var detailTab: DetailTab = .info
+
+    enum DetailTab: String, CaseIterable {
+        case info = "信息"
+        case console = "控制台"
+    }
+
+    var body: some View {
+        Group {
+            if let config = store.selectedConfiguration,
+               let project = store.selectedProject,
+               let result = project.result {
+                VStack(spacing: 0) {
+                    header(config: config, project: project, result: result)
+                    Divider()
+                    if detailTab == .console, let model = store.sessions[config.uniqueKey] {
+                        LogConsoleView(model: model)
+                    } else {
+                        infoDetail(config: config, result: result)
+                    }
+                }
+                .task(id: config.uniqueKey) {
+                    revealSecrets = false
+                    await resolveDetails(config: config, result: result)
+                }
+            } else {
+                VStack(spacing: 10) {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.secondary)
+                    Text("选择一个配置查看详情")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    // MARK: 顶栏：操作按钮（§52）
+
+    private func header(config: RunConfiguration, project: ProjectEntry, result: ScanResult) -> some View {
+        let model = store.sessions[config.uniqueKey]
+        let launchable = (config.type == .application || config.type == .springBoot) && result.buildSystem.maven != nil
+
+        return HStack(spacing: 10) {
+            Text(config.name)
+                .font(.title3.weight(.semibold))
+            Text(config.type.displayName)
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button {
+                store.run(configKey: config.uniqueKey)
+                detailTab = .console
+            } label: {
+                Label("Run", systemImage: "play.fill")
+            }
+            .keyboardShortcut("r", modifiers: .command)
+            .help(launchable ? "编译并启动" : "仅支持 Maven 的 Application / Spring Boot 配置")
+            .disabled(!launchable || model?.isBuilding == true || model?.isRunning == true)
+
+            Button {
+                store.stop(configKey: config.uniqueKey)
+            } label: {
+                Label("Stop", systemImage: "stop.fill")
+            }
+            .keyboardShortcut(".", modifiers: .command)
+            .help("发送 SIGTERM")
+            .disabled(model?.isRunning != true)
+
+            if model?.state == .stopping {
+                Button(role: .destructive) {
+                    store.forceKill(configKey: config.uniqueKey)
+                } label: {
+                    Label("Force Kill", systemImage: "xmark.octagon.fill")
+                }
+                .help("强制结束（SIGKILL）")
+            }
+
+            Button {
+                store.restart(configKey: config.uniqueKey)
+                detailTab = .console
+            } label: {
+                Label("Restart", systemImage: "arrow.triangle.2.circlepath")
+            }
+            .keyboardShortcut("r", modifiers: [.command, .shift])
+            .help("停止旧进程后重新编译启动")
+            .disabled(model == nil || model?.isBuilding == true)
+
+            Spacer()
+
+            Picker("", selection: $detailTab) {
+                ForEach(DetailTab.allCases, id: \.self) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 150)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    // MARK: 信息页
+
+    private func infoDetail(config: RunConfiguration, result: ScanResult) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                if let model = store.sessions[config.uniqueKey] {
+                    runtimeBanner(model: model)
+                }
+
+                section("运行信息") {
+                    keyRow("Main Class", config.mainClass, monospaced: true)
+                    keyRow("Module", config.moduleName)
+                    if let directory = resolvedModuleDirectory {
+                        keyRow("Module 目录", directory.path, monospaced: true)
+                    }
+                    keyRow("JDK", jdkText)
+                    keyRow("VM Options", config.vmOptions, monospaced: true)
+                    keyRow("Program Arguments", config.programArguments, monospaced: true)
+                    if !config.springProfiles.isEmpty {
+                        keyRow("Spring Profiles", config.springProfiles.joined(separator: ", "))
+                    }
+                    keyRow("Working Directory", resolvedWorkDir ?? config.workingDirectory, monospaced: true)
+                }
+
+                if !config.compoundMembers.isEmpty {
+                    section("Compound 成员") {
+                        ForEach(config.compoundMembers, id: \.self) { member in
+                            HStack(spacing: 6) {
+                                Image(systemName: "rectangle.stack")
+                                    .foregroundStyle(.secondary)
+                                Text(member.name)
+                            }
+                        }
+                    }
+                }
+
+                if !config.environmentVariables.isEmpty {
+                    section("环境变量") {
+                        HStack {
+                            Text("默认隐藏取值（§28）")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Toggle("显示明文", isOn: $revealSecrets)
+                                .toggleStyle(.checkbox)
+                                .font(.caption)
+                        }
+                        ForEach(config.environmentVariables.keys.sorted(), id: \.self) { key in
+                            HStack(alignment: .top) {
+                                Text(key)
+                                    .font(.system(.callout, design: .monospaced))
+                                    .frame(width: 200, alignment: .leading)
+                                Text(revealSecrets ? (config.environmentVariables[key] ?? "") : "••••••••")
+                                    .font(.system(.callout, design: .monospaced))
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    }
+                }
+
+                if !config.beforeLaunchTasks.isEmpty {
+                    section("Before Launch") {
+                        ForEach(config.beforeLaunchTasks, id: \.self) { task in
+                            HStack(spacing: 6) {
+                                Image(systemName: task.isEnabled ? "checkmark.circle" : "minus.circle")
+                                    .foregroundStyle(.secondary)
+                                Text(task.displayName)
+                            }
+                        }
+                    }
+                }
+
+                if !config.warnings.isEmpty {
+                    section("警告") {
+                        ForEach(config.warnings, id: \.self) { warning in
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: "exclamationmark.triangle")
+                                    .foregroundStyle(.yellow)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(warning.title).fontWeight(.medium)
+                                    Text(warning.detail).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                section("来源") {
+                    keyRow("配置来源", config.source.kind.displayName)
+                    keyRow("文件", config.source.file.path, monospaced: true)
+                    if let modified = config.source.modifiedAt {
+                        keyRow("修改时间", modified.formatted(date: .abbreviated, time: .shortened))
+                    }
+                }
+            }
+            .padding(22)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func runtimeBanner(model: RunningProcessModel) -> some View {
+        HStack(spacing: 10) {
+            if model.isBuilding {
+                ProgressView()
+                    .controlSize(.small)
+            }
+            Text(model.state.displayText)
+                .font(.callout.weight(.medium))
+            if let pid = model.pid {
+                Text("PID \(pid)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("清空日志") {
+                model.clearLogs()
+            }
+            .controlSize(.small)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+    }
+
+    private var jdkText: String? {
+        guard let jdk = resolvedJDK else { return nil }
+        guard let installation = jdk.installation else {
+            return jdk.warnings.first?.detail
+        }
+        let version = installation.majorVersion.map(String.init) ?? "?"
+        let origin: String
+        switch jdk.origin {
+        case .runConfigurationSpecified: origin = "Run Configuration 指定"
+        case .projectSDK: origin = "IDEA 项目 SDK"
+        case .javaHome: origin = "JAVA_HOME"
+        case .systemInstalled: origin = "系统默认"
+        case .notResolved: origin = "未解析"
+        }
+        return "\(installation.displayName ?? installation.home.lastPathComponent) (major \(version)) — \(origin)"
+    }
+
+    /// §100: JDK/宏/模块解析不进主线程。
+    private func resolveDetails(config: RunConfiguration, result: ScanResult) async {
+        resolvedJDK = nil
+        resolvedModuleDirectory = nil
+        resolvedWorkDir = nil
+
+        let configJDKName = config.jreReference
+        let projectJDKName = result.projectJDKName
+        let moduleName = config.moduleName
+        let mainClass = config.mainClass
+        let projectRoot = result.projectRoot
+        let knownModules = result.modules
+        let rawWorkDir = config.workingDirectory
+
+        let (jdk, moduleDir, workDir) = await Task.detached(priority: .userInitiated) { () -> (JDKResolution, URL?, String?) in
+            let resolution = ModuleResolver.resolveModule(
+                named: moduleName,
+                mainClass: mainClass,
+                projectRoot: projectRoot,
+                knownModules: knownModules
+            )
+            let jdk = JDKResolver().resolve(configJDKName: configJDKName, projectJDKName: projectJDKName)
+            let workDir = rawWorkDir.map {
+                MacroResolver(projectDir: projectRoot, moduleDir: resolution.module?.directory).resolve($0).value
+            }
+            return (jdk, resolution.module?.directory, workDir)
+        }.value
+
+        resolvedJDK = jdk
+        resolvedModuleDirectory = moduleDir
+        resolvedWorkDir = workDir
+    }
+
+    // MARK: - 布局小件
+
+    private func section(_ title: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.headline)
+            content()
+        }
+    }
+
+    @ViewBuilder
+    private func keyRow(_ title: String, _ value: String?, monospaced: Bool = false) -> some View {
+        if let value, !value.isEmpty {
+            HStack(alignment: .top) {
+                Text(title)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 150, alignment: .trailing)
+                Text(value)
+                    .font(monospaced ? .system(.callout, design: .monospaced) : .callout)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+}
+
+// MARK: - 控制台（§38: NSTextView，不用 SwiftUI List 渲染日志）
+
+struct LogConsoleView: NSViewRepresentable {
+    @ObservedObject var model: RunningProcessModel
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let textView = NSTextView()
+        textView.isEditable = false
+        textView.isRichText = false
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.textContainer?.widthTracksTextView = true
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.backgroundColor = NSColor.textBackgroundColor
+        textView.autoresizingMask = [.width]
+
+        let scrollView = NSScrollView()
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        let coordinator = context.coordinator
+
+        if coordinator.generation != model.clearGeneration {
+            coordinator.generation = model.clearGeneration
+            coordinator.renderedCount = 0
+            textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
+        }
+
+        let totalCount = model.lines.count
+        guard coordinator.renderedCount < totalCount else { return }
+        let newLines = model.lines[coordinator.renderedCount...]
+        coordinator.renderedCount = totalCount
+
+        let attributed = NSMutableAttributedString()
+        for line in newLines {
+            attributed.append(Self.attributed(line))
+        }
+        if let storage = textView.textStorage {
+            storage.append(attributed)
+            // TextStorage 自身也设上限，防止无限膨胀
+            let maxCharacters = 2_000_000
+            if storage.length > maxCharacters {
+                storage.deleteCharacters(in: NSRange(location: 0, length: storage.length - maxCharacters))
+            }
+        }
+        textView.needsDisplay = true
+        if coordinator.follow {
+            textView.scrollToEndOfDocument(nil)
+        }
+    }
+
+    private static func attributed(_ line: LogLine) -> NSAttributedString {
+        let color: NSColor
+        switch line.stream {
+        case .stdout: color = .textColor
+        case .stderr: color = .systemRed
+        case .system: color = .secondaryLabelColor
+        }
+        let timeText = line.timestamp.formatted(date: .omitted, time: .standard)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 1
+        return NSAttributedString(
+            string: "\(timeText) \(line.text)\n",
+            attributes: [
+                .foregroundColor: color,
+                .paragraphStyle: paragraph,
+            ]
+        )
+    }
+
+    final class Coordinator {
+        var renderedCount = 0
+        var generation = 0
+        var follow = true
+    }
+}

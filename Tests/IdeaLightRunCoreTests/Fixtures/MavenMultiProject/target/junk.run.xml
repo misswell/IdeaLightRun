@@ -1,0 +1,5 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Junk" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.example.junk.Junk" />
+  </configuration>
+</component>

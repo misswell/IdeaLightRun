@@ -1,0 +1,11 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="AppApplication" type="SpringBootApplicationConfigurationType" factoryName="Spring Boot">
+    <module name="app" />
+    <option name="SPRING_BOOT_MAIN_CLASS" value="com.example.app.AppApplication" />
+    <option name="ACTIVE_PROFILES" value="local" />
+    <option name="PROGRAM_PARAMETERS" value="--spring.profiles.active=dev" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

@@ -1,0 +1,6 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Backend All" type="CompoundRunConfigurationType" factoryName="Compound">
+    <toRun name="GatewayApplication" type="SpringBootApplicationConfigurationType" />
+    <toRun name="UserApplication" type="SpringBootApplicationConfigurationType" />
+  </configuration>
+</component>

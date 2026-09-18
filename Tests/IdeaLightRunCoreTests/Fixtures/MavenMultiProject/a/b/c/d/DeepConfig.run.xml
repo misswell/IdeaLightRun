@@ -1,0 +1,6 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="DeepConfig" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.example.deep.Deep" />
+    <module name="gateway" />
+  </configuration>
+</component>

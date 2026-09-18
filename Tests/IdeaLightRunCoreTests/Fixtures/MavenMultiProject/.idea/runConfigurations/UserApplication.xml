@@ -1,0 +1,15 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="UserApplication" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.example.user.UserApplication" />
+    <module name="user-service" />
+    <option name="VM_PARAMETERS" value="-Dname=&quot;hello world&quot;" />
+    <option name="PROGRAM_PARAMETERS" value="--server.port=8081" />
+    <option name="WORKING_DIRECTORY" value="$MODULE_DIR$" />
+    <envs>
+      <env name="PASSWORD" value="abc xyz" />
+    </envs>
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

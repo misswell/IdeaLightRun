@@ -1,0 +1,16 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="GatewayApplication" type="SpringBootApplicationConfigurationType" factoryName="Spring Boot">
+    <module name="gateway" />
+    <option name="MAIN_CLASS_NAME" value="com.example.gateway.GatewayApplication" />
+    <option name="VM_PARAMETERS" value="-Xms256m -Xmx1024m" />
+    <option name="PROGRAM_PARAMETERS" value="--spring.profiles.active=dev" />
+    <option name="ACTIVE_PROFILES" value="dev" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/gateway" />
+    <envs>
+      <env name="NACOS_ADDR" value="http://nacos.local:8848" />
+    </envs>
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

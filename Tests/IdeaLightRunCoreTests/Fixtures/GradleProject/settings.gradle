@@ -1,0 +1,3 @@
+rootProject.name = 'gradle-demo'
+include 'app'
+include 'library:util'
