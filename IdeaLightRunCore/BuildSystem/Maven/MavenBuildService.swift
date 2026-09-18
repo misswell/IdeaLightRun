@@ -19,11 +19,20 @@ public struct MavenBuildService: BuildSystemAdapter {
     public let projectRoot: URL
     public let mavenExecutable: URL
     public let environment: [String: String]
+    /// 默认 -nsu：跳过 SNAPSHOT 远程更新检查，优先用 ~/.m2 已有依赖（IDEA 下载过的即命中）。
+    /// 与 IDEA 点 Run 的行为一致；本地缺失的依赖仍会正常首次下载。
+    public let noSnapshotUpdates: Bool
 
-    public init(projectRoot: URL, mavenExecutable: URL, environment: [String: String]) {
+    public init(
+        projectRoot: URL,
+        mavenExecutable: URL,
+        environment: [String: String],
+        noSnapshotUpdates: Bool = true
+    ) {
         self.projectRoot = projectRoot
         self.mavenExecutable = mavenExecutable
         self.environment = environment
+        self.noSnapshotUpdates = noSnapshotUpdates
     }
 
     /// §15: 项目自带 Wrapper 优先，其次 PATH 中的 mvn。
@@ -106,11 +115,15 @@ public struct MavenBuildService: BuildSystemAdapter {
     }
 
     private func mavenArguments(base: [String]) -> [String] {
-        if mavenExecutable.lastPathComponent == "mvnw" {
-            return base
+        var arguments = base
+        if noSnapshotUpdates {
+            arguments.insert("-nsu", at: 0)
         }
-        // 系统 mvn：加 batch 模式减少噪音
-        return ["-B"] + base
+        if mavenExecutable.lastPathComponent != "mvnw" {
+            // 系统 mvn：batch 模式减少进度条噪音
+            arguments.insert("-B", at: 0)
+        }
+        return arguments
     }
 
     /// 同步执行 Maven，stdout/stderr 逐行回调（可能来自后台线程）。

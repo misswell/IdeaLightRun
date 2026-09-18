@@ -62,6 +62,7 @@ swift test    # 含真实 Maven 多模块 classpath 集成测试（无 mvn 自�
 - XML 宽松解析：未知字段进 `rawOptions`，未知类型标记 `unknown` 并显示为 Unsupported（§78）。
 - `$Prompt$` 等 IDEA 上下文宏不伪造，产生 warning（§11）。
 - Java 启动使用 Process.arguments 数组传参，绝不走 `/bin/sh -c`（§27）。
+- Maven 默认加 `-nsu`：跳过 SNAPSHOT 远程更新检查，优先使用 `~/.m2` 已有依赖（与 IDEA 点 Run 的行为一致）；本地缺失的依赖仍会正常首次下载。需要强制拉取最新快照时，在 IDEA/Maven 里更新一次即可。
 - reactor 依赖解析为 `target/classes` 而非 SNAPSHOT jar，重启即用最新代码（§92/§93）。
 - 不依赖 IDEA 安装目录，只读项目内配置（§113）。
 - 100% 本地，无网络，无后台常驻（§64）。
