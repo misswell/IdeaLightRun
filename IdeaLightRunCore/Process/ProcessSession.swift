@@ -39,10 +39,14 @@ public final class ProcessSession {
 
         let process = Process()
         process.executableURL = plan.javaExecutable
-        // §27: 参数逐项传递
-        process.arguments = plan.vmArguments
-            + ["-cp", plan.classpath.joined(separator: ":"), plan.mainClass]
-            + plan.programArguments
+        // §27: 参数逐项传递。mainClass 为空视为非 Java 启动（测试/工具进程）。
+        if plan.mainClass.isEmpty {
+            process.arguments = plan.vmArguments + plan.programArguments
+        } else {
+            process.arguments = plan.vmArguments
+                + ["-cp", plan.classpath.joined(separator: ":"), plan.mainClass]
+                + plan.programArguments
+        }
         process.environment = plan.environment
         process.currentDirectoryURL = plan.workingDirectory
         process.standardInput = Pipe()

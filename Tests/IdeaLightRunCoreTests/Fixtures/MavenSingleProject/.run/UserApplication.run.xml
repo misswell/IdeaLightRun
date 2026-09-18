@@ -1,6 +1,6 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="UserApplication" type="SpringBootApplicationConfigurationType" factoryName="Spring Boot" nameIsGenerated="true">
-    <module name="lightrun-demo" />
+    <module name="idealightrun-demo" />
     <option name="SPRING_BOOT_MAIN_CLASS" value="com.example.user.UserApplication" />
     <option name="VM_PARAMETERS" value="-Xms256m -Xmx1024m -Dfile.encoding=UTF-8" />
     <option name="PROGRAM_PARAMETERS" value="--spring.profiles.active=dev" />

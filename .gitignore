@@ -4,3 +4,7 @@ build/
 *.xcodeproj
 *.xcuserdata
 DerivedData/
+
+# Java 编译产物
+*.class
+target/classes/

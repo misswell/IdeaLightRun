@@ -79,9 +79,9 @@ final class ClasspathCacheTests: XCTestCase {
 
         let normalized = MavenClasspathResolver.normalize(entries: entries, reactor: reactor, targetModuleDirectory: userDir)
 
-        XCTAssertEqual(normalized.first, userDir.appendingPathComponent("target/classes").path, "目标模块自身 classes 在最前")
-        XCTAssertTrue(normalized.contains(commonDir.appendingPathComponent("target/classes").path), "common 的 SNAPSHOT jar 应替换为 target/classes")
+        XCTAssertEqual(normalized.first, MavenClasspathResolver.canonicalPath(userDir.appendingPathComponent("target/classes").path), "目标模块自身 classes 在最前")
+        XCTAssertTrue(normalized.contains(MavenClasspathResolver.canonicalPath(commonDir.appendingPathComponent("target/classes").path)), "common 的 SNAPSHOT jar 应替换为 target/classes")
         XCTAssertFalse(normalized.contains { $0.hasSuffix("common-1.0.0-SNAPSHOT.jar") }, "不应保留 reactor SNAPSHOT jar")
-        XCTAssertTrue(normalized.contains(entries[0]), "外部依赖 jar 保留")
+        XCTAssertTrue(normalized.contains(MavenClasspathResolver.canonicalPath(entries[0])), "外部依赖 jar 保留")
     }
 }

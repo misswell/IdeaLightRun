@@ -90,9 +90,7 @@ public struct MavenBuildService: BuildSystemAdapter {
             .split(separator: ":")
             .map(String.init)
             .filter { !$0.isEmpty }
-        guard !entries.isEmpty else {
-            throw IdeaLightRunError.classpathResolveFailed(detail: "Maven 输出的 classpath 为空。")
-        }
+        // 无外部依赖时 Maven 输出空文件，classpath 仅剩 target/classes，属正常情况。
         return entries
     }
 

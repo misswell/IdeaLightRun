@@ -13,6 +13,7 @@ final class MavenClasspathIntegrationTests: XCTestCase {
         }
         tempProject = FileManager.default.temporaryDirectory
             .appendingPathComponent("lr-it-\(UUID().uuidString)", isDirectory: true)
+            .resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: tempProject, withIntermediateDirectories: true)
         try makeProject()
     }

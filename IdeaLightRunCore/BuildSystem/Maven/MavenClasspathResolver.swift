@@ -3,6 +3,11 @@ import Foundation
 /// §18: classpath 归一化——reactor 内部依赖转 target/classes，
 /// 不长期依赖 common-1.0-SNAPSHOT.jar，保证重启即用最新编译代码（§92/§93）。
 public enum MavenClasspathResolver {
+    /// 解析符号链接（/tmp → /private/tmp 等），保证路径比较一致。
+    static func canonicalPath(_ path: String) -> String {
+        URL(fileURLWithPath: path, isDirectory: true).resolvingSymlinksInPath().path
+    }
+
     public static func normalize(
         entries: [String],
         reactor: [MavenModuleInfo],
@@ -10,8 +15,9 @@ public enum MavenClasspathResolver {
     ) -> [String] {
         var result: [String] = []
         func push(_ path: String) {
-            if !result.contains(path) {
-                result.append(path)
+            let canonical = canonicalPath(path)
+            if !result.contains(canonical) {
+                result.append(canonical)
             }
         }
 

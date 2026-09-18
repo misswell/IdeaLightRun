@@ -9,7 +9,7 @@
     </configuration>
     <configuration name="ToolApplication" type="Application" factoryName="Application">
       <option name="MAIN_CLASS_NAME" value="com.example.tool.ToolApplication" />
-      <module name="lightrun-demo" />
+      <module name="idealightrun-demo" />
       <option name="VM_PARAMETERS" value="-Dname=&quot;hello world&quot;" />
       <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
       <method v="2">

@@ -63,7 +63,7 @@ final class LaunchPlanBuilderTests: XCTestCase {
         let plan = try LaunchPlanBuilder.build(
             config: config,
             projectRoot: projectRoot,
-            moduleDirectory: nil,
+            moduleDirectory: projectRoot.appendingPathComponent("gateway", isDirectory: true),
             classpath: ["/tmp/a.jar"],
             jdk: makeJDK()
         )
@@ -78,7 +78,7 @@ final class LaunchPlanBuilderTests: XCTestCase {
         XCTAssertThrowsError(try LaunchPlanBuilder.build(
             config: config,
             projectRoot: projectRoot,
-            moduleDirectory: nil,
+            moduleDirectory: projectRoot.appendingPathComponent("gateway", isDirectory: true),
             classpath: ["/tmp/a.jar"],
             jdk: makeJDK()
         )) { error in
@@ -92,10 +92,11 @@ final class LaunchPlanBuilderTests: XCTestCase {
         let plan = try LaunchPlanBuilder.build(
             config: makeConfig(),
             projectRoot: projectRoot,
-            moduleDirectory: nil,
+            moduleDirectory: projectRoot.appendingPathComponent("gateway", isDirectory: true),
             classpath: ["/tmp/a.jar", "/tmp/b c.jar"],
             jdk: makeJDK()
         )
-        XCTAssertTrue(plan.displayCommand().contains("\"/tmp/b c.jar\""))
+        // displayCommand 对整个 -cp 值加引号（它是一个参数）
+        XCTAssertTrue(plan.displayCommand().contains("\"/tmp/a.jar:/tmp/b c.jar\""))
     }
 }
