@@ -16,9 +16,15 @@ final class RunningProcessModel: ObservableObject, Identifiable {
     @Published var lines: [LogLine] = []
     @Published var clearGeneration = 0
 
+    /// 构建期（classpath 解析/编译）进程句柄，Stop 用它终止 Maven。
+    var buildHandle: ProcessHandle?
+
     var pendingRestart = false
     var onRestartNeeded: (() -> Void)?
     private(set) var session: ProcessSession?
+
+    /// lines[0] 对应的绝对行号（配合环形截断，供控制台增量渲染）。
+    private(set) var firstLineIndex = 0
 
     init(configKey: String, configName: String, projectPath: String) {
         self.configKey = configKey
@@ -36,19 +42,31 @@ final class RunningProcessModel: ObservableObject, Identifiable {
         }
     }
 
+    var isActiveBuildPhase: Bool { isBuilding }
+
     var isRunning: Bool { state == .running }
 
+    static let maxViewLines = 20_000
+
     func appendLog(_ line: LogLine) {
-        lines.append(line)
+        appendLog([line])
     }
 
     func appendLog(_ batch: [LogLine]) {
+        guard !batch.isEmpty else { return }
         lines.append(contentsOf: batch)
+        // 内存上限与 LogRingBuffer 对齐（§37）
+        if lines.count > Self.maxViewLines {
+            let drop = lines.count - Self.maxViewLines
+            lines.removeFirst(drop)
+            firstLineIndex += drop
+        }
     }
 
     func clearLogs() {
         logBuffer.clear()
         lines = []
+        firstLineIndex = 0
         clearGeneration += 1
     }
 

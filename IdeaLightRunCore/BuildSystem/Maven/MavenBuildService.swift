@@ -2,10 +2,16 @@ import Foundation
 
 /// §14: BuildSystemAdapter 协议。Gradle 实现在 Milestone 4。
 public protocol BuildSystemAdapter {
-    func compile(reactorModuleName: String?, hasModules: Bool, log: @escaping LogCallback) throws
+    func compile(
+        reactorModuleName: String?,
+        hasModules: Bool,
+        handle: ProcessHandle?,
+        log: @escaping LogCallback
+    ) throws
     func resolveRuntimeClasspath(
         reactorModuleName: String?,
         hasModules: Bool,
+        handle: ProcessHandle?,
         outputFile: URL,
         log: @escaping LogCallback
     ) throws -> [String]
@@ -15,6 +21,7 @@ public protocol BuildSystemAdapter {
 /// - mvnw 优先，其次 PATH 中的 mvn
 /// - compile 不 clean（增量）
 /// - classpath 交给 Maven 自己解析（dependency:build-classpath），不重写依赖解析
+/// - handle 非空时：构建进程句柄交给调用方，Stop 可终止构建（对齐 IDEA）
 public struct MavenBuildService: BuildSystemAdapter {
     public let projectRoot: URL
     public let mavenExecutable: URL
@@ -60,8 +67,16 @@ public struct MavenBuildService: BuildSystemAdapter {
         return env
     }
 
-    public func compile(reactorModuleName: String?, hasModules: Bool, log: @escaping LogCallback) throws {
-        let status = try run(arguments: mavenArguments(base: baseModuleArguments(reactorModuleName: reactorModuleName, hasModules: hasModules) + ["compile"]), log: log)
+    public func compile(
+        reactorModuleName: String?,
+        hasModules: Bool,
+        handle: ProcessHandle?,
+        log: @escaping LogCallback
+    ) throws {
+        let arguments = mavenArguments(
+            base: baseModuleArguments(reactorModuleName: reactorModuleName, hasModules: hasModules) + ["compile"]
+        )
+        let status = try run(arguments: arguments, handle: handle, log: log)
         guard status == 0 else {
             throw IdeaLightRunError.buildFailed(detail: "Maven compile 失败（退出码 \(status)），详见控制台输出。")
         }
@@ -71,6 +86,7 @@ public struct MavenBuildService: BuildSystemAdapter {
     public func resolveRuntimeClasspath(
         reactorModuleName: String?,
         hasModules: Bool,
+        handle: ProcessHandle?,
         outputFile: URL,
         log: @escaping LogCallback
     ) throws -> [String] {
@@ -87,7 +103,7 @@ public struct MavenBuildService: BuildSystemAdapter {
             "-DincludeScope=runtime",
             "-Dmdep.outputFile=\(outputFile.path)",
         ]
-        let status = try run(arguments: mavenArguments(base: arguments), log: log)
+        let status = try run(arguments: mavenArguments(base: arguments), handle: handle, log: log)
         guard status == 0 else {
             throw IdeaLightRunError.classpathResolveFailed(detail: "Maven dependency:build-classpath 失败（退出码 \(status)），详见控制台输出。")
         }
@@ -126,8 +142,9 @@ public struct MavenBuildService: BuildSystemAdapter {
         return arguments
     }
 
-    /// 同步执行 Maven，stdout/stderr 逐行回调（可能来自后台线程）。
-    func run(arguments: [String], log: @escaping LogCallback) throws -> Int32 {
+    /// 同步执行 Maven，stdout/stderr 由读线程逐行回调（可能来自后台线程）。
+    /// handle.terminate() 可终止构建（§：构建期可停止，对齐 IDEA）。
+    func run(arguments: [String], handle: ProcessHandle?, log: @escaping LogCallback) throws -> Int32 {
         let process = Process()
         process.executableURL = mavenExecutable
         process.arguments = arguments
@@ -142,32 +159,31 @@ public struct MavenBuildService: BuildSystemAdapter {
 
         let ioLock = NSLock()
         var splitters: [LogStream: LineSplitter] = [:]
-        let now = { Date() }
+        let readerGroup = DispatchGroup()
+        let clock = { Date() }
 
-        func makeHandler(_ stream: LogStream, _ pipe: Pipe) -> (FileHandle) -> Void {
-            { handle in
-                let data = handle.availableData
-                if data.isEmpty {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                ioLock.lock()
-                var splitter = splitters[stream] ?? LineSplitter()
-                let lines = splitter.feed(data)
-                splitters[stream] = splitter
-                ioLock.unlock()
-                for line in lines {
-                    log(LogLine(timestamp: now(), stream: stream, text: line))
-                }
+        func ingest(_ data: Data, stream: LogStream) {
+            var lines: [String] = []
+            ioLock.lock()
+            var splitter = splitters[stream] ?? LineSplitter()
+            lines = splitter.feed(data)
+            splitters[stream] = splitter
+            ioLock.unlock()
+            for line in lines {
+                log(LogLine(timestamp: clock(), stream: stream, text: line))
             }
         }
 
-        stdoutPipe.fileHandleForReading.readabilityHandler = makeHandler(.stdout, stdoutPipe)
-        stderrPipe.fileHandleForReading.readabilityHandler = makeHandler(.stderr, stderrPipe)
-
-        let semaphore = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in
-            semaphore.signal()
+        func pump(_ stream: LogStream, fileHandle: FileHandle) {
+            readerGroup.enter()
+            DispatchQueue.global(qos: .utility).async {
+                defer { readerGroup.leave() }
+                while true {
+                    let data = fileHandle.readData(ofLength: 65536)
+                    if data.isEmpty { return }  // EOF
+                    ingest(data, stream: stream)
+                }
+            }
         }
 
         do {
@@ -175,27 +191,39 @@ public struct MavenBuildService: BuildSystemAdapter {
         } catch {
             throw IdeaLightRunError.buildToolNotFound(detail: "无法执行 \(mavenExecutable.path)：\(error.localizedDescription)")
         }
-        semaphore.wait()
+        handle?.attach(process)
 
-        // 进程已退出：移除 handler 后读取管道残余，冲刷最后的半行
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-        let leftoverStdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let leftoverStderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        pump(.stdout, fileHandle: stdoutPipe.fileHandleForReading)
+        pump(.stderr, fileHandle: stderrPipe.fileHandleForReading)
 
+        semaphoreWait(process: process)
+        handle?.detach()
+        readerGroup.wait()
+
+        // 冲刷最后的半行
         ioLock.lock()
-        for (stream, leftover) in [(LogStream.stdout, leftoverStdout), (LogStream.stderr, leftoverStderr)] {
-            guard !leftover.isEmpty else { continue }
-            var splitter = splitters[stream] ?? LineSplitter()
-            for line in splitter.feed(leftover) {
-                log(LogLine(timestamp: now(), stream: stream, text: line))
-            }
-            if let last = splitter.finish(), !last.isEmpty {
-                log(LogLine(timestamp: now(), stream: stream, text: last))
-            }
-            splitters[stream] = splitter
-        }
+        let leftovers = splitters
+        splitters = [:]
         ioLock.unlock()
+        for (stream, splitter) in leftovers {
+            var splitter = splitter
+            if let last = splitter.finish(), !last.isEmpty {
+                log(LogLine(timestamp: clock(), stream: stream, text: last))
+            }
+        }
+
+        // §：构建被 Stop 终止时，不要报"构建失败"而是"已停止"
+        if handle?.isCancelled == true {
+            throw IdeaLightRunError.launchCancelled(detail: "构建已被用户停止。")
+        }
         return process.terminationStatus
+    }
+
+    private func semaphoreWait(process: Process) {
+        let semaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            semaphore.signal()
+        }
+        semaphore.wait()
     }
 }

@@ -98,6 +98,7 @@ final class MavenClasspathIntegrationTests: XCTestCase {
         let entries = try service.resolveRuntimeClasspath(
             reactorModuleName: "user-service",
             hasModules: true,
+            handle: nil,
             outputFile: outputFile,
             log: { _ in }
         )
@@ -133,7 +134,27 @@ final class MavenClasspathIntegrationTests: XCTestCase {
             environment: MavenBuildService.buildEnvironment(javaHome: nil)
         )
         // 连续两次 compile：验证可重复执行（§17：不 clean，增量）
-        try service.compile(reactorModuleName: nil, hasModules: false, log: { _ in })
-        try service.compile(reactorModuleName: nil, hasModules: false, log: { _ in })
+        try service.compile(reactorModuleName: nil, hasModules: false, handle: nil, log: { _ in })
+        try service.compile(reactorModuleName: nil, hasModules: false, handle: nil, log: { _ in })
+    }
+
+    /// 构建期 Stop（IDEA 行为）：handle.terminate() 应终止构建进程，
+    /// run 抛出 launchCancelled 而不是"构建失败"。
+    func testBuildCancellationViaHandle() throws {
+        let service = MavenBuildService(
+            projectRoot: FileManager.default.temporaryDirectory,
+            mavenExecutable: URL(fileURLWithPath: "/bin/sleep"),
+            environment: ProcessInfo.processInfo.environment
+        )
+        let handle = ProcessHandle()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+            handle.terminate()
+        }
+        XCTAssertThrowsError(try service.run(arguments: ["100"], handle: handle, log: { _ in })) { error in
+            guard case IdeaLightRunError.launchCancelled = error else {
+                return XCTFail("期望 launchCancelled，实际：\(error)")
+            }
+        }
+        XCTAssertTrue(handle.isCancelled)
     }
 }

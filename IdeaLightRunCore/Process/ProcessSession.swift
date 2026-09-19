@@ -2,9 +2,10 @@ import Foundation
 
 /// §32/§33/§36/§37: 单个 Java 进程会话。
 /// - Process.arguments 数组传参，绝不走 /bin/sh -c（§27）
-/// - stdout/stderr 分别 Pipe 捕获进入环形缓冲（§36/§37）
+/// - stdout/stderr 分别由读线程捕获进入环形缓冲（§36/§37）
+///   （读线程而非 readabilityHandler：避免与 readDataToEndOfFile 混用的 Foundation 竞态崩溃）
 /// - 100ms 批量回调（§103）
-/// - stop(): SIGTERM → 3 秒后仍存活则保持 .stopping，由用户决定 Force Kill（§33）
+/// - stop(): SIGTERM → 由用户决定 Force Kill（§33）
 public final class ProcessSession {
     public let configKey: String
     public let configName: String
@@ -17,12 +18,13 @@ public final class ProcessSession {
     private let lock = NSLock()
     private var stateValue: ProcessState = .starting
     private var splitters: [LogStream: LineSplitter] = [:]
-    private var forceKilled = false
+    private var exitStatusValue: Int32?
     private var timerResumed = false
 
     private let process: Process
     private let flushTimer: DispatchSourceTimer
     private let flushQueue = DispatchQueue(label: "com.misswell.IdeaLightRun.log-flush", qos: .utility)
+    private let readerGroup = DispatchGroup()
 
     public init(
         configKey: String,
@@ -52,52 +54,8 @@ public final class ProcessSession {
         process.standardInput = Pipe()
         self.process = process
 
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
         flushTimer = DispatchSource.makeTimerSource(queue: flushQueue)
         flushTimer.schedule(deadline: .now() + 0.1, repeating: 0.1)
-
-        // self 至此已完成初始化，以下闭包才能捕获 self
-        flushTimer.setEventHandler { [weak self] in
-            self?.flushNow()
-        }
-
-        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-                return
-            }
-            self?.ingest(data, stream: .stdout)
-        }
-        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-                return
-            }
-            self?.ingest(data, stream: .stderr)
-        }
-
-        process.terminationHandler = { [weak self] terminatedProcess in
-            guard let self else { return }
-            // 冲刷管道中的残余输出
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
-            let leftoverStdout = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            let leftoverStderr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            if !leftoverStdout.isEmpty { self.ingest(leftoverStdout, stream: .stdout) }
-            if !leftoverStderr.isEmpty { self.ingest(leftoverStderr, stream: .stderr) }
-
-            self.lock.lock()
-            self.stateValue = .exited(terminatedProcess.terminationStatus)
-            self.lock.unlock()
-            self.flushNow()
-            self.onState?(.exited(terminatedProcess.terminationStatus))
-        }
     }
 
     deinit {
@@ -119,6 +77,11 @@ public final class ProcessSession {
     }
 
     public func start() {
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
         do {
             try process.run()
         } catch {
@@ -127,18 +90,36 @@ public final class ProcessSession {
             setState(.failed(message))
             return
         }
+
         lock.lock()
         let firstStart = !timerResumed
         timerResumed = true
         lock.unlock()
         if firstStart {
+            flushTimer.setEventHandler { [weak self] in
+                self?.flushNow()
+            }
             flushTimer.resume()
         }
+
         logBuffer.append(LogLine(stream: .system, text: "[IdeaLightRun] 进程已启动，PID \(process.processIdentifier)"))
         setState(.running)
+
+        // 读线程持续消费管道直到 EOF；EOF + 退出码齐备后统一收尾
+        process.terminationHandler = { [weak self] terminatedProcess in
+            guard let self else { return }
+            self.lock.lock()
+            self.exitStatusValue = terminatedProcess.terminationStatus
+            self.lock.unlock()
+        }
+        readerGroup.notify(queue: flushQueue) { [weak self] in
+            self?.finishReading()
+        }
+        pump(.stdout, fileHandle: stdoutPipe.fileHandleForReading)
+        pump(.stderr, fileHandle: stderrPipe.fileHandleForReading)
     }
 
-    /// §33: 先 SIGTERM；3 秒后仍存活则保持 .stopping，等待用户 Force Kill。
+    /// §33: 先 SIGTERM；仍存活则保持 .stopping，等待用户 Force Kill。
     public func stop() {
         lock.lock()
         guard stateValue == .running else {
@@ -154,9 +135,6 @@ public final class ProcessSession {
 
     public func forceKill() {
         guard process.isRunning else { return }
-        lock.lock()
-        forceKilled = true
-        lock.unlock()
         kill(process.processIdentifier, SIGKILL)
     }
 
@@ -175,6 +153,50 @@ public final class ProcessSession {
     }
 
     // MARK: - 内部
+
+    private func pump(_ stream: LogStream, fileHandle: FileHandle) {
+        readerGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            defer { self?.readerGroup.leave() }
+            while true {
+                let data = fileHandle.readData(ofLength: 65536)
+                if data.isEmpty { return }  // EOF
+                self?.ingest(data, stream: stream)
+            }
+        }
+    }
+
+    private func finishReading() {
+        // 尾部半行
+        lock.lock()
+        let remainingSplitters = splitters
+        splitters = [:]
+        var status = exitStatusValue
+        lock.unlock()
+        for (stream, splitter) in remainingSplitters {
+            var splitter = splitter
+            if let last = splitter.finish(), !last.isEmpty {
+                logBuffer.append(LogLine(stream: stream, text: last))
+            }
+        }
+
+        // terminationHandler 与 EOF 顺序不定，短暂等待退出码
+        var waitedMilliseconds = 0
+        while status == nil && waitedMilliseconds < 2000 {
+            Thread.sleep(forTimeInterval: 0.02)
+            waitedMilliseconds += 20
+            lock.lock()
+            status = exitStatusValue
+            lock.unlock()
+        }
+
+        let exitCode = status ?? 0
+        lock.lock()
+        stateValue = .exited(exitCode)
+        lock.unlock()
+        flushNow()
+        onState?(.exited(exitCode))
+    }
 
     private func ingest(_ data: Data, stream: LogStream) {
         var newLines: [LogLine] = []

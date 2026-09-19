@@ -13,6 +13,7 @@ public enum IdeaLightRunError: Error, Equatable, Sendable {
     case classpathResolveFailed(detail: String)
     case mainClassNotFound(detail: String)
     case launchFailed(detail: String)
+    case launchCancelled(detail: String)
 }
 
 extension IdeaLightRunError {
@@ -29,6 +30,7 @@ extension IdeaLightRunError {
         case .classpathResolveFailed: return "Classpath 解析失败"
         case .mainClassNotFound: return "找不到 Main Class"
         case .launchFailed: return "启动失败"
+        case .launchCancelled: return "已停止"
         }
     }
 
@@ -46,7 +48,8 @@ extension IdeaLightRunError {
              .buildFailed(let detail),
              .classpathResolveFailed(let detail),
              .mainClassNotFound(let detail),
-             .launchFailed(let detail):
+             .launchFailed(let detail),
+             .launchCancelled(let detail):
             return detail
         }
     }
@@ -75,6 +78,8 @@ extension IdeaLightRunError {
             return "确认 Main Class 是否存在并已编译。"
         case .launchFailed:
             return "查看日志中的详细错误。"
+        case .launchCancelled:
+            return "点击 Run 重新启动。"
         }
     }
 

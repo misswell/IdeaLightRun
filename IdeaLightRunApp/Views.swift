@@ -344,7 +344,7 @@ struct ConfigurationRow: View {
             case .building, .resolvingClasspath, .preparing, .starting: return .orange
             case .stopping: return .yellow
             case .failed: return .red
-            case .exited: return .secondary
+            case .exited, .cancelled: return .secondary
             }
         }
         switch config.readiness {
@@ -407,6 +407,8 @@ struct ConfigurationDetailView: View {
     private func header(config: RunConfiguration, project: ProjectEntry, result: ScanResult) -> some View {
         let model = store.sessions[config.uniqueKey]
         let launchable = (config.type == .application || config.type == .springBoot) && result.buildSystem.maven != nil
+        // IDEA 行为：构建期与运行期 Stop 都可用
+        let stopEnabled = model?.state.isActive == true && model?.state != .stopping
 
         return HStack(spacing: 10) {
             Text(config.name)
@@ -424,7 +426,7 @@ struct ConfigurationDetailView: View {
             }
             .keyboardShortcut("r", modifiers: .command)
             .help(launchable ? "编译并启动" : "仅支持 Maven 的 Application / Spring Boot 配置")
-            .disabled(!launchable || model?.isBuilding == true || model?.isRunning == true)
+            .disabled(!launchable || model != nil && !model!.state.isTerminal)
 
             Button {
                 store.stop(configKey: config.uniqueKey)
@@ -432,8 +434,8 @@ struct ConfigurationDetailView: View {
                 Label("Stop", systemImage: "stop.fill")
             }
             .keyboardShortcut(".", modifiers: .command)
-            .help("发送 SIGTERM")
-            .disabled(model?.isRunning != true)
+            .help(model?.isActiveBuildPhase == true ? "终止 Maven 构建" : "发送 SIGTERM")
+            .disabled(!stopEnabled)
 
             if model?.state == .stopping {
                 Button(role: .destructive) {
@@ -453,6 +455,7 @@ struct ConfigurationDetailView: View {
             .keyboardShortcut("r", modifiers: [.command, .shift])
             .help("停止旧进程后重新编译启动")
             .disabled(model == nil || model?.isBuilding == true)
+            .disabled(model?.state == .stopping)
 
             Spacer()
 
@@ -699,30 +702,38 @@ struct LogConsoleView: NSViewRepresentable {
 
         if coordinator.generation != model.clearGeneration {
             coordinator.generation = model.clearGeneration
-            coordinator.renderedCount = 0
+            coordinator.nextAbsolute = 0
             textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
         }
 
-        let totalCount = model.lines.count
-        guard coordinator.renderedCount < totalCount else { return }
-        let newLines = model.lines[coordinator.renderedCount...]
-        coordinator.renderedCount = totalCount
+        // 增量渲染：用绝对行号对齐（model.lines 有环形截断，firstLineIndex 会前移）
+        let firstAbsolute = model.firstLineIndex
+        var startOffset = coordinator.nextAbsolute - firstAbsolute
+        if startOffset < 0 {
+            // 早期行已被截断丢弃，跳过
+            coordinator.nextAbsolute = firstAbsolute
+            startOffset = 0
+        }
+        if startOffset < model.lines.count {
+            let newLines = model.lines[startOffset...]
+            coordinator.nextAbsolute = firstAbsolute + model.lines.count
 
-        let attributed = NSMutableAttributedString()
-        for line in newLines {
-            attributed.append(Self.attributed(line))
-        }
-        if let storage = textView.textStorage {
-            storage.append(attributed)
-            // TextStorage 自身也设上限，防止无限膨胀
-            let maxCharacters = 2_000_000
-            if storage.length > maxCharacters {
-                storage.deleteCharacters(in: NSRange(location: 0, length: storage.length - maxCharacters))
+            let attributed = NSMutableAttributedString()
+            for line in newLines {
+                attributed.append(Self.attributed(line))
             }
-        }
-        textView.needsDisplay = true
-        if coordinator.follow {
-            textView.scrollToEndOfDocument(nil)
+            if let storage = textView.textStorage {
+                storage.append(attributed)
+                // TextStorage 自身也设上限，防止无限膨胀
+                let maxCharacters = 2_000_000
+                if storage.length > maxCharacters {
+                    storage.deleteCharacters(in: NSRange(location: 0, length: storage.length - maxCharacters))
+                }
+            }
+            textView.needsDisplay = true
+            if coordinator.follow {
+                textView.scrollToEndOfDocument(nil)
+            }
         }
     }
 
@@ -746,7 +757,7 @@ struct LogConsoleView: NSViewRepresentable {
     }
 
     final class Coordinator {
-        var renderedCount = 0
+        var nextAbsolute = 0
         var generation = 0
         var follow = true
     }

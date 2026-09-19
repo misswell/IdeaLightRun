@@ -9,7 +9,8 @@ public struct JavaLauncher: Sendable {
         config: RunConfiguration,
         projectRoot: URL,
         log: @escaping LogCallback,
-        progress: @escaping (ProcessState) -> Void
+        progress: @escaping (ProcessState) -> Void,
+        processHandle: ProcessHandle? = nil
     ) async throws -> JavaLaunchPlan {
         let scanner = IntelliJProjectScanner()
         let result = try scanner.scan(projectRoot: projectRoot)
@@ -85,6 +86,7 @@ public struct JavaLauncher: Sendable {
                 let rawEntries = try service.resolveRuntimeClasspath(
                     reactorModuleName: reactorModuleName,
                     hasModules: isMultiModule,
+                    handle: processHandle,
                     outputFile: outputFile,
                     log: log
                 )
@@ -107,6 +109,7 @@ public struct JavaLauncher: Sendable {
             try service.compile(
                 reactorModuleName: reactorModuleName,
                 hasModules: isMultiModule,
+                handle: processHandle,
                 log: log
             )
 

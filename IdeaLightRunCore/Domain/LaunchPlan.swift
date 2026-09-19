@@ -50,12 +50,23 @@ public enum ProcessState: Equatable, Sendable {
     case running
     case stopping
     case exited(Int32)
+    case cancelled
     case failed(String)
 
     public var isTerminal: Bool {
         switch self {
-        case .exited, .failed: return true
+        case .exited, .failed, .cancelled: return true
         default: return false
+        }
+    }
+
+    /// 运行会话活跃（构建期 + 运行期）——Stop 按钮的可用条件。
+    public var isActive: Bool {
+        switch self {
+        case .preparing, .building, .resolvingClasspath, .starting, .running, .stopping:
+            return true
+        case .exited, .cancelled, .failed:
+            return false
         }
     }
 
@@ -68,6 +79,7 @@ public enum ProcessState: Equatable, Sendable {
         case .running: return "运行中"
         case .stopping: return "停止中"
         case .exited(let code): return "已退出 (\(code))"
+        case .cancelled: return "已停止"
         case .failed: return "失败"
         }
     }

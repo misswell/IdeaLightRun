@@ -73,6 +73,8 @@ final class AppStore: ObservableObject {
 
         let projectRoot = project.url
         let launcher = JavaLauncher()
+        let handle = ProcessHandle()
+        model.buildHandle = handle
         Task.detached(priority: .userInitiated) {
             do {
                 let plan = try await launcher.prepare(
@@ -83,8 +85,14 @@ final class AppStore: ObservableObject {
                     },
                     progress: { state in
                         Task { @MainActor in model.setPipelineState(state) }
-                    }
+                    },
+                    processHandle: handle
                 )
+                // Stop 在构建期按下：终止构建，不再启动 Java（IDEA 行为）
+                if handle.isCancelled {
+                    await model.setPipelineState(.cancelled)
+                    return
+                }
                 let session = try ProcessSession(
                     configKey: configKey,
                     configName: config.name,
@@ -92,21 +100,44 @@ final class AppStore: ObservableObject {
                     logBuffer: model.logBuffer
                 )
                 await model.attach(session: session)
+                if handle.isCancelled {
+                    await model.setPipelineState(.cancelled)
+                    return
+                }
                 session.start()
+            } catch let error as IdeaLightRunError {
+                if case .launchCancelled = error {
+                    await model.setPipelineState(.cancelled)
+                } else {
+                    await model.pipelineFailed(error.localizedDescription)
+                }
             } catch {
-                let message = (error as? IdeaLightRunError)?.localizedDescription ?? error.localizedDescription
-                await model.pipelineFailed(message)
+                await model.pipelineFailed(error.localizedDescription)
             }
         }
     }
 
-    /// §33: SIGTERM，3 秒后仍存活由用户决定 Force Kill。
+    /// §33: 构建期 Stop → 终止 Maven 构建；运行期 Stop → SIGTERM，
+    /// 3 秒后仍存活由用户决定 Force Kill。
     func stop(configKey: String) {
-        sessions[configKey]?.session?.stop()
+        guard let model = sessions[configKey] else { return }
+        switch model.state {
+        case .preparing, .resolvingClasspath, .building, .starting:
+            model.buildHandle?.terminate()
+        case .running:
+            model.session?.stop()
+        case .stopping, .exited, .cancelled, .failed:
+            break
+        }
     }
 
     func forceKill(configKey: String) {
-        sessions[configKey]?.session?.forceKill()
+        guard let model = sessions[configKey] else { return }
+        if model.state == .stopping {
+            model.session?.forceKill()
+        } else if model.isActiveBuildPhase {
+            model.buildHandle?.forceKill()
+        }
     }
 
     /// §34: 等旧进程退出后再重新走完整流水线。
@@ -115,9 +146,8 @@ final class AppStore: ObservableObject {
             if model.isRunning {
                 model.pendingRestart = true
                 model.session?.stop()
-            } else if model.isBuilding {
-                return // 构建中不允许重启
             }
+            // 构建期不允许重启（Stop 后可重新 Run）
             return
         }
         sessions.removeValue(forKey: configKey)
