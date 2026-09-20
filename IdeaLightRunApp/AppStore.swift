@@ -52,6 +52,15 @@ final class AppStore: ObservableObject {
         selectedProjectID.flatMap { builds[$0] }
     }
 
+    /// 菜单命令的入口。`Commands.body` 在旧 SDK（CI 的 Xcode 15 / Swift 5.10）上不是
+    /// `@MainActor`，闭包没法直接调主 actor 方法；显式走这里，两种工具链都成立。
+    nonisolated static func fromMenu(_ action: @escaping @MainActor (AppStore) -> Void) {
+        Task { @MainActor in
+            guard let store = current else { return }
+            action(store)
+        }
+    }
+
     // MARK: - 运行管理（§32–§35）
 
     func run(configKey: String, projectID: String? = nil) {

@@ -62,13 +62,13 @@ struct BuildCommands: Commands {
 
     var body: some Commands {
         CommandMenu("构建") {
-            Button("构建项目") { AppStore.current?.build(rebuild: false) }
+            Button("构建项目") { AppStore.fromMenu { $0.build(rebuild: false) } }
                 .keyboardShortcut(Self.f9, modifiers: .command)
-            Button("重新构建项目") { AppStore.current?.build(rebuild: true) }
+            Button("重新构建项目") { AppStore.fromMenu { $0.build(rebuild: true) } }
                 .keyboardShortcut(Self.f9, modifiers: [.command, .shift])
             Divider()
-            Button("停止构建") { AppStore.current?.stopBuild() }
-            Button("强制结束构建") { AppStore.current?.forceKillBuild() }
+            Button("停止构建") { AppStore.fromMenu { $0.stopBuild() } }
+            Button("强制结束构建") { AppStore.fromMenu { $0.forceKillBuild() } }
         }
     }
 }

@@ -1,0 +1,22 @@
+name: Compile check
+
+# 发布用的 macos-14 runner 是 Xcode 15 / Swift 5.10，比本机工具链旧：
+# 旧 SDK 上 `Commands.body` 不是 @MainActor，Swift 6 里能过的写法在 CI 上是编译错误。
+# `swift test` 不会构建 App target，所以这里显式 `swift build` 全量编译，
+# 打 tag 之前先在 main 上绿灯。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build every target with the release toolchain
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - name: Build all targets
+        run: swift build
+      - name: Build tests
+        run: swift build --build-tests
