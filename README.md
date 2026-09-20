@@ -59,6 +59,8 @@ GUI 侧对应「构建」菜单：构建项目 ⌘F9、重新构建项目 ⇧⌘
 
 正式发布走 GitHub Actions：推 `v*` tag 即自动 `swift test` → Developer ID 签名 → Apple 公证
 → staple → 创建 Release（附件 `IdeaLightRun-<ver>-universal.zip` 与 `SHA256SUMS.txt`）。
+tag 之前先等 `Compile check`（push 到 main 自动跑）绿灯：它用发布同款工具链
+`swift build` 全量编译，覆盖 `swift test` 不构建的 GUI target。
 
 ```bash
 git tag -a v0.1.2 -m "v0.1.2" && git push origin v0.1.2

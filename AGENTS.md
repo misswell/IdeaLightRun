@@ -4,6 +4,10 @@
 
 - 每次改动完成并验证通过后：提交并推送 GitHub、创建新的 patch 版本 tag、创建 GitHub Release，回复 commit 与 Release 链接。
 - 使用新版本号，绝不移动或覆盖已推送的 tag；仅在 `swift test` 与构建验证通过后发布。
+- 打 tag 前必须先等 `Compile check` 工作流在 main 上绿灯，再打 tag 发布：CI runner 是
+  macos-14 / Swift 5.10（旧 SDK 上 `Commands.body` 不是 `@MainActor`，本机 Xcode 26 能过
+  的写法在 CI 上是编译错误），而 `swift test` 不构建 App target，只有 `swift build`
+  全量编译才覆盖到 GUI 代码。tag 一旦推上去就作废不了，失败的 tag 只能留着。
 - 签名、公证或 Actions 任一环失败时，必须报告失败环节和证据，不得把未验证的包当正式 Release。
 
 ## 签名与公证
