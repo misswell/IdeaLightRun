@@ -22,7 +22,7 @@ public protocol BuildSystemAdapter {
 /// - compile 不 clean（增量）
 /// - classpath 交给 Maven 自己解析（dependency:build-classpath），不重写依赖解析
 /// - handle 非空时：构建进程句柄交给调用方，Stop 可终止构建（对齐 IDEA）
-/// - `buildProject(rebuild:)` 是 IDEA 的 Build / Rebuild Project（整个 reactor）
+/// - `buildProject(kind:)` 是 IDEA 的 Build / Rebuild Project 与 Maven clean（整个 reactor）
 public struct MavenBuildService: BuildSystemAdapter, Sendable {
     public let projectRoot: URL
     public let mavenExecutable: URL
@@ -72,29 +72,32 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
         }
     }
 
-    /// IDEA 的 Build Project / Rebuild Project：作用于整个 reactor，不带 `-pl`。
-    /// Build = 增量 `compile`；Rebuild = `clean compile`（先清空产物再全量编译）。
-    public func buildProject(rebuild: Bool, handle: ProcessHandle?, log: @escaping LogCallback) throws {
-        let goal = rebuild ? "clean compile" : "compile"
+    /// IDEA 的 Build Project / Rebuild Project 与 Maven clean：作用于整个 reactor，不带 `-pl`。
+    /// Build = 增量 `compile`；Rebuild = `clean compile`（先清空产物再全量编译）；
+    /// Clean = 只 `clean`（清空产物，不编译）。
+    public func buildProject(kind: ProjectBuildKind, handle: ProcessHandle?, log: @escaping LogCallback) throws {
         let status = try run(
             arguments: Self.projectBuildArguments(
                 mavenExecutable: mavenExecutable,
                 noSnapshotUpdates: noSnapshotUpdates,
-                rebuild: rebuild
+                kind: kind
             ),
             handle: handle,
             log: log
         )
         guard status == 0 else {
-            throw IdeaLightRunError.buildFailed(detail: "Maven \(goal) 失败（退出码 \(status)），详见构建输出。")
+            throw IdeaLightRunError.buildFailed(
+                detail: "Maven \(kind.goalsDescription) 失败（退出码 \(status)），详见\(kind.actionName)输出。"
+            )
         }
     }
 
-    static func projectBuildArguments(mavenExecutable: URL, noSnapshotUpdates: Bool, rebuild: Bool) -> [String] {
-        var arguments = ["-DskipTests"]
-        if rebuild { arguments.append("clean") }
-        arguments.append("compile")
-        return styled(arguments, executable: mavenExecutable, noSnapshotUpdates: noSnapshotUpdates)
+    static func projectBuildArguments(
+        mavenExecutable: URL,
+        noSnapshotUpdates: Bool,
+        kind: ProjectBuildKind
+    ) -> [String] {
+        styled(kind.goalArguments, executable: mavenExecutable, noSnapshotUpdates: noSnapshotUpdates)
     }
 
     /// §18: compile + dependency:build-classpath 一次 JVM 调用完成（Cold Resolve）。

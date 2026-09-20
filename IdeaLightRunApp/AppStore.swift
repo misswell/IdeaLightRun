@@ -173,18 +173,19 @@ final class AppStore: ObservableObject {
 
     // MARK: - 项目级构建（IDEA 的 Build / Rebuild Project）
 
-    /// Build Project = 增量 `compile`；Rebuild Project = `clean compile` 全量。
+    /// Build Project = 增量 `compile`；Rebuild Project = `clean compile` 全量；
+    /// Clean = 只 `clean`（清空产物，不编译）。
     /// 构建中重复触发直接忽略：同项目已由 BuildGate 串行（§42），排队只会让 UI 看起来卡住。
-    func build(projectID: String? = nil, rebuild: Bool) {
+    func build(projectID: String? = nil, kind: ProjectBuildKind) {
         guard let id = projectID ?? selectedProjectID,
               let project = projects.first(where: { $0.id == id }) else { return }
         guard project.result?.buildSystem.maven != nil else {
-            alertMessage = "当前版本仅支持 Maven 项目构建；Gradle 支持在 Milestone 4 提供。"
+            alertMessage = "当前版本仅支持 Maven 项目\(kind.actionName)；Gradle 支持在 Milestone 4 提供。"
             return
         }
         guard builds[id]?.phase.isBusy != true else { return }
 
-        let model = ProjectBuildModel(projectPath: id, rebuild: rebuild)
+        let model = ProjectBuildModel(projectPath: id, kind: kind)
         let handle = ProcessHandle()
         model.handle = handle
         model.onChange = { [weak self] in
@@ -199,7 +200,7 @@ final class AppStore: ObservableObject {
             do {
                 try await builder.build(
                     projectRoot: projectRoot,
-                    rebuild: rebuild,
+                    kind: kind,
                     log: { line in
                         Task { @MainActor in model.appendLog(line) }
                     },

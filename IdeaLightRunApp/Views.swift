@@ -54,7 +54,7 @@ struct IdeaLightRunApp: App {
     }
 }
 
-/// IDEA 的 Build 菜单：Build Project（⌘F9）/ Rebuild Project（⇧⌘F9）。
+/// IDEA 的 Build 菜单：Build Project（⌘F9）/ Rebuild Project（⇧⌘F9）+ Maven clean。
 /// 菜单项不做置灰——不可用时点了要给原因（弹窗），而不是让人猜为什么不能点。
 struct BuildCommands: Commands {
     /// AppKit 用私有码点表示功能键：F9 = 0xF70C。
@@ -62,10 +62,11 @@ struct BuildCommands: Commands {
 
     var body: some Commands {
         CommandMenu("构建") {
-            Button("构建项目") { AppStore.fromMenu { $0.build(rebuild: false) } }
+            Button("构建项目") { AppStore.fromMenu { $0.build(kind: .build) } }
                 .keyboardShortcut(Self.f9, modifiers: .command)
-            Button("重新构建项目") { AppStore.fromMenu { $0.build(rebuild: true) } }
+            Button("重新构建项目") { AppStore.fromMenu { $0.build(kind: .rebuild) } }
                 .keyboardShortcut(Self.f9, modifiers: [.command, .shift])
+            Button("清理项目") { AppStore.fromMenu { $0.build(kind: .clean) } }
             Divider()
             Button("停止构建") { AppStore.fromMenu { $0.stopBuild() } }
             Button("强制结束构建") { AppStore.fromMenu { $0.forceKillBuild() } }
@@ -130,9 +131,11 @@ struct SidebarView: View {
                     }
                     .tag(project.id)
                     .contextMenu {
-                        Button("构建项目") { store.build(projectID: project.id, rebuild: false) }
+                        Button("构建项目") { store.build(projectID: project.id, kind: .build) }
                             .disabled(project.result?.buildSystem.maven == nil)
-                        Button("重新构建项目") { store.build(projectID: project.id, rebuild: true) }
+                        Button("重新构建项目") { store.build(projectID: project.id, kind: .rebuild) }
+                            .disabled(project.result?.buildSystem.maven == nil)
+                        Button("清理项目") { store.build(projectID: project.id, kind: .clean) }
                             .disabled(project.result?.buildSystem.maven == nil)
                         if store.builds[project.id]?.phase.isBusy == true {
                             Button("停止构建", role: .destructive) { store.stopBuild(projectID: project.id) }
@@ -318,7 +321,7 @@ struct ProjectSummaryView: View {
         .padding(.vertical, 10)
     }
 
-    /// IDEA 的 Build Project / Rebuild Project：项目级、作用于整个 reactor。
+    /// IDEA 的 Build Project / Rebuild Project 与 Maven clean：项目级、作用于整个 reactor。
     private var buildControls: some View {
         let build = store.builds[project.id]
         let busy = build?.phase.isBusy ?? false
@@ -329,7 +332,7 @@ struct ProjectSummaryView: View {
             if busy {
                 ProgressView()
                     .controlSize(.small)
-                Text(build?.phase.displayText ?? "")
+                Text(build?.statusText ?? "")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("停止构建") { store.stopBuild(projectID: project.id) }
@@ -344,12 +347,15 @@ struct ProjectSummaryView: View {
                     .help("强制结束（SIGKILL）")
                 }
             } else {
-                Button("构建") { store.build(projectID: project.id, rebuild: false) }
+                Button("构建") { store.build(projectID: project.id, kind: .build) }
                     .disabled(!mavenReady)
                     .help(mavenReady ? "增量编译整个项目（IDEA 的 Build Project，⌘F9）" : unavailableHint)
-                Button("重新构建") { store.build(projectID: project.id, rebuild: true) }
+                Button("重新构建") { store.build(projectID: project.id, kind: .rebuild) }
                     .disabled(!mavenReady)
                     .help(mavenReady ? "清空产物后全量编译（IDEA 的 Rebuild Project，⇧⌘F9）" : unavailableHint)
+                Button("清理") { store.build(projectID: project.id, kind: .clean) }
+                    .disabled(!mavenReady)
+                    .help(mavenReady ? "只清空各模块 target/ 产物，不编译（Maven clean）" : unavailableHint)
             }
         }
         .controlSize(.small)
@@ -542,7 +548,7 @@ struct ConfigurationDetailView: View {
                 ProgressView()
                     .controlSize(.small)
             }
-            Text(model.phase.displayText)
+            Text(model.statusText)
                 .font(.callout.weight(.medium))
             Text(project.name)
                 .font(.caption)

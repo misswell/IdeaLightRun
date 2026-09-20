@@ -27,7 +27,14 @@ struct IdeaLightRunCLI {
             }
         case "build":
             do {
-                try runBuild(arguments: Array(arguments.dropFirst()))
+                try runBuild(arguments: Array(arguments.dropFirst()), defaultKind: .build)
+            } catch {
+                printError(error)
+                exit(1)
+            }
+        case "clean":
+            do {
+                try runBuild(arguments: Array(arguments.dropFirst()), defaultKind: .clean)
             } catch {
                 printError(error)
                 exit(1)
@@ -327,13 +334,13 @@ struct IdeaLightRunCLI {
         }
     }
 
-    static func runBuild(arguments: [String]) throws {
-        var rebuildRequested = false
+    static func runBuild(arguments: [String], defaultKind: ProjectBuildKind) throws {
+        var requestedKind = defaultKind
         var path: String?
         for argument in arguments {
             switch argument {
-            case "--rebuild":
-                rebuildRequested = true
+            case "--rebuild" where defaultKind != .clean:
+                requestedKind = .rebuild
             case "-h", "--help":
                 printUsage()
                 exit(0)
@@ -347,12 +354,13 @@ struct IdeaLightRunCLI {
             }
         }
         guard let path else {
-            FileHandle.standardError.write("用法：idealightrun build [--rebuild] <project>\n".data(using: .utf8)!)
+            let usage = defaultKind == .clean
+                ? "用法：idealightrun clean <project>\n"
+                : "用法：idealightrun build [--rebuild] <project>\n"
+            FileHandle.standardError.write(usage.data(using: .utf8)!)
             exit(2)
         }
-        let rebuild = rebuildRequested
-
-
+        let kind = requestedKind
         let expanded = (path as NSString).expandingTildeInPath
         let projectRoot = URL(fileURLWithPath: expanded, isDirectory: true)
         guard BuildSystemDetector.isValidProjectRoot(projectRoot) else {
@@ -373,7 +381,7 @@ struct IdeaLightRunCLI {
             do {
                 try await ProjectBuilder().build(
                     projectRoot: projectRoot,
-                    rebuild: rebuild,
+                    kind: kind,
                     log: { line in emit(line.text) },
                     progress: { state in emit("[IdeaLightRun] \(state.displayText)…") },
                     processHandle: handle
@@ -417,6 +425,7 @@ struct IdeaLightRunCLI {
               scan <path>                扫描项目并输出所有 Run Configuration（list 为别名）
               run <path> <config-name>   编译并启动指定配置（Ctrl-C 停止）
               build <path>               构建整个项目（IDEA 的 Build Project）
+              clean <path>               清空项目产物（Maven clean，只删 target/ 不编译）
 
             OPTIONS:
               --json                     以 JSON 输出（scan）
