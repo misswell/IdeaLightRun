@@ -42,11 +42,22 @@ swift run IdeaLightRunCLI run /path/to/project UserApplication
 swift run IdeaLightRunCLI scan /path/to/project --json
 ```
 
-## GUI 打包
+## GUI 打包与发布
 
 ```bash
-./scripts/build-app.sh release   # 产物 build/IdeaLightRun.app，双击使用
+./scripts/build-app.sh release                    # 产物 build/IdeaLightRun.app，双击使用
+UNIVERSAL=1 APP_VERSION=0.1.0 ./scripts/build-app.sh release   # arm64 + x86_64 通用包（发布用）
 ```
+
+发布由 GitHub Actions 完成：推 tag 即触发 `swift test` → 通用包构建 → 创建 Release
+（附件 `IdeaLightRun-<ver>-universal.zip` 与 `SHA256SUMS.txt`）。
+
+```bash
+git tag -a v0.1.1 -m "v0.1.1" && git push origin v0.1.1
+```
+
+产物为 ad-hoc 签名、未做 Apple 公证，用户首次打开需右键 → 打开。
+Maven 集成测试需要真实下载依赖，只在本地跑，CI 用 `--skip` 跳过。
 
 ## 测试
 
