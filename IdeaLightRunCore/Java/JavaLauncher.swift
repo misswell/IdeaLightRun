@@ -114,7 +114,7 @@ public struct JavaLauncher: Sendable {
             )
 
             // ⑦ LaunchPlan（§26）
-            progress(.preparing)
+            progress(.starting)
             return try LaunchPlanBuilder.build(
                 config: config,
                 projectRoot: projectRoot,

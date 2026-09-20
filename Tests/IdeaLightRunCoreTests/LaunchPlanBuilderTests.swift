@@ -4,6 +4,20 @@ import XCTest
 final class LaunchPlanBuilderTests: XCTestCase {
     let projectRoot = Fixtures.url("MavenMultiProject")
 
+    /// LaunchPlanBuilder 会校验 bin/java 真实可执行，所以用临时桩而不是依赖机器的 JAVA_HOME。
+    private var fakeJavaHome: URL!
+
+    override func setUpWithError() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lightrun-fake-jdk-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: home.appendingPathComponent("bin"), withIntermediateDirectories: true)
+        let java = home.appendingPathComponent("bin/java")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: java)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: java.path)
+        fakeJavaHome = home
+        addTeardownBlock { try? FileManager.default.removeItem(at: home) }
+    }
+
     private func makeConfig() -> RunConfiguration {
         RunConfiguration(
             name: "GatewayApplication",
@@ -20,9 +34,7 @@ final class LaunchPlanBuilderTests: XCTestCase {
     }
 
     private func makeJDK() -> JDKInstallation {
-        let home = ProcessInfo.processInfo.environment["JAVA_HOME"].map { URL(fileURLWithPath: $0) }
-            ?? URL(fileURLWithPath: "/Library/Java/JavaVirtualMachines")
-        return JDKInstallation(home: home, majorVersion: 8)
+        JDKInstallation(home: fakeJavaHome, majorVersion: 8)
     }
 
     func testBuildPlanTokenizesAndResolves() throws {

@@ -13,6 +13,13 @@ public final class ProcessHandle: @unchecked Sendable {
         return cancelledValue
     }
 
+    /// 构建进程是否仍存活。退出流程用它判断 SIGTERM 后是否还需要兜底 SIGKILL。
+    public var hasLiveProcess: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return process?.isRunning ?? false
+    }
+
     public init() {}
 
     func attach(_ process: Process) {

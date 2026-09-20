@@ -11,8 +11,8 @@ final class RunningProcessModel: ObservableObject, Identifiable {
     let projectPath: String
     let logBuffer = LogRingBuffer()
 
-    @Published var state: ProcessState = .preparing
-    @Published var pid: Int32?
+    @Published private(set) var state: ProcessState = .preparing
+    @Published private(set) var pid: Int32?
     @Published var lines: [LogLine] = []
     @Published var clearGeneration = 0
 
@@ -22,6 +22,11 @@ final class RunningProcessModel: ObservableObject, Identifiable {
     var pendingRestart = false
     var onRestartNeeded: (() -> Void)?
     private(set) var session: ProcessSession?
+
+    /// 状态/PID 变更通知。本模型是 AppStore 里的嵌套 ObservableObject，SwiftUI 不会自动
+    /// 观察它；不显式冒泡到 AppStore.objectWillChange，列表行状态、顶栏按钮和运行横幅会
+    /// 永远冻结在 Run 那一刻的快照上（进程已退出仍显示"准备中"）。
+    var onChange: (() -> Void)?
 
     /// lines[0] 对应的绝对行号（配合环形截断，供控制台增量渲染）。
     private(set) var firstLineIndex = 0
@@ -71,18 +76,18 @@ final class RunningProcessModel: ObservableObject, Identifiable {
     }
 
     func setPipelineState(_ newState: ProcessState) {
-        state = newState
+        publish(newState)
     }
 
     func pipelineFailed(_ message: String) {
         appendLog(LogLine(stream: .system, text: "[IdeaLightRun] \(message)"))
-        state = .failed(message)
+        publish(.failed(message))
     }
 
     /// 构建完成后挂接真实进程会话。
     func attach(session: ProcessSession) {
         self.session = session
-        pid = session.pid
+        setPID(session.pid)
         session.onLogLines = { [weak self] batch in
             Task { @MainActor [weak self] in
                 self?.appendLog(batch)
@@ -91,22 +96,32 @@ final class RunningProcessModel: ObservableObject, Identifiable {
         session.onState = { [weak self] newState in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.state = newState
+                self.publish(newState)
                 switch newState {
                 case .exited(let code):
-                    self.pid = nil
+                    self.setPID(nil)
                     self.appendLog(LogLine(stream: .system, text: "[IdeaLightRun] 进程退出，退出码 \(code)"))
                     if self.pendingRestart {
                         self.pendingRestart = false
                         self.onRestartNeeded?()
                     }
-                case .failed(let message):
-                    self.pid = nil
-                    _ = message
+                case .failed:
+                    // 失败原因由 ProcessSession 写入 logBuffer 后随批次送达，此处不重复。
+                    self.setPID(nil)
                 default:
                     break
                 }
             }
         }
+    }
+
+    private func publish(_ newState: ProcessState) {
+        state = newState
+        onChange?()
+    }
+
+    private func setPID(_ newPID: Int32?) {
+        pid = newPID
+        onChange?()
     }
 }

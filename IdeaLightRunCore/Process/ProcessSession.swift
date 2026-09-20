@@ -19,7 +19,6 @@ public final class ProcessSession {
     private var stateValue: ProcessState = .starting
     private var splitters: [LogStream: LineSplitter] = [:]
     private var exitStatusValue: Int32?
-    private var timerResumed = false
 
     private let process: Process
     private let flushTimer: DispatchSourceTimer
@@ -54,8 +53,14 @@ public final class ProcessSession {
         process.standardInput = Pipe()
         self.process = process
 
+        // 定时器在 init 就 resume：deinit 只能 cancel 已恢复的 source，
+        // 否则 start() 失败/未调用时释放挂起的 source 会直接崩溃。
         flushTimer = DispatchSource.makeTimerSource(queue: flushQueue)
         flushTimer.schedule(deadline: .now() + 0.1, repeating: 0.1)
+        flushTimer.setEventHandler { [weak self] in
+            self?.flushNow()
+        }
+        flushTimer.resume()
     }
 
     deinit {
@@ -89,17 +94,6 @@ public final class ProcessSession {
             logBuffer.append(LogLine(stream: .system, text: "[IdeaLightRun] \(message)"))
             setState(.failed(message))
             return
-        }
-
-        lock.lock()
-        let firstStart = !timerResumed
-        timerResumed = true
-        lock.unlock()
-        if firstStart {
-            flushTimer.setEventHandler { [weak self] in
-                self?.flushNow()
-            }
-            flushTimer.resume()
         }
 
         logBuffer.append(LogLine(stream: .system, text: "[IdeaLightRun] 进程已启动，PID \(process.processIdentifier)"))

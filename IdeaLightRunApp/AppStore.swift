@@ -45,8 +45,9 @@ final class AppStore: ObservableObject {
 
     // MARK: - 运行管理（§32–§35）
 
-    func run(configKey: String) {
-        guard let project = selectedProject,
+    func run(configKey: String, projectID: String? = nil) {
+        let project = projectID.flatMap { id in projects.first { $0.id == id } } ?? selectedProject
+        guard let project,
               let config = project.result?.configurations.first(where: { $0.uniqueKey == configKey }) else {
             return
         }
@@ -65,8 +66,12 @@ final class AppStore: ObservableObject {
         sessions.removeValue(forKey: configKey)
 
         let model = RunningProcessModel(configKey: configKey, configName: config.name, projectPath: project.id)
+        model.onChange = { [weak self] in
+            self?.objectWillChange.send()
+        }
+        // 重启可能发生在用户切换项目之后，必须锁定发起时的项目而不是当时的 selectedProject。
         model.onRestartNeeded = { [weak self] in
-            self?.run(configKey: configKey)
+            self?.run(configKey: configKey, projectID: project.id)
         }
         sessions[configKey] = model
         selectedConfigurationKey = configKey
@@ -120,28 +125,22 @@ final class AppStore: ObservableObject {
     /// §33: 构建期 Stop → 终止 Maven 构建；运行期 Stop → SIGTERM，
     /// 3 秒后仍存活由用户决定 Force Kill。
     func stop(configKey: String) {
-        guard let model = sessions[configKey] else { return }
-        switch model.state {
-        case .preparing, .resolvingClasspath, .building, .starting:
-            model.buildHandle?.terminate()
-        case .running:
-            model.session?.stop()
-        case .stopping, .exited, .cancelled, .failed:
-            break
-        }
+        guard let model = sessions[configKey], !model.state.isTerminal else { return }
+        // model.state 经主线程异步投递，构建期/运行期的边界上可能仍是旧值；
+        // 两个通道都发一次，避免 Stop 落空（已结束的句柄是 no-op）。
+        model.buildHandle?.terminate()
+        model.session?.stop()
     }
 
     func forceKill(configKey: String) {
-        guard let model = sessions[configKey] else { return }
-        if model.state == .stopping {
-            model.session?.forceKill()
-        } else if model.isActiveBuildPhase {
-            model.buildHandle?.forceKill()
-        }
+        guard let model = sessions[configKey], !model.state.isTerminal else { return }
+        model.session?.forceKill()
+        model.buildHandle?.forceKill()
     }
 
     /// §34: 等旧进程退出后再重新走完整流水线。
     func restart(configKey: String) {
+        let projectID = sessions[configKey]?.projectPath
         if let model = sessions[configKey], !model.state.isTerminal {
             if model.isRunning {
                 model.pendingRestart = true
@@ -151,11 +150,7 @@ final class AppStore: ObservableObject {
             return
         }
         sessions.removeValue(forKey: configKey)
-        run(configKey: configKey)
-    }
-
-    func state(for configKey: String) -> ProcessState? {
-        sessions[configKey]?.state
+        run(configKey: configKey, projectID: projectID)
     }
 
     // MARK: - 项目管理（§48）
@@ -179,9 +174,11 @@ final class AppStore: ObservableObject {
     }
 
     func removeProject(id: String) {
-        // 停掉该项目正在运行的服务
-        for model in sessions.values where model.projectPath == id {
-            model.session?.stop()
+        // 停掉该项目正在运行的服务，并丢弃其会话（否则 configKey 会残留到同名项目重新添加时）
+        let ownedKeys = sessions.compactMap { $0.value.projectPath == id ? $0.key : nil }
+        for key in ownedKeys {
+            stop(configKey: key)
+            sessions.removeValue(forKey: key)
         }
         projects.removeAll { $0.id == id }
         if selectedProjectID == id {

@@ -6,19 +6,28 @@ import IdeaLightRunCore
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let store = AppStore.current else { return .terminateNow }
-        let running = store.sessions.values.filter { !$0.state.isTerminal }
-        for model in running {
+        let active = store.sessions.values.filter { !$0.state.isTerminal }
+        for model in active {
+            model.buildHandle?.terminate()
             model.session?.stop()
         }
-        // 最多等 2 秒优雅退出，剩余强杀
+        // 这里阻塞了主线程，model.state 由 Task { @MainActor } 写入、永远不会更新；
+        // 必须轮询后台线程直接维护的 ProcessSession / Process 状态。
+        func stillAlive(_ model: RunningProcessModel) -> Bool {
+            if let session = model.session { return !session.state.isTerminal }
+            return model.buildHandle?.hasLiveProcess ?? false
+        }
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline {
-            let stillRunning = running.contains(where: { model in !model.state.isTerminal })
-            if !stillRunning { break }
+            if !active.contains(where: stillAlive) { break }
             Thread.sleep(forTimeInterval: 0.05)
         }
-        for model in running where !model.state.isTerminal {
-            model.session?.forceKill()
+        for model in active {
+            if let session = model.session {
+                if !session.state.isTerminal { session.forceKill() }
+            } else {
+                model.buildHandle?.forceKill()
+            }
         }
         return .terminateNow
     }
@@ -211,9 +220,14 @@ struct ConfigurationListView: View {
                 .listStyle(.inset(alternatesRowBackgrounds: true))
                 .contextMenu(forSelectionType: String.self) { keys in
                     if let key = keys.first {
+                        // 可用性跟随运行态，避免点了没反应的菜单项
+                        let model = store.sessions[key]
                         Button("运行 ▶") { store.run(configKey: key) }
+                            .disabled(model.map { !$0.state.isTerminal } ?? false)
                         Button("重启 ↻") { store.restart(configKey: key) }
+                            .disabled(model.map { $0.isBuilding || $0.state == .stopping } ?? false)
                         Button("停止 ■", role: .destructive) { store.stop(configKey: key) }
+                            .disabled(model.map { !$0.state.isActive || $0.state == .stopping } ?? true)
                     }
                 } primaryAction: { keys in
                     if let key = keys.first {

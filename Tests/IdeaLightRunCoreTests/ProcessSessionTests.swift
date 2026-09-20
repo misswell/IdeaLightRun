@@ -64,6 +64,59 @@ final class ProcessSessionTests: XCTestCase {
         ))
     }
 
+    /// 可执行但无法 spawn 的目标：run() 抛错时写入的日志也必须送达 UI。
+    /// 回归——flush 定时器原先在 run() 之后才 resume，失败路径上的日志永远留在缓冲区。
+    func testFailedStartStillDeliversLogs() throws {
+        let bogus = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lightrun-bogus-\(UUID().uuidString)")
+        try Data("#!/nonexistent/interpreter\n".utf8).write(to: bogus)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bogus.path)
+        defer { try? FileManager.default.removeItem(at: bogus) }
+
+        let session = try ProcessSession(
+            configKey: "test", configName: "test",
+            plan: makePlan(executable: bogus.path, arguments: [])
+        )
+        var received: [LogLine] = []
+        let lock = NSLock()
+        session.onLogLines = { batch in
+            lock.lock()
+            received += batch
+            lock.unlock()
+        }
+
+        session.start()
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            lock.lock()
+            let delivered = received.contains { $0.text.contains("启动失败") }
+            lock.unlock()
+            if delivered { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        lock.lock()
+        let text = received.map(\.text).joined(separator: "\n")
+        lock.unlock()
+        XCTAssertTrue(text.contains("启动失败"), "启动失败的原因必须出现在控制台，实际：\(text)")
+        guard case .failed = session.state else {
+            return XCTFail("期望 failed，实际：\(session.state)")
+        }
+    }
+
+    /// start() 从未调用过也必须能安全释放：定时器在 init 就 resume，
+    /// 否则 deinit 里 cancel 一个挂起的 DispatchSource 会直接崩溃。
+    func testReleaseWithoutStartIsSafe() throws {
+        for _ in 0..<20 {
+            let session = try ProcessSession(
+                configKey: "test", configName: "test",
+                plan: makePlan(executable: "/bin/echo", arguments: ["unused"])
+            )
+            withExtendedLifetime(session) {}
+        }
+    }
+
     func testLogBufferCapUnderHeavyOutput() throws {
         // 大量输出时环形缓冲不应无限增长（§37）
         let session = try ProcessSession(
