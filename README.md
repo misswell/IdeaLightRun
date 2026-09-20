@@ -45,18 +45,19 @@ swift run IdeaLightRunCLI scan /path/to/project --json
 ## GUI 打包与发布
 
 ```bash
-./scripts/build-app.sh release                    # 产物 build/IdeaLightRun.app，双击使用
-UNIVERSAL=1 APP_VERSION=0.1.0 ./scripts/build-app.sh release   # arm64 + x86_64 通用包（发布用）
+./scripts/build-app.sh release      # 本机包：Developer ID 签名 + hardened runtime，产物 build/IdeaLightRun.app
+./scripts/distribute-app.sh         # 正式包：通用二进制 + 签名 + 公证 + staple + 校验，产物 dist/
 ```
 
-发布由 GitHub Actions 完成：推 tag 即触发 `swift test` → 通用包构建 → 创建 Release
-（附件 `IdeaLightRun-<ver>-universal.zip` 与 `SHA256SUMS.txt`）。
+正式发布走 GitHub Actions：推 `v*` tag 即自动 `swift test` → Developer ID 签名 → Apple 公证
+→ staple → 创建 Release（附件 `IdeaLightRun-<ver>-universal.zip` 与 `SHA256SUMS.txt`）。
 
 ```bash
 git tag -a v0.1.1 -m "v0.1.1" && git push origin v0.1.1
 ```
 
-产物为 ad-hoc 签名、未做 Apple 公证，用户首次打开需右键 → 打开。
+产物已 Developer ID 签名并公证（票据已 staple），解压双击即可打开，无需右键放行；
+通用二进制（Apple Silicon + Intel），要求 macOS 13 及以上。
 Maven 集成测试需要真实下载依赖，只在本地跑，CI 用 `--skip` 跳过。
 
 ## 测试

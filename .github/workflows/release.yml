@@ -8,9 +8,24 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: idealightrun-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  macos:
+  release:
+    name: Sign, notarize, and publish
     runs-on: macos-14
+    env:
+      APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      GH_TOKEN: ${{ github.token }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -20,34 +35,69 @@ jobs:
       - name: Test
         run: swift test --skip MavenClasspathIntegrationTests
 
-      - name: Build universal app
-        run: APP_VERSION="${GITHUB_REF_NAME#v}" UNIVERSAL=1 ./scripts/build-app.sh release
-
-      - name: Package
+      - name: Sign, notarize, and staple
+        shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          mkdir -p dist
-          ditto -c -k --keepParent build/IdeaLightRun.app "dist/IdeaLightRun-${VERSION}-universal.zip"
-          (cd dist && shasum -a 256 *.zip > SHA256SUMS.txt)
+          set -euo pipefail
+          keychain_path="$RUNNER_TEMP/idealightrun-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          certificate_path="$RUNNER_TEMP/developer-id.p12"
+          notary_key_path="$RUNNER_TEMP/notary-api.p8"
 
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
+          cleanup() {
+            security delete-keychain "$keychain_path" >/dev/null 2>&1 || true
+            rm -f "$certificate_path" "$notary_key_path"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$APPLE_CERTIFICATE_P12" | base64 -D > "$certificate_path"
+          printf '%s' "$APPLE_API_KEY" | base64 -D > "$notary_key_path"
+          security create-keychain -p "$keychain_password" "$keychain_path" >/dev/null
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security >/dev/null
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path" >/dev/null
+          security list-keychains -d user -s "$keychain_path"
+          security find-identity -v -p codesigning "$keychain_path"
+
+          IDEALIGHTRUN_VERSION="${GITHUB_REF_NAME#v}" \
+          IDEALIGHTRUN_DEVELOPER_ID="$APPLE_DEVELOPER_ID" \
+          IDEALIGHTRUN_TEAM_ID="$APPLE_TEAM_ID" \
+          IDEALIGHTRUN_APPLE_API_KEY_PATH="$notary_key_path" \
+          IDEALIGHTRUN_APPLE_API_KEY_ID="$APPLE_API_KEY_ID" \
+          IDEALIGHTRUN_APPLE_API_ISSUER="$APPLE_API_ISSUER" \
+            ./scripts/distribute-app.sh
+
+      - name: Publish GitHub Release
+        shell: bash
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
+          archive="dist/IdeaLightRun-${VERSION}-universal.zip"
+          [ -f "$archive" ] || { echo "缺少发布产物 $archive" >&2; exit 1; }
+
           cat > "$RUNNER_TEMP/notes.md" <<EOF
           ## 安装
 
           1. 下载 \`IdeaLightRun-${VERSION}-universal.zip\`，解压得到 IdeaLightRun.app
-          2. 首次打开若被 Gatekeeper 拦截：右键 App → 打开 → 打开
-             （产物为 ad-hoc 签名，未做 Apple 开发者公证）
+          2. 拖到「应用程序」后直接双击打开——产物已 Developer ID 签名并通过 Apple 公证、
+             票据已 staple，离线也放行
 
           通用二进制（Apple Silicon + Intel），要求 macOS 13 及以上。
           需要本机安装 JDK 与 Maven（或项目内的 mvnw）。
           EOF
+
           gh release create "$GITHUB_REF_NAME" \
             --title "IdeaLightRun ${GITHUB_REF_NAME}" \
             --notes-file "$RUNNER_TEMP/notes.md" \
             --generate-notes \
-            "dist/IdeaLightRun-${VERSION}-universal.zip" \
+            "$archive" \
             "dist/SHA256SUMS.txt"

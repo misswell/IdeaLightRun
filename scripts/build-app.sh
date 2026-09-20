@@ -1,16 +1,28 @@
 #!/bin/bash
-# 构建 IdeaLightRun.app（debug 或 release），供本机双击使用。
-# 用法: ./scripts/build-app.sh [release]
-#   UNIVERSAL=1  产 arm64 + x86_64 通用包（发布用，仅 release）
-#   APP_VERSION  写入 CFBundleVersion/ShortVersionString，默认 0.1.0
+# 构建 IdeaLightRun.app。
+# 用法: ./scripts/build-app.sh [debug|release]      默认 release
+#   IDEALIGHTRUN_UNIVERSAL=1     产 arm64 + x86_64 通用包（发布用，仅 release）
+#   IDEALIGHTRUN_VERSION         写入 CFBundleVersion/ShortVersionString，默认取最近 tag
+#   IDEALIGHTRUN_DEVELOPER_ID    签名身份，默认本机 Developer ID
+# 出正式包请走 scripts/distribute-app.sh（签名 + 公证 + staple + 校验）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CONFIG="${1:-release}"
-VERSION="${APP_VERSION:-0.1.0}"
+DEVELOPER_ID="${IDEALIGHTRUN_DEVELOPER_ID:-Developer ID Application: Guofeng Liu (U8U443D7ZL)}"
+TEAM_ID="${IDEALIGHTRUN_TEAM_ID:-U8U443D7ZL}"
 BUILD_UNIVERSAL=0
-if [ "${UNIVERSAL:-}" = "1" ] && [ "$CONFIG" = "release" ]; then
+if [ "${IDEALIGHTRUN_UNIVERSAL:-}" = "1" ] && [ "$CONFIG" = "release" ]; then
     BUILD_UNIVERSAL=1
+fi
+
+VERSION="${IDEALIGHTRUN_VERSION:-}"
+if [ -z "$VERSION" ]; then
+    VERSION="$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')"
+fi
+[ -n "$VERSION" ] || VERSION="0.0.0-dev"
+
+if [ "$BUILD_UNIVERSAL" = "1" ]; then
     swift build -c release --arch arm64 --arch x86_64
 else
     swift build -c "$CONFIG"
@@ -68,5 +80,14 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-codesign --force --sign - "$APP"
+# Hardened runtime + 安全时间戳是公证的硬性前提；ad-hoc 签名不会被 Gatekeeper 放行。
+codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$APP"
+
+codesign --verify --deep --strict "$APP"
+SIGNATURE="$(codesign --display --verbose=4 "$APP" 2>&1)"
+grep -q '^Authority=Developer ID Application:' <<<"$SIGNATURE" \
+    || { echo "❌ 不是 Developer ID Application 签名" >&2; exit 1; }
+grep -q "^TeamIdentifier=$TEAM_ID$" <<<"$SIGNATURE" \
+    || { echo "❌ TeamIdentifier 不是 $TEAM_ID" >&2; exit 1; }
+
 echo "✅ Built $APP (v${VERSION}, $(lipo -archs "$APP/Contents/MacOS/IdeaLightRun"))"
