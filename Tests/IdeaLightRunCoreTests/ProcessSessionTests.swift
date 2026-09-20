@@ -129,4 +129,45 @@ final class ProcessSessionTests: XCTestCase {
         XCTAssertLessThanOrEqual(session.logBuffer.count, 20_000)
         XCTAssertGreaterThan(session.logBuffer.count, 0)
     }
+
+    /// 回归：readerGroup.notify 原先在 enter() 之前注册，计数为 0 时它会立即投递，
+    /// 于是进程刚起来就被判成 .exited(0)——服务在跑，列表却显示"已退出"。
+    func testLongRunningProcessIsNotReportedExited() throws {
+        let session = try ProcessSession(
+            configKey: "test", configName: "test",
+            plan: makePlan(executable: "/bin/sleep", arguments: ["30"])
+        )
+        session.start()
+        // 旧实现里 notify 立即投递 + 退出码兜底为 0，2 秒后就会显示"已退出 (0)"
+        Thread.sleep(forTimeInterval: 2.5)
+        XCTAssertEqual(session.state, .running, "进程仍在运行时不得报退出")
+
+        session.stop()
+        XCTAssertTrue(session.waitUntilExit(timeout: 10))
+    }
+
+    /// 回归：子进程自行关闭 stdout（管道 EOF）不等于进程退出，退出码必须来自真实退出。
+    func testStdoutClosedWhileProcessAlive() throws {
+        let session = try ProcessSession(
+            configKey: "test", configName: "test",
+            plan: makePlan(executable: "/bin/sh", arguments: ["-c", "exec 1>&-; sleep 1; exit 7"])
+        )
+        session.start()
+        Thread.sleep(forTimeInterval: 0.4)
+        XCTAssertEqual(session.state, .running, "stdout 关闭后进程还活着，不能报退出")
+
+        XCTAssertTrue(session.waitUntilExit(timeout: 10))
+        XCTAssertEqual(session.state, .exited(7))
+    }
+
+    /// 孙进程继承管道写端会让 EOF 迟迟不到；状态必须以进程退出为准，不能卡在"运行中"。
+    func testExitDetainedByInheritedPipeStillReports() throws {
+        let session = try ProcessSession(
+            configKey: "test", configName: "test",
+            plan: makePlan(executable: "/bin/sh", arguments: ["-c", "sleep 2 & exit 3"])
+        )
+        session.start()
+        XCTAssertTrue(session.waitUntilExit(timeout: 5), "父进程已退出，不能被挂起的管道拖住状态")
+        XCTAssertEqual(session.state, .exited(3))
+    }
 }

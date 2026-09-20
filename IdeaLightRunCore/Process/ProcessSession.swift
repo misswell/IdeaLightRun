@@ -4,6 +4,7 @@ import Foundation
 /// - Process.arguments 数组传参，绝不走 /bin/sh -c（§27）
 /// - stdout/stderr 分别由读线程捕获进入环形缓冲（§36/§37）
 ///   （读线程而非 readabilityHandler：避免与 readDataToEndOfFile 混用的 Foundation 竞态崩溃）
+/// - 退出以进程本身为准：管道 EOF 只代表"暂时没有输出"，不代表进程退出
 /// - 100ms 批量回调（§103）
 /// - stop(): SIGTERM → 由用户决定 Force Kill（§33）
 public final class ProcessSession {
@@ -19,6 +20,9 @@ public final class ProcessSession {
     private var stateValue: ProcessState = .starting
     private var splitters: [LogStream: LineSplitter] = [:]
     private var exitStatusValue: Int32?
+    private var hasTerminated = false
+    /// 收尾只生效一次；只在 flushQueue 上读写，无需加锁。
+    private var didFinish = false
 
     private let process: Process
     private let flushTimer: DispatchSourceTimer
@@ -99,18 +103,26 @@ public final class ProcessSession {
         logBuffer.append(LogLine(stream: .system, text: "[IdeaLightRun] 进程已启动，PID \(process.processIdentifier)"))
         setState(.running)
 
-        // 读线程持续消费管道直到 EOF；EOF + 退出码齐备后统一收尾
+        // 退出状态以进程本身为准；管道只决定日志何时读完。
         process.terminationHandler = { [weak self] terminatedProcess in
             guard let self else { return }
             self.lock.lock()
             self.exitStatusValue = terminatedProcess.terminationStatus
+            self.hasTerminated = true
             self.lock.unlock()
+            // 被启动的进程可能派生子进程继承管道写端，使 EOF 迟迟不到；
+            // 给读线程一个宽限期送完尾部日志，之后必须落定状态，否则永远停在"运行中"。
+            self.flushQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.finishOnce()
+            }
         }
-        readerGroup.notify(queue: flushQueue) { [weak self] in
-            self?.finishReading()
-        }
+        // 必须先 pump 再 notify：notify 在计数已归零时会立即投递，
+        // 那样进程刚启动就被判成退出。
         pump(.stdout, fileHandle: stdoutPipe.fileHandleForReading)
         pump(.stderr, fileHandle: stderrPipe.fileHandleForReading)
+        readerGroup.notify(queue: flushQueue) { [weak self] in
+            self?.finishOnce()
+        }
     }
 
     /// §33: 先 SIGTERM；仍存活则保持 .stopping，等待用户 Force Kill。
@@ -153,19 +165,47 @@ public final class ProcessSession {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             defer { self?.readerGroup.leave() }
             while true {
+                guard let self else { return }
                 let data = fileHandle.readData(ofLength: 65536)
-                if data.isEmpty { return }  // EOF
-                self?.ingest(data, stream: stream)
+                if data.isEmpty {
+                    // 管道 EOF ≠ 进程退出：被启动的进程可以自行关闭/重定向 fd 1、2，
+                    // 或读操作被瞬时错误打断。此时必须继续排空（否则对端写满 64KB 会永久阻塞），
+                    // 只有进程真的退出才结束读取。
+                    if self.processHasExited() { return }
+                    Thread.sleep(forTimeInterval: 0.1)
+                    continue
+                }
+                self.ingest(data, stream: stream)
             }
         }
     }
 
-    private func finishReading() {
-        // 尾部半行
+    /// terminationHandler 可能来不及回调（进程在赋值前就退出），因此同时向 Process 本身确认。
+    private func processHasExited() -> Bool {
+        lock.lock()
+        if hasTerminated {
+            lock.unlock()
+            return true
+        }
+        lock.unlock()
+        guard !process.isRunning else { return false }
+        lock.lock()
+        exitStatusValue = process.terminationStatus
+        hasTerminated = true
+        lock.unlock()
+        return true
+    }
+
+    /// 收尾：读线程全部结束，或进程退出后过了宽限期。两条路径都可能到达，只生效一次。
+    /// 只在 flushQueue 上执行，因此 didFinish 无需加锁。
+    private func finishOnce() {
+        guard !didFinish else { return }
+        didFinish = true
+
         lock.lock()
         let remainingSplitters = splitters
         splitters = [:]
-        var status = exitStatusValue
+        let status = exitStatusValue
         lock.unlock()
         for (stream, splitter) in remainingSplitters {
             var splitter = splitter
@@ -174,22 +214,15 @@ public final class ProcessSession {
             }
         }
 
-        // terminationHandler 与 EOF 顺序不定，短暂等待退出码
-        var waitedMilliseconds = 0
-        while status == nil && waitedMilliseconds < 2000 {
-            Thread.sleep(forTimeInterval: 0.02)
-            waitedMilliseconds += 20
-            lock.lock()
-            status = exitStatusValue
-            lock.unlock()
+        // 读线程只在进程确认退出后才收尾，退出码此时必定已知；
+        // 拿不到就是状态机出了问题，绝不能报成"退出码 0"的成功假象。
+        guard let exitCode = status else {
+            flushNow()
+            setState(.failed("进程状态未知：未取到退出码"))
+            return
         }
-
-        let exitCode = status ?? 0
-        lock.lock()
-        stateValue = .exited(exitCode)
-        lock.unlock()
         flushNow()
-        onState?(.exited(exitCode))
+        setState(.exited(exitCode))
     }
 
     private func ingest(_ data: Data, stream: LogStream) {
