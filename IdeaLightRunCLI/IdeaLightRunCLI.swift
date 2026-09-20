@@ -328,12 +328,12 @@ struct IdeaLightRunCLI {
     }
 
     static func runBuild(arguments: [String]) throws {
-        var rebuild = false
+        var rebuildRequested = false
         var path: String?
         for argument in arguments {
             switch argument {
             case "--rebuild":
-                rebuild = true
+                rebuildRequested = true
             case "-h", "--help":
                 printUsage()
                 exit(0)
@@ -350,6 +350,8 @@ struct IdeaLightRunCLI {
             FileHandle.standardError.write("用法：idealightrun build [--rebuild] <project>\n".data(using: .utf8)!)
             exit(2)
         }
+        let rebuild = rebuildRequested
+
 
         let expanded = (path as NSString).expandingTildeInPath
         let projectRoot = URL(fileURLWithPath: expanded, isDirectory: true)
