@@ -24,6 +24,10 @@ final class AppStore: ObservableObject {
     @Published var alertMessage: String?
     /// configKey → 运行会话（含构建阶段）
     @Published private(set) var sessions: [String: RunningProcessModel] = [:]
+    /// projectID → 最近一次项目级构建（IDEA 的 Build / Rebuild Project）
+    @Published private(set) var builds: [String: ProjectBuildModel] = [:]
+    /// 每次开始构建自增，UI 据此切到"构建"页看输出
+    @Published private(set) var buildRevision = 0
 
     private static let persistenceURL = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -41,6 +45,11 @@ final class AppStore: ObservableObject {
     var selectedConfiguration: RunConfiguration? {
         guard let key = selectedConfigurationKey else { return nil }
         return selectedProject?.result?.configurations.first { $0.uniqueKey == key }
+    }
+
+    /// 当前项目的最近一次构建（菜单项"停止构建"用）
+    var currentBuild: ProjectBuildModel? {
+        selectedProjectID.flatMap { builds[$0] }
     }
 
     // MARK: - 运行管理（§32–§35）
@@ -153,6 +162,67 @@ final class AppStore: ObservableObject {
         run(configKey: configKey, projectID: projectID)
     }
 
+    // MARK: - 项目级构建（IDEA 的 Build / Rebuild Project）
+
+    /// Build Project = 增量 `compile`；Rebuild Project = `clean compile` 全量。
+    /// 构建中重复触发直接忽略：同项目已由 BuildGate 串行（§42），排队只会让 UI 看起来卡住。
+    func build(projectID: String? = nil, rebuild: Bool) {
+        guard let id = projectID ?? selectedProjectID,
+              let project = projects.first(where: { $0.id == id }) else { return }
+        guard project.result?.buildSystem.maven != nil else {
+            alertMessage = "当前版本仅支持 Maven 项目构建；Gradle 支持在 Milestone 4 提供。"
+            return
+        }
+        guard builds[id]?.phase.isBusy != true else { return }
+
+        let model = ProjectBuildModel(projectPath: id, rebuild: rebuild)
+        let handle = ProcessHandle()
+        model.handle = handle
+        model.onChange = { [weak self] in
+            self?.objectWillChange.send()
+        }
+        builds[id] = model
+        buildRevision += 1
+
+        let projectRoot = project.url
+        let builder = ProjectBuilder()
+        Task.detached(priority: .userInitiated) {
+            do {
+                try await builder.build(
+                    projectRoot: projectRoot,
+                    rebuild: rebuild,
+                    log: { line in
+                        Task { @MainActor in model.appendLog(line) }
+                    },
+                    processHandle: handle
+                )
+                await model.succeed()
+            } catch let error as IdeaLightRunError {
+                if case .launchCancelled = error {
+                    await model.cancel()
+                } else {
+                    await model.fail(error.localizedDescription)
+                }
+            } catch {
+                await model.fail(error.localizedDescription)
+            }
+        }
+    }
+
+    /// 停止构建 = SIGTERM Maven 进程（对齐 IDEA 的 Stop Build）；已结束的句子进程是 no-op。
+    func stopBuild(projectID: String? = nil) {
+        guard let id = projectID ?? selectedProjectID,
+              let model = builds[id], model.phase.isBusy else { return }
+        model.markStopping()
+        model.handle?.terminate()
+    }
+
+    func forceKillBuild(projectID: String? = nil) {
+        guard let id = projectID ?? selectedProjectID,
+              let model = builds[id], model.phase.isBusy else { return }
+        model.handle?.forceKill()
+    }
+
     // MARK: - 项目管理（§48）
 
     func addProject(url: URL) {
@@ -180,6 +250,8 @@ final class AppStore: ObservableObject {
             stop(configKey: key)
             sessions.removeValue(forKey: key)
         }
+        builds[id]?.handle?.terminate()
+        builds.removeValue(forKey: id)
         projects.removeAll { $0.id == id }
         if selectedProjectID == id {
             selectedProjectID = projects.first?.id

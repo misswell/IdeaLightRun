@@ -4,7 +4,7 @@ import IdeaLightRunCore
 /// GUI 侧的单次运行模型：包装 ProcessSession，回调统一切回主线程。
 /// 日志经 LogRingBuffer（§37 上限）+ 100ms 批量（§103）进入 NSTextView 控制台。
 @MainActor
-final class RunningProcessModel: ObservableObject, Identifiable {
+final class RunningProcessModel: LogViewModel, Identifiable {
     nonisolated let id: String
     let configKey: String
     let configName: String
@@ -13,8 +13,6 @@ final class RunningProcessModel: ObservableObject, Identifiable {
 
     @Published private(set) var state: ProcessState = .preparing
     @Published private(set) var pid: Int32?
-    @Published var lines: [LogLine] = []
-    @Published var clearGeneration = 0
 
     /// 构建期（classpath 解析/编译）进程句柄，Stop 用它终止 Maven。
     var buildHandle: ProcessHandle?
@@ -28,14 +26,12 @@ final class RunningProcessModel: ObservableObject, Identifiable {
     /// 永远冻结在 Run 那一刻的快照上（进程已退出仍显示"准备中"）。
     var onChange: (() -> Void)?
 
-    /// lines[0] 对应的绝对行号（配合环形截断，供控制台增量渲染）。
-    private(set) var firstLineIndex = 0
-
     init(configKey: String, configName: String, projectPath: String) {
         self.configKey = configKey
         self.configName = configName
         self.projectPath = projectPath
         self.id = configKey
+        super.init()
     }
 
     var isBuilding: Bool {
@@ -51,28 +47,9 @@ final class RunningProcessModel: ObservableObject, Identifiable {
 
     var isRunning: Bool { state == .running }
 
-    static let maxViewLines = 20_000
-
-    func appendLog(_ line: LogLine) {
-        appendLog([line])
-    }
-
-    func appendLog(_ batch: [LogLine]) {
-        guard !batch.isEmpty else { return }
-        lines.append(contentsOf: batch)
-        // 内存上限与 LogRingBuffer 对齐（§37）
-        if lines.count > Self.maxViewLines {
-            let drop = lines.count - Self.maxViewLines
-            lines.removeFirst(drop)
-            firstLineIndex += drop
-        }
-    }
-
-    func clearLogs() {
+    override func clearLogs() {
         logBuffer.clear()
-        lines = []
-        firstLineIndex = 0
-        clearGeneration += 1
+        super.clearLogs()
     }
 
     func setPipelineState(_ newState: ProcessState) {

@@ -25,6 +25,13 @@ struct IdeaLightRunCLI {
                 printError(error)
                 exit(1)
             }
+        case "build":
+            do {
+                try runBuild(arguments: Array(arguments.dropFirst()))
+            } catch {
+                printError(error)
+                exit(1)
+            }
         case "help", "--help", "-h":
             printUsage()
         default:
@@ -309,6 +316,92 @@ struct IdeaLightRunCLI {
         exit(1)
     }
 
+    // MARK: - build（IDEA 的 Build Project / Rebuild Project）
+
+    final class ExitCodeBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _value: Int32 = 1
+        var value: Int32 {
+            get { lock.lock(); defer { lock.unlock() }; return _value }
+            set { lock.lock(); _value = newValue; lock.unlock() }
+        }
+    }
+
+    static func runBuild(arguments: [String]) throws {
+        var rebuild = false
+        var path: String?
+        for argument in arguments {
+            switch argument {
+            case "--rebuild":
+                rebuild = true
+            case "-h", "--help":
+                printUsage()
+                exit(0)
+            default:
+                if argument.hasPrefix("-") {
+                    FileHandle.standardError.write("未知选项：\(argument)\n".data(using: .utf8)!)
+                    printUsage()
+                    exit(2)
+                }
+                if path == nil { path = argument }
+            }
+        }
+        guard let path else {
+            FileHandle.standardError.write("用法：idealightrun build [--rebuild] <project>\n".data(using: .utf8)!)
+            exit(2)
+        }
+
+        let expanded = (path as NSString).expandingTildeInPath
+        let projectRoot = URL(fileURLWithPath: expanded, isDirectory: true)
+        guard BuildSystemDetector.isValidProjectRoot(projectRoot) else {
+            throw IdeaLightRunError.invalidProjectRoot(path: projectRoot.path)
+        }
+
+        let logLock = NSLock()
+        let emit: (String) -> Void = { text in
+            logLock.lock()
+            print(text)
+            logLock.unlock()
+        }
+
+        let handle = ProcessHandle()
+        let code = ExitCodeBox()
+        let finished = DispatchSemaphore(value: 0)
+        Task.detached(priority: .userInitiated) {
+            do {
+                try await ProjectBuilder().build(
+                    projectRoot: projectRoot,
+                    rebuild: rebuild,
+                    log: { line in emit(line.text) },
+                    progress: { state in emit("[IdeaLightRun] \(state.displayText)…") },
+                    processHandle: handle
+                )
+                code.value = 0
+            } catch let error as IdeaLightRunError {
+                emit("[IdeaLightRun] \(error.title)：\(error.reason)")
+                // 130 = 128 + SIGINT，与被 Ctrl-C 终止的命令行工具一致
+                code.value = isCancelled(error) ? 130 : 1
+            } catch {
+                emit("[IdeaLightRun] 错误：\(error.localizedDescription)")
+                code.value = 1
+            }
+            finished.signal()
+        }
+
+        // Ctrl-C → 终止正在进行的 Maven 构建（对齐 IDEA 的 Stop Build）
+        signal(SIGINT, SIG_IGN)
+        let interruptSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: DispatchQueue.global())
+        interruptSource.setEventHandler { handle.terminate() }
+        interruptSource.resume()
+        finished.wait()
+        exit(code.value)
+    }
+
+    private static func isCancelled(_ error: IdeaLightRunError) -> Bool {
+        if case .launchCancelled = error { return true }
+        return false
+    }
+
     // MARK: - Usage / Error
 
     static func printUsage() {
@@ -321,10 +414,12 @@ struct IdeaLightRunCLI {
             COMMANDS:
               scan <path>                扫描项目并输出所有 Run Configuration（list 为别名）
               run <path> <config-name>   编译并启动指定配置（Ctrl-C 停止）
+              build <path>               构建整个项目（IDEA 的 Build Project）
 
             OPTIONS:
               --json                     以 JSON 输出（scan）
               --show-secrets             显示环境变量明文（默认掩码）
+              --rebuild                  先清空产物再全量编译（build，IDEA 的 Rebuild Project）
               -h, --help                 显示帮助
             """
         )

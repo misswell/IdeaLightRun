@@ -11,6 +11,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model.buildHandle?.terminate()
             model.session?.stop()
         }
+        // 项目级构建（Build/Rebuild Project）的 Maven 子进程同样要停，否则退出后留下孤儿 mvn
+        let building = store.builds.values.filter { $0.phase.isBusy }
+        for model in building {
+            model.handle?.terminate()
+        }
         // 这里阻塞了主线程，model.state 由 Task { @MainActor } 写入、永远不会更新；
         // 必须轮询后台线程直接维护的 ProcessSession / Process 状态。
         func stillAlive(_ model: RunningProcessModel) -> Bool {
@@ -19,7 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let deadline = Date().addingTimeInterval(2)
         while Date() < deadline {
-            if !active.contains(where: stillAlive) { break }
+            if !active.contains(where: stillAlive) && !building.contains(where: { $0.handle?.hasLiveProcess ?? false }) { break }
             Thread.sleep(forTimeInterval: 0.05)
         }
         for model in active {
@@ -28,6 +33,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 model.buildHandle?.forceKill()
             }
+        }
+        for model in building {
+            model.handle?.forceKill()
         }
         return .terminateNow
     }
@@ -42,6 +50,26 @@ struct IdeaLightRunApp: App {
             RootView()
         }
         .windowToolbarStyle(.unified)
+        .commands { BuildCommands() }
+    }
+}
+
+/// IDEA 的 Build 菜单：Build Project（⌘F9）/ Rebuild Project（⇧⌘F9）。
+/// 菜单项不做置灰——不可用时点了要给原因（弹窗），而不是让人猜为什么不能点。
+struct BuildCommands: Commands {
+    /// AppKit 用私有码点表示功能键：F9 = 0xF70C。
+    private static let f9 = KeyEquivalent(Character(UnicodeScalar(0xF70C)!))
+
+    var body: some Commands {
+        CommandMenu("构建") {
+            Button("构建项目") { AppStore.current?.build(rebuild: false) }
+                .keyboardShortcut(Self.f9, modifiers: .command)
+            Button("重新构建项目") { AppStore.current?.build(rebuild: true) }
+                .keyboardShortcut(Self.f9, modifiers: [.command, .shift])
+            Divider()
+            Button("停止构建") { AppStore.current?.stopBuild() }
+            Button("强制结束构建") { AppStore.current?.forceKillBuild() }
+        }
     }
 }
 
@@ -102,6 +130,14 @@ struct SidebarView: View {
                     }
                     .tag(project.id)
                     .contextMenu {
+                        Button("构建项目") { store.build(projectID: project.id, rebuild: false) }
+                            .disabled(project.result?.buildSystem.maven == nil)
+                        Button("重新构建项目") { store.build(projectID: project.id, rebuild: true) }
+                            .disabled(project.result?.buildSystem.maven == nil)
+                        if store.builds[project.id]?.phase.isBusy == true {
+                            Button("停止构建", role: .destructive) { store.stopBuild(projectID: project.id) }
+                        }
+                        Divider()
                         Button("重新扫描") { store.rescan(entryID: project.id) }
                         Divider()
                         Button("移除", role: .destructive) { store.removeProject(id: project.id) }
@@ -166,7 +202,7 @@ struct ConfigurationListView: View {
         Group {
             if let project = store.selectedProject {
                 VStack(spacing: 0) {
-                    ProjectSummaryView(project: project)
+                    ProjectSummaryView(store: store, project: project)
                     Divider()
                     configList(project: project)
                 }
@@ -263,6 +299,7 @@ struct ConfigurationListView: View {
 }
 
 struct ProjectSummaryView: View {
+    @ObservedObject var store: AppStore
     let project: ProjectEntry
 
     var body: some View {
@@ -275,9 +312,47 @@ struct ProjectSummaryView: View {
                 chip(icon: "square.stack.3d.up", text: "\(result.modules.count) 模块")
             }
             Spacer()
+            buildControls
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+    }
+
+    /// IDEA 的 Build Project / Rebuild Project：项目级、作用于整个 reactor。
+    private var buildControls: some View {
+        let build = store.builds[project.id]
+        let busy = build?.phase.isBusy ?? false
+        let mavenReady = project.result?.buildSystem.maven != nil
+        let unavailableHint = "仅支持 Maven 项目；Gradle 支持在 Milestone 4 提供"
+
+        return HStack(spacing: 8) {
+            if busy {
+                ProgressView()
+                    .controlSize(.small)
+                Text(build?.phase.displayText ?? "")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("停止构建") { store.stopBuild(projectID: project.id) }
+                    .disabled(build?.phase == .stopping)
+                    .help("终止 Maven 进程（SIGTERM）")
+                if build?.phase == .stopping {
+                    Button(role: .destructive) {
+                        store.forceKillBuild(projectID: project.id)
+                    } label: {
+                        Image(systemName: "xmark.octagon.fill")
+                    }
+                    .help("强制结束（SIGKILL）")
+                }
+            } else {
+                Button("构建") { store.build(projectID: project.id, rebuild: false) }
+                    .disabled(!mavenReady)
+                    .help(mavenReady ? "增量编译整个项目（IDEA 的 Build Project，⌘F9）" : unavailableHint)
+                Button("重新构建") { store.build(projectID: project.id, rebuild: true) }
+                    .disabled(!mavenReady)
+                    .help(mavenReady ? "清空产物后全量编译（IDEA 的 Rebuild Project，⇧⌘F9）" : unavailableHint)
+            }
+        }
+        .controlSize(.small)
     }
 
     private var buildSystemText: String {
@@ -383,48 +458,136 @@ struct ConfigurationDetailView: View {
     enum DetailTab: String, CaseIterable {
         case info = "信息"
         case console = "控制台"
+        case build = "构建"
     }
 
     var body: some View {
         Group {
-            if let config = store.selectedConfiguration,
-               let project = store.selectedProject,
-               let result = project.result {
+            if let project = store.selectedProject {
                 VStack(spacing: 0) {
-                    header(config: config, project: project, result: result)
+                    header(project: project)
                     Divider()
-                    if detailTab == .console, let model = store.sessions[config.uniqueKey] {
-                        LogConsoleView(model: model)
-                    } else {
-                        infoDetail(config: config, result: result)
+                    detailContent(project: project)
+                }
+                .task(id: store.selectedConfiguration?.uniqueKey) {
+                    revealSecrets = false
+                    if let config = store.selectedConfiguration, let result = project.result {
+                        await resolveDetails(config: config, result: result)
                     }
                 }
-                .task(id: config.uniqueKey) {
-                    revealSecrets = false
-                    await resolveDetails(config: config, result: result)
-                }
+                // 开始构建后自动切到构建页，对齐 IDEA 弹出 Build 窗口的行为
+                .onChange(of: store.buildRevision) { _ in detailTab = .build }
             } else {
-                VStack(spacing: 10) {
-                    Image(systemName: "doc.text.magnifyingglass")
-                        .font(.system(size: 32))
-                        .foregroundStyle(.secondary)
-                    Text("选择一个配置查看详情")
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                emptyPane(icon: "doc.text.magnifyingglass", text: "选择一个项目查看配置")
             }
         }
     }
 
+    @ViewBuilder
+    private func detailContent(project: ProjectEntry) -> some View {
+        switch detailTab {
+        case .info:
+            if let config = store.selectedConfiguration, let result = project.result {
+                infoDetail(config: config, result: result)
+            } else {
+                emptyPane(icon: "doc.text.magnifyingglass", text: "选择一个配置查看详情")
+            }
+        case .console:
+            if let config = store.selectedConfiguration, let model = store.sessions[config.uniqueKey] {
+                LogConsoleView(model: model)
+            } else {
+                emptyPane(icon: "terminal", text: "尚未启动，无运行日志")
+            }
+        case .build:
+            buildDetail(project: project)
+        }
+    }
+
+    private func emptyPane(icon: String, text: String) -> some View {
+        VStack(spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 32))
+                .foregroundStyle(.secondary)
+            Text(text)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: 构建页（IDEA 的 Build 窗口）
+
+    private func buildDetail(project: ProjectEntry) -> some View {
+        Group {
+            if let model = store.builds[project.id] {
+                VStack(alignment: .leading, spacing: 0) {
+                    buildBanner(model: model, project: project)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                    Divider()
+                    LogConsoleView(model: model)
+                }
+            } else {
+                emptyPane(
+                    icon: "hammer",
+                    text: "尚未构建。用 ⌘F9 构建项目，或点项目摘要里的「构建」"
+                )
+            }
+        }
+    }
+
+    private func buildBanner(model: ProjectBuildModel, project: ProjectEntry) -> some View {
+        HStack(spacing: 10) {
+            if model.phase.isBusy {
+                ProgressView()
+                    .controlSize(.small)
+            }
+            Text(model.phase.displayText)
+                .font(.callout.weight(.medium))
+            Text(project.name)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("清空日志") { model.clearLogs() }
+                .controlSize(.small)
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+    }
+
     // MARK: 顶栏：操作按钮（§52）
 
-    private func header(config: RunConfiguration, project: ProjectEntry, result: ScanResult) -> some View {
+    private func header(project: ProjectEntry) -> some View {
+        HStack(spacing: 10) {
+            if let config = store.selectedConfiguration, let result = project.result {
+                configActions(config: config, result: result)
+            } else {
+                Text(project.name)
+                    .font(.title3.weight(.semibold))
+            }
+
+            Spacer()
+
+            Picker("", selection: $detailTab) {
+                ForEach(DetailTab.allCases, id: \.self) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 210)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    @ViewBuilder
+    private func configActions(config: RunConfiguration, result: ScanResult) -> some View {
         let model = store.sessions[config.uniqueKey]
         let launchable = (config.type == .application || config.type == .springBoot) && result.buildSystem.maven != nil
         // IDEA 行为：构建期与运行期 Stop 都可用
         let stopEnabled = model?.state.isActive == true && model?.state != .stopping
 
-        return HStack(spacing: 10) {
+        HStack(spacing: 10) {
             Text(config.name)
                 .font(.title3.weight(.semibold))
             Text(config.type.displayName)
@@ -470,19 +633,9 @@ struct ConfigurationDetailView: View {
             .help("停止旧进程后重新编译启动")
             .disabled(model == nil || model?.isBuilding == true)
             .disabled(model?.state == .stopping)
-
-            Spacer()
-
-            Picker("", selection: $detailTab) {
-                ForEach(DetailTab.allCases, id: \.self) { tab in
-                    Text(tab.rawValue).tag(tab)
-                }
-            }
-            .pickerStyle(.segmented)
-            .frame(width: 150)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
+        // 撑满顶栏剩余宽度，让内部 Spacer 把按钮推到右侧（标签页选择器在其右）
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: 信息页
@@ -686,7 +839,7 @@ struct ConfigurationDetailView: View {
 // MARK: - 控制台（§38: NSTextView，不用 SwiftUI List 渲染日志）
 
 struct LogConsoleView: NSViewRepresentable {
-    @ObservedObject var model: RunningProcessModel
+    @ObservedObject var model: LogViewModel
 
     func makeCoordinator() -> Coordinator {
         Coordinator()

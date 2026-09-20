@@ -27,27 +27,17 @@ public struct JavaLauncher: Sendable {
             throw IdeaLightRunError.moduleNotFound(detail: detail.isEmpty ? "无法定位 module。" : detail)
         }
 
-        // ② JDK 解析（§23）
-        let jdkResolution = JDKResolver().resolve(
+        // ②③ JDK + 构建工具（§23/§15，与项目级构建共用 ProjectToolchain）
+        let toolchain = try ProjectToolchain.resolve(
+            projectRoot: projectRoot,
+            result: result,
             configJDKName: config.jreReference,
-            projectJDKName: result.projectJDKName
+            context: "启动",
+            log: log
         )
-        guard let jdk = jdkResolution.installation else {
-            let detail = jdkResolution.warnings.map(\.detail).joined(separator: "；")
-            throw IdeaLightRunError.jdkNotFound(detail: detail.isEmpty ? "未找到可用 JDK。" : detail)
-        }
-        log(LogLine(stream: .system, text: "[IdeaLightRun] JDK: \(jdk.displayName ?? jdk.home.lastPathComponent) (major \(jdk.majorVersion.map(String.init) ?? "?"))"))
+        let jdk = toolchain.jdk
 
-        // ③ 构建系统（当前 Maven；Gradle 在 Milestone 4）
-        guard let maven = result.buildSystem.maven else {
-            throw IdeaLightRunError.buildToolNotFound(detail: "当前版本仅支持 Maven 项目直接启动；Gradle 支持在 Milestone 4 提供。")
-        }
-        guard let mavenExecutable = MavenBuildService.discoverMavenExecutable(projectRoot: projectRoot) else {
-            throw IdeaLightRunError.buildToolNotFound(detail: "找不到 Maven：项目没有可执行的 mvnw，PATH 中也没有 mvn。")
-        }
-        log(LogLine(stream: .system, text: "[IdeaLightRun] Maven: \(mavenExecutable.path)"))
-
-        let reactor = MavenPomReader.collectReactor(rootPom: maven.pomURL)
+        let reactor = MavenPomReader.collectReactor(rootPom: toolchain.rootPomURL)
         let reactorModule = reactor.first { $0.directory.standardizedFileURL == module.directory.standardizedFileURL }
             ?? reactor.first { $0.artifactId == module.name }
         // reactor 中存在非根模块即视为多模块（§16）
@@ -60,11 +50,7 @@ public struct JavaLauncher: Sendable {
             return info.artifactId
         }()
 
-        let service = MavenBuildService(
-            projectRoot: projectRoot,
-            mavenExecutable: mavenExecutable,
-            environment: MavenBuildService.buildEnvironment(javaHome: jdk.home)
-        )
+        let service = toolchain.service
 
         // ④ §42: 同项目串行构建
         let plan = try await BuildGate.shared.run(projectKey: projectRoot.standardizedFileURL.path) {

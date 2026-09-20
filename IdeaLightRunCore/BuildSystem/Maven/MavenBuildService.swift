@@ -18,11 +18,12 @@ public protocol BuildSystemAdapter {
 }
 
 /// §15/§17/§18: Maven 适配器。
-/// - mvnw 优先，其次 PATH 中的 mvn
+/// - Maven 由 `MavenLocator` 按绝对路径候选定位（不依赖 shell PATH）
 /// - compile 不 clean（增量）
 /// - classpath 交给 Maven 自己解析（dependency:build-classpath），不重写依赖解析
 /// - handle 非空时：构建进程句柄交给调用方，Stop 可终止构建（对齐 IDEA）
-public struct MavenBuildService: BuildSystemAdapter {
+/// - `buildProject(rebuild:)` 是 IDEA 的 Build / Rebuild Project（整个 reactor）
+public struct MavenBuildService: BuildSystemAdapter, Sendable {
     public let projectRoot: URL
     public let mavenExecutable: URL
     public let environment: [String: String]
@@ -42,20 +43,9 @@ public struct MavenBuildService: BuildSystemAdapter {
         self.noSnapshotUpdates = noSnapshotUpdates
     }
 
-    /// §15: 项目自带 Wrapper 优先，其次 PATH 中的 mvn。
+    /// §15: 定位 Maven。见 `MavenLocator`：不能只查 PATH，GUI 从 Dock 启动时 PATH 不含用户安装的 Maven。
     public static func discoverMavenExecutable(projectRoot: URL) -> URL? {
-        let wrapper = projectRoot.appendingPathComponent("mvnw")
-        if FileManager.default.isExecutableFile(atPath: wrapper.path) {
-            return wrapper
-        }
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        for directory in path.split(separator: ":") {
-            let candidate = URL(fileURLWithPath: String(directory)).appendingPathComponent("mvn")
-            if FileManager.default.isExecutableFile(atPath: candidate.path) {
-                return candidate
-            }
-        }
-        return nil
+        MavenLocator.discover(projectRoot: projectRoot)?.executable
     }
 
     /// 构建/解析共用的 Maven 环境：JAVA_HOME 指向解析出的 JDK。
@@ -80,6 +70,31 @@ public struct MavenBuildService: BuildSystemAdapter {
         guard status == 0 else {
             throw IdeaLightRunError.buildFailed(detail: "Maven compile 失败（退出码 \(status)），详见控制台输出。")
         }
+    }
+
+    /// IDEA 的 Build Project / Rebuild Project：作用于整个 reactor，不带 `-pl`。
+    /// Build = 增量 `compile`；Rebuild = `clean compile`（先清空产物再全量编译）。
+    public func buildProject(rebuild: Bool, handle: ProcessHandle?, log: @escaping LogCallback) throws {
+        let goal = rebuild ? "clean compile" : "compile"
+        let status = try run(
+            arguments: Self.projectBuildArguments(
+                mavenExecutable: mavenExecutable,
+                noSnapshotUpdates: noSnapshotUpdates,
+                rebuild: rebuild
+            ),
+            handle: handle,
+            log: log
+        )
+        guard status == 0 else {
+            throw IdeaLightRunError.buildFailed(detail: "Maven \(goal) 失败（退出码 \(status)），详见构建输出。")
+        }
+    }
+
+    static func projectBuildArguments(mavenExecutable: URL, noSnapshotUpdates: Bool, rebuild: Bool) -> [String] {
+        var arguments = ["-DskipTests"]
+        if rebuild { arguments.append("clean") }
+        arguments.append("compile")
+        return styled(arguments, executable: mavenExecutable, noSnapshotUpdates: noSnapshotUpdates)
     }
 
     /// §18: compile + dependency:build-classpath 一次 JVM 调用完成（Cold Resolve）。
@@ -131,15 +146,23 @@ public struct MavenBuildService: BuildSystemAdapter {
     }
 
     private func mavenArguments(base: [String]) -> [String] {
-        var arguments = base
+        Self.styled(base, executable: mavenExecutable, noSnapshotUpdates: noSnapshotUpdates)
+    }
+
+    /// mvnw 自带进度输出，系统 mvn 加 -B 减少噪音；-nsu 跳过 SNAPSHOT 远程更新检查。
+    private static func styled(
+        _ arguments: [String],
+        executable: URL,
+        noSnapshotUpdates: Bool
+    ) -> [String] {
+        var result = arguments
         if noSnapshotUpdates {
-            arguments.insert("-nsu", at: 0)
+            result.insert("-nsu", at: 0)
         }
-        if mavenExecutable.lastPathComponent != "mvnw" {
-            // 系统 mvn：batch 模式减少进度条噪音
-            arguments.insert("-B", at: 0)
+        if executable.lastPathComponent != "mvnw" {
+            result.insert("-B", at: 0)
         }
-        return arguments
+        return result
     }
 
     /// 同步执行 Maven，stdout/stderr 由读线程逐行回调（可能来自后台线程）。
