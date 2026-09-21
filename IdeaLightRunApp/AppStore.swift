@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import IdeaLightRunCore
 
@@ -28,13 +29,22 @@ final class AppStore: ObservableObject {
     @Published private(set) var builds: [String: ProjectBuildModel] = [:]
     /// 每次开始构建自增，UI 据此切到"构建"页看输出
     @Published private(set) var buildRevision = 0
+    /// 在线更新（§64 例外：仅用户主动点「检查更新…」时联网）
+    let updater: SoftwareUpdater
 
     private static let persistenceURL = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("IdeaLightRun/projects.json")
 
+    private var cancellables: Set<AnyCancellable> = []
+
     init() {
+        updater = SoftwareUpdater()
         AppStore.current = self
+        // updater 是嵌套的 ObservableObject，不转发就不会有人重绘。
+        updater.objectWillChange
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &cancellables)
         loadProjects()
     }
 
@@ -50,6 +60,11 @@ final class AppStore: ObservableObject {
     /// 当前项目的最近一次构建（菜单项"停止构建"用）
     var currentBuild: ProjectBuildModel? {
         selectedProjectID.flatMap { builds[$0] }
+    }
+
+    /// 仍在运行的服务数：更新面板据此说明「安装会把它们停掉」。
+    var activeSessionCount: Int {
+        sessions.values.filter { !$0.state.isTerminal }.count
     }
 
     /// 菜单命令的入口。`Commands.body` 在旧 SDK（CI 的 Xcode 15 / Swift 5.10）上不是

@@ -10,6 +10,19 @@
   全量编译才覆盖到 GUI 代码。tag 一旦推上去就作废不了，失败的 tag 只能留着。
 - 签名、公证或 Actions 任一环失败时，必须报告失败环节和证据，不得把未验证的包当正式 Release。
 
+## 在线更新通道
+
+- 更新通道靠字面量对齐：产物名 `IdeaLightRun-<ver>-universal.zip`、bundle id、Team ID、
+  更新助手落点 `Contents/MacOS/IdeaLightRunUpdater` 同时存在于
+  `IdeaLightRunUpdate/UpdateIdentity.swift`、`scripts/build-app.sh`、`scripts/distribute-app.sh`
+  与 `.github/workflows/release.yml`。改任何一处都要同步其余三处——不同步的后果是老用户
+  永远「无可用更新」或永远校验失败，而且本地看不出来。
+  `UpdateIdentityTests` 直接读脚本与 workflow 原文钉住这条线。
+- 正式包必须内置更新助手：`distribute-app.sh` 会拒绝缺少 `IdeaLightRunUpdater` 的包。
+- 只有 `Developer ID Application` + Team `U8U443D7ZL` 签出的产物才会被接受；换证书或换签名
+  方式（ad-hoc / Apple Development）等于断开更新链，老用户会收到身份校验失败。
+- 联网只在用户主动点「检查更新…」时发生（§64）。不要加启动自查、后台定时器或遥测。
+
 ## 签名与公证
 
 - 禁止生成或交付 ad-hoc、临时签名包。`scripts/build-app.sh` 默认用

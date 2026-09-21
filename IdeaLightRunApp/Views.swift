@@ -50,7 +50,10 @@ struct IdeaLightRunApp: App {
             RootView()
         }
         .windowToolbarStyle(.unified)
-        .commands { BuildCommands() }
+        .commands {
+            BuildCommands()
+            UpdateCommands()
+        }
     }
 }
 
@@ -106,6 +109,14 @@ struct RootView: View {
             Button("好", role: .cancel) {}
         } message: {
             Text(store.alertMessage ?? "")
+        }
+        .sheet(
+            isPresented: Binding(
+                get: { store.updater.isPresented },
+                set: { store.updater.isPresented = $0 }
+            )
+        ) {
+            UpdateSheet(updater: store.updater, activeSessionCount: store.activeSessionCount)
         }
     }
 }

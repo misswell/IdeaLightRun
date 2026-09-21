@@ -93,6 +93,9 @@ jobs:
 
           通用二进制（Apple Silicon + Intel），要求 macOS 13 及以上。
           需要本机安装 JDK 与 Maven（或项目内的 mvnw）。
+
+          从 v0.1.6 起内置在线更新：菜单栏 IdeaLightRun ▸ 检查更新… 即可升级，无需再手动下载。
+          更早版本没有这个入口，只能手动装一次本版本（v${VERSION}）。
           EOF
 
           gh release create "$GITHUB_REF_NAME" \

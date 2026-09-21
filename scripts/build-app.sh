@@ -32,14 +32,20 @@ APP="build/IdeaLightRun.app"
 # 通用构建产物落在 .build/apple/Products，与单架构路径不同；按本次配置精确取，
 # 否则可能打包到上一次另一配置的旧二进制。
 if [ "$BUILD_UNIVERSAL" = "1" ]; then
-    BINARY=".build/apple/Products/Release/IdeaLightRunApp"
+    PRODUCT_DIR=".build/apple/Products/Release"
 else
-    BINARY=".build/$CONFIG/IdeaLightRunApp"
+    PRODUCT_DIR=".build/$CONFIG"
 fi
+BINARY="$PRODUCT_DIR/IdeaLightRunApp"
+UPDATER_BINARY="$PRODUCT_DIR/IdeaLightRunUpdater"
 [ -f "$BINARY" ] || { echo "❌ 找不到 $BINARY" >&2; exit 1; }
+# 缺了更新助手的包是残废的：它自己将无法完成在线更新，还会被新版本的校验判定为不完整。
+[ -f "$UPDATER_BINARY" ] || { echo "❌ 找不到 $UPDATER_BINARY" >&2; exit 1; }
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/IdeaLightRun"
+cp "$UPDATER_BINARY" "$APP/Contents/MacOS/IdeaLightRunUpdater"
+chmod 755 "$APP/Contents/MacOS/IdeaLightRunUpdater"
 
 # 应用图标（icns 缺失时从源图重新生成）
 if [ ! -f scripts/AppIcon.icns ]; then
@@ -80,10 +86,21 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
+# 先签嵌套代码再签外层：外层 bundle 的封存记录的是内层已签名的哈希，
+# 反过来做会让助手在替换时被判定为签名无效。
+# 助手不能套用 app 的标识——它是独立的 Mach-O，用 --deep 连带签名会拿到错的 bundle id。
+codesign --force --options runtime --timestamp \
+    --identifier "com.idealightrun.app.updater" \
+    --sign "$DEVELOPER_ID" "$APP/Contents/MacOS/IdeaLightRunUpdater"
+
 # Hardened runtime + 安全时间戳是公证的硬性前提；ad-hoc 签名不会被 Gatekeeper 放行。
 codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$APP"
 
 codesign --verify --deep --strict "$APP"
+codesign --verify --strict "$APP/Contents/MacOS/IdeaLightRunUpdater" \
+    || { echo "❌ 更新助手签名无效" >&2; exit 1; }
+[ -x "$APP/Contents/MacOS/IdeaLightRunUpdater" ] \
+    || { echo "❌ 更新助手不可执行，这个包装了就再也无法在线更新" >&2; exit 1; }
 SIGNATURE="$(codesign --display --verbose=4 "$APP" 2>&1)"
 grep -q '^Authority=Developer ID Application:' <<<"$SIGNATURE" \
     || { echo "❌ 不是 Developer ID Application 签名" >&2; exit 1; }

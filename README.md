@@ -11,6 +11,7 @@
 - [x] **Milestone 3 核心（启动）** — JavaLaunchPlan（§26）、数组传参启动（§27）、env 合并（§28）、profiles 去重注入（§29）、ProcessSession（SIGTERM→Force Kill，§32/§33）、LogRingBuffer（20000 行/10MB 上限，§37）+ 100ms 批量（§103）
 - [x] **Build / Rebuild / Clean（对齐 IDEA）** — 项目级 `mvn compile` / `mvn clean compile` / `mvn clean`（整 reactor，不带 `-pl`）、独立构建控制台、可停止（SIGTERM→SIGKILL）、⌘F9 / ⇧⌘F9、CLI `build` / `clean`
 - [x] **GUI** — 三栏界面 + ▶ Run / ■ Stop / ↻ Restart / Force Kill + NSTextView 控制台 + 退出时停服（§66）
+- [x] **在线更新** — 应用菜单「检查更新…」→ GitHub Releases → 镜像链下载 + SHA-256 校验 + 签名/身份校验 → 进程外原子替换并重启（失败自动回滚）
 - [ ] Milestone 4 — Gradle（当前 Gradle 项目仅支持浏览，启动会提示）
 - [ ] Milestone 5 — GUI 完整版（Compound 启动、Restart to Apply 提示、端口检测等 P1）
 
@@ -26,8 +27,10 @@ IdeaLightRunCore/    核心库（GUI 与 CLI 共用，禁止另起一套启动�
   Logging/           LogRingBuffer（环形日志缓冲）
   Utilities/         CommandLineTokenizer（禁用 /bin/sh -c）、XML 子树捕获
 IdeaLightRunCLI/     开发期验证工具（scan / run / build）
+IdeaLightRunUpdate/  在线更新内核（版本比较、发布解析、镜像下载、产物与签名校验、助手参数契约）
+IdeaLightRunUpdater/ 进程外安装助手（主 app 退出后替换 bundle 并重启，失败回滚）
 IdeaLightRunApp/     SwiftUI GUI
-Tests/               单元 + Maven 多模块真实集成测试（共 100 用例）+ Fixtures
+Tests/               单元 + Maven 多模块真实集成测试（共 135 用例）+ Fixtures
 ```
 
 ## CLI 用法
@@ -73,13 +76,45 @@ git tag -a v0.1.2 -m "v0.1.2" && git push origin v0.1.2
 通用二进制（Apple Silicon + Intel），要求 macOS 13 及以上。
 Maven 集成测试需要真实下载依赖，只在本地跑，CI 用 `--skip` 跳过。
 
+## 在线更新
+
+应用菜单「IdeaLightRun ▸ 检查更新…」是唯一入口（§64：不做启动自查，也没有后台定时器）。面板会说明
+走到哪一步、为什么失败、下一步做什么：检查 → 下载 → 校验 → 移交安装 → 退出并重启。
+
+取版本：`api.github.com/repos/misswell/IdeaLightRun/releases/latest` 给 `tag_name` 和附件的 `digest`
+（SHA-256）；被匿名限流（403）时退回公开的 `releases/expanded_assets/<tag>` 页面解析同一份摘要，
+可信度不因绕开 API 而降低。只接受 `IdeaLightRun-<ver>-universal.zip` 且必须带可解析的 sha256——
+没有摘要就不下载。下载按 `xget.xi-xu.me → ghfast.top → gh-proxy.org → github.com` 逐个尝试，
+每个源落地后都要过 SHA-256，不过就删掉换下一个源；最近一次成功的镜像会记住并提到队首
+（直连成功则清掉该偏好，避免网络变好后仍绕远路）。
+
+安装分两段，因为要被替换的正是自己：
+
+1. 主进程内（`UpdatePackageValidator`）：SHA-256 → `ditto` 解包（不是 `unzip`，只有它保留权限与元数据）
+   → 结构自检（bundle id、可执行文件、版本号、**更新助手在位**）→ `codesign --verify --deep --strict`
+   → TeamIdentifier → 按**语义**比对新旧 app 的 designated requirement（比文本会把合法更新判成身份变更，
+   而这条 requirement 决定了系统授权能否延续）→ `spctl --assess` → 递归清除隔离属性
+   （漏掉它，重启后会被 App Translocation 搬到随机只读路径，每一项系统授权都要重新点）。
+2. 先拷出 bundle 的 `IdeaLightRunUpdater` 再执行（不能就地跑：它所在的 bundle 即将被换掉），
+   等主进程退出 → 同卷原子替换并留备份 → 直接 exec `Contents/MacOS/IdeaLightRun` 重启
+   （不走 `open`：LaunchServices 对刚替换路径的旧记录会「返回成功却不起进程」）
+   → 任一步失败则回滚旧版本，并仍然把可用的 app 拉起来。
+
+日志在 `~/Library/Logs/IdeaLightRun/update.log`。前提与限制：
+
+- 必须装在可写目录（`/Applications` 或 `~/Applications`）；DMG、只读位置、App Translocation 一律拒绝。
+- 更新会退出应用，正在运行的 Java 服务随之停止——面板在安装前会说明当前有几个在跑。
+- **从 v0.1.6 起才内置更新助手**：更早的版本点更新会提示「缺少更新助手」，需要手动装一次 0.1.6，
+  之后的更新才都能在应用内完成。
+- 不做权限提升：不用 Authorization Services，也不弹管理员密码；装不进可写位置就是不可自更新。
+
 ## 测试
 
 ```bash
 swift test    # 含真实 Maven 多模块 classpath 集成测试（无 mvn 自动跳过）
 ```
 
-覆盖：RunConfigurationParser（alias / rawOptions / Before Launch）、WorkspaceParser（流式、只取 RunManager、跳过模板）、ProjectScanner（§7 来源优先级去重、§6 深度上限 4、忽略目录）、MacroResolver（§11 全部宏与 IDEA 上下文变量）、CommandLineTokenizer（§72 参数集）、ModuleResolver（§13 五种方式）、JDKResolver（§23–25 优先级与 major version 模糊匹配）、LaunchPlanBuilder（§26–§29）、LogRingBuffer（§37 上限）、ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、MavenLocator（Dock 启动无 PATH 时的绝对路径枚举）、项目级 Build/Rebuild/Clean 参数与取消语义、ClasspathCache + reactor 归一化（§18/§19/§57）、Maven 多模块真实集成（§92/§93）。
+覆盖：RunConfigurationParser（alias / rawOptions / Before Launch）、WorkspaceParser（流式、只取 RunManager、跳过模板）、ProjectScanner（§7 来源优先级去重、§6 深度上限 4、忽略目录）、MacroResolver（§11 全部宏与 IDEA 上下文变量）、CommandLineTokenizer（§72 参数集）、ModuleResolver（§13 五种方式）、JDKResolver（§23–25 优先级与 major version 模糊匹配）、LaunchPlanBuilder（§26–§29）、LogRingBuffer（§37 上限）、ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、MavenLocator（Dock 启动无 PATH 时的绝对路径枚举）、项目级 Build/Rebuild/Clean 参数与取消语义、ClasspathCache + reactor 归一化（§18/§19/§57）、Maven 多模块真实集成（§92/§93）。在线更新：版本比较与 fail-closed、发布元数据解析（JSON 与 expanded_assets 两条路径）、镜像链顺序与回退/取消/坏文件删除、更新助手参数契约与重启路径、designated requirement 解析与语义判定，以及把产物名 / bundle id / Team / 助手落点钉到 `scripts/` 与 `release.yml` 原文的防漂移断言。
 
 ## 关键设计约束（当前已落实）
 
@@ -92,4 +127,4 @@ swift test    # 含真实 Maven 多模块 classpath 集成测试（无 mvn 自�
 - Build / Rebuild / Clean 与 IDEA 一一对应：Build = 整 reactor `compile`（增量），Rebuild = `clean compile`（全量），Clean = `clean`（只清空产物、不编译，因此不带 `-DskipTests`）；都不带 `-pl`、不跑测试，且不清 classpath 缓存（`clean` 只删 `target/`，依赖坐标未变则缓存仍有效，缓存另有 fingerprint 守护）。Clean 之后 Run 仍正常：Run 的 compile 步骤带 `-pl -am`，会连带重新产出依赖模块的 `target/classes`。Run 与三者共用同一条工具链解析管线（`ProjectToolchain`）。
 - Maven 定位不依赖 PATH：GUI 从 Dock/Finder 启动时环境变量里没有 Homebrew 或用户自装的 Maven，故按绝对路径枚举候选（含 IDEA 自带 Maven），逐个 `--version` 探活后取第一个可用的。
 - 不依赖 IDEA 安装目录，只读项目内配置（§113）。
-- 100% 本地，无网络，无后台常驻（§64）。
+- 除「检查更新…」外 100% 本地，无网络，无后台常驻（§64）：联网只在用户主动点应用菜单「IdeaLightRun ▸ 检查更新…」时发生，没有启动自查、没有定时器、不上传任何项目或本机信息。

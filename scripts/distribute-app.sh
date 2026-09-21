@@ -46,6 +46,11 @@ ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
 
 echo "==> 校验最终产物"
 codesign --verify --deep --strict "$APP"
+# 更新助手必须独立可验：在线更新靠它替换 bundle，缺了它的包会把用户
+# 留在「只能手动升级」的版本上，而这一点要在这里拦住，不能等用户点「下载并安装」。
+[ -x "$APP/Contents/MacOS/IdeaLightRunUpdater" ] \
+    || { echo "❌ 正式包缺更新助手 IdeaLightRunUpdater" >&2; exit 1; }
+codesign --verify --strict "$APP/Contents/MacOS/IdeaLightRunUpdater"
 spctl --assess --type execute --verbose "$APP"
 for arch in arm64 x86_64; do
     lipo -archs "$APP/Contents/MacOS/IdeaLightRun" | grep -qw "$arch" \
