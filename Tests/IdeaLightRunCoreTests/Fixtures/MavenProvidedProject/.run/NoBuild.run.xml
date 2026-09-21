@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="NoBuild" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.example.provided.AppApplication" />
+    <module name="app" />
+    <method v="2" />
+  </configuration>
+</component>

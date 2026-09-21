@@ -1,0 +1,10 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="WithProvided" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.example.provided.AppApplication" />
+    <module name="app" />
+    <option name="INCLUDE_PROVIDED_SCOPE" value="true" />
+    <method v="2">
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

@@ -1,6 +1,30 @@
 import CryptoKit
 import Foundation
 
+/// §6.1: classpath 的缓存身份。同一 module 在不同配置下可以是不同 classpath
+/// （includeProvided  true/false），构建系统也一样会改变解析方式；
+/// 三者不同时缓存必须分开，否则配置 A、B 会互相污染。
+public struct ClasspathVariant: Hashable, Codable, Sendable {
+    public var moduleIdentifier: String
+    public var buildSystem: String
+    public var includeProvided: Bool
+
+    public init(moduleIdentifier: String, buildSystem: String, includeProvided: Bool) {
+        self.moduleIdentifier = moduleIdentifier
+        self.buildSystem = buildSystem
+        self.includeProvided = includeProvided
+    }
+
+    public static func maven(module: String, includeProvided: Bool) -> ClasspathVariant {
+        ClasspathVariant(moduleIdentifier: module, buildSystem: "maven", includeProvided: includeProvided)
+    }
+
+    /// 参与哈希的完整身份，逐项成行避免拼接歧义。
+    var cacheKey: String {
+        "module=\(moduleIdentifier)\nbuildSystem=\(buildSystem)\nincludeProvided=\(includeProvided)"
+    }
+}
+
 public struct CachedClasspath: Codable, Sendable, Equatable {
     public var module: String
     public var entries: [String]
@@ -16,44 +40,58 @@ public struct CachedClasspath: Codable, Sendable, Equatable {
 }
 
 /// §19: classpath 缓存。
-/// 位置：~/Library/Caches/IdeaLightRun/projects/<projectHash>/maven/<moduleHash>/classpath.json
+/// 位置：~/Library/Caches/IdeaLightRun/projects/<projectHash>/<buildSystem>/<variantHash>/classpath.json
 /// 失效条件见 mavenFingerprint（§57）：pom / .mvn / wrapper / settings.xml / JDK。
 public enum ClasspathCache {
-    public static func cacheDirectory(projectRoot: URL, moduleName: String) -> URL {
+    public static func cacheDirectory(projectRoot: URL, variant: ClasspathVariant) -> URL {
         let projectHash = sha256(projectRoot.standardizedFileURL.path)
-        let moduleHash = sha256(moduleName)
         return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("IdeaLightRun/projects/\(projectHash)/maven/\(moduleHash)", isDirectory: true)
+            .appendingPathComponent(
+                "IdeaLightRun/projects/\(projectHash)/\(variant.buildSystem)/\(sha256(variant.cacheKey))",
+                isDirectory: true
+            )
     }
 
-    static func cachedClasspathURL(projectRoot: URL, moduleName: String) -> URL {
-        cacheDirectory(projectRoot: projectRoot, moduleName: moduleName)
+    static func cachedClasspathURL(projectRoot: URL, variant: ClasspathVariant) -> URL {
+        cacheDirectory(projectRoot: projectRoot, variant: variant)
             .appendingPathComponent("classpath.json")
     }
 
-    static func mavenOutputFileURL(projectRoot: URL, moduleName: String) -> URL {
-        cacheDirectory(projectRoot: projectRoot, moduleName: moduleName)
-            .appendingPathComponent("classpath-maven.txt")
+    public static func mavenOutputFileURL(
+        projectRoot: URL,
+        variant: ClasspathVariant,
+        scope: MavenClasspathScope
+    ) -> URL {
+        cacheDirectory(projectRoot: projectRoot, variant: variant)
+            .appendingPathComponent("classpath-maven-\(scope.rawValue).txt")
     }
 
-    public static func load(projectRoot: URL, moduleName: String) -> CachedClasspath? {
-        guard let data = try? Data(contentsOf: cachedClasspathURL(projectRoot: projectRoot, moduleName: moduleName)),
+    public static func load(projectRoot: URL, variant: ClasspathVariant) -> CachedClasspath? {
+        guard let data = try? Data(contentsOf: cachedClasspathURL(projectRoot: projectRoot, variant: variant)),
               let cached = try? JSONDecoder().decode(CachedClasspath.self, from: data) else {
             return nil
         }
         return cached
     }
 
-    public static func store(_ cached: CachedClasspath, projectRoot: URL, moduleName: String) {
-        let directory = cacheDirectory(projectRoot: projectRoot, moduleName: moduleName)
+    public static func store(_ cached: CachedClasspath, projectRoot: URL, variant: ClasspathVariant) {
+        let directory = cacheDirectory(projectRoot: projectRoot, variant: variant)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         guard let data = try? JSONEncoder().encode(cached) else { return }
-        try? data.write(to: cachedClasspathURL(projectRoot: projectRoot, moduleName: moduleName), options: .atomic)
+        try? data.write(to: cachedClasspathURL(projectRoot: projectRoot, variant: variant), options: .atomic)
     }
 
-    /// §69: Rebuild Classpath —— 删除当前 module 的 classpath 缓存。
-    public static func clear(projectRoot: URL, moduleName: String) {
-        try? FileManager.default.removeItem(at: cacheDirectory(projectRoot: projectRoot, moduleName: moduleName))
+    /// §69: Rebuild Classpath —— 删除该 module 在两种 provided 取值下的 classpath 缓存。
+    public static func clear(projectRoot: URL, variant: ClasspathVariant) {
+        try? FileManager.default.removeItem(at: cacheDirectory(projectRoot: projectRoot, variant: variant))
+    }
+
+    public static func clear(projectRoot: URL, moduleName: String, buildSystem: String = "maven") {
+        for includeProvided in [false, true] {
+            clear(projectRoot: projectRoot, variant: ClasspathVariant(
+                moduleIdentifier: moduleName, buildSystem: buildSystem, includeProvided: includeProvided
+            ))
+        }
     }
 
     public static func sha256(_ string: String) -> String {

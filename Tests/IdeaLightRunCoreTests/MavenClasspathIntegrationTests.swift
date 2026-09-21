@@ -94,12 +94,18 @@ final class MavenClasspathIntegrationTests: XCTestCase {
             environment: MavenBuildService.buildEnvironment(javaHome: nil)
         )
 
-        let outputFile = tempProject.appendingPathComponent("cp-out.txt")
+        let runtimeOutput = tempProject.appendingPathComponent("cp-runtime.txt")
+        let providedOutput = tempProject.appendingPathComponent("cp-compile.txt")
+        // §3.1/§3.3: 需要 Build 时 compile 与 dependency:build-classpath 合并为一次调用
+        // ——兄弟模块的 SNAPSHOT 只有在同一次会话里编译过才解析得到。
         let entries = try service.resolveRuntimeClasspath(
             reactorModuleName: "user-service",
             hasModules: true,
+            includeProvided: false,
+            withCompile: true,
+            runtimeOutputFile: runtimeOutput,
+            providedOutputFile: providedOutput,
             handle: nil,
-            outputFile: outputFile,
             log: { _ in }
         )
 

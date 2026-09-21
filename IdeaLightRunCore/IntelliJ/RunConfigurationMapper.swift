@@ -13,6 +13,8 @@ public enum RunConfigurationMapper {
     static let includeProvidedAliases = ["INCLUDE_PROVIDED_SCOPE"]
     static let allowParallelAliases = ["ALLOW_PARALLEL_RUN_WITHIN_GROUP", "ALLOW_MULTIPLE_INSTANCES"]
     static let envFileAliases = ["ENV_FILES", "ENV_FILE_PATHS"]
+    /// §4.2: IDEA 写 PASS_PARENT_ENVS，早期版本与插件里见过 PASS_PARENT_ENV。
+    static let passParentEnvAliases = ["PASS_PARENT_ENVS", "PASS_PARENT_ENV"]
 
     public static func map(node: XMLElementNode, source: ConfigurationSource) -> RunConfiguration? {
         guard node.name == "configuration" else { return nil }
@@ -35,6 +37,7 @@ public enum RunConfigurationMapper {
         var allowParallel = false
         var environmentVariables: [String: String] = [:]
         var environmentFiles: [String] = []
+        var passParentEnvironment = true
         var compoundMembers: [CompoundMember] = []
         var beforeLaunchTasks: [BeforeLaunchTask] = []
         var rawOptions: [String: String] = [:]
@@ -69,6 +72,8 @@ public enum RunConfigurationMapper {
                             .split(whereSeparator: { $0 == ":" || $0 == ";" })
                             .map(String.init)
                     }
+                } else if passParentEnvAliases.contains(optionName) {
+                    passParentEnvironment = value != "false"
                 } else {
                     rawOptions[optionName] = value
                 }
@@ -116,6 +121,7 @@ public enum RunConfigurationMapper {
             workingDirectory: workingDirectory,
             environmentVariables: environmentVariables,
             environmentFiles: environmentFiles,
+            passParentEnvironment: passParentEnvironment,
             springProfiles: springProfiles,
             includeProvidedDependencies: includeProvided,
             allowParallelRun: allowParallel,
@@ -127,8 +133,8 @@ public enum RunConfigurationMapper {
         )
     }
 
-    /// §30: Before Launch 第一版只识别 Build / Run Another Configuration，
-    /// 其余任务产生 warning，不偷偷忽略。
+    /// §30: Before Launch 识别 Build / Build Project / Run Another Configuration /
+    /// Maven / Gradle 任务，其余任务产生 warning，不偷偷忽略。
     private static func parseBeforeLaunchTasks(
         from methodNode: XMLElementNode,
         into tasks: inout [BeforeLaunchTask],
@@ -138,21 +144,30 @@ public enum RunConfigurationMapper {
             guard let taskName = option.attribute("name") else { continue }
             let enabled = option.attribute("enabled") != "false"
             switch taskName {
-            case "Make":
+            case "Make", "make":
                 tasks.append(BeforeLaunchTask(kind: .build, isEnabled: enabled))
+            case "BuildProject", "build.project", "MakeProject":
+                tasks.append(BeforeLaunchTask(kind: .buildProject, isEnabled: enabled))
             case "Maven.BeforeRunTask":
                 let goal = option.attribute("goal")
+                    ?? option.attribute("runnerParams")
                     ?? option.firstChild("param")?.attribute("value")
                     ?? ""
                 tasks.append(BeforeLaunchTask(kind: .mavenGoal(goal: goal), isEnabled: enabled))
             case "Gradle.BeforeRunTask":
-                let task = option.attribute("taskName") ?? option.attribute("task") ?? ""
+                let task = option.attribute("tasks")
+                    ?? option.attribute("taskName")
+                    ?? option.attribute("task")
+                    ?? ""
                 tasks.append(BeforeLaunchTask(kind: .gradleTask(task: task), isEnabled: enabled))
             case "RunConfigurationTask":
-                if let referenced = option.firstChild("configuration"),
-                   let referencedName = referenced.attribute("name") {
+                // IDEA 的 .run.xml 用属性保存引用；workspace.xml 的旧形式是子元素 configuration。
+                let referenced = option.firstChild("configuration")
+                let name = option.attribute("run_configuration_name") ?? referenced?.attribute("name")
+                let type = option.attribute("run_configuration_type") ?? referenced?.attribute("type")
+                if let referencedName = name, !referencedName.isEmpty {
                     tasks.append(BeforeLaunchTask(
-                        kind: .runConfiguration(name: referencedName, type: referenced.attribute("type")),
+                        kind: .runConfiguration(name: referencedName, type: type),
                         isEnabled: enabled
                     ))
                 } else if enabled {
@@ -161,6 +176,9 @@ public enum RunConfigurationMapper {
             case "ActivateToolWindow", "ToolWindow.BeforeRunTask":
                 break
             default:
+                // §3.2: 未知任务必须留在任务列表里——GUI 能看到警告，
+                // Core 在执行阶段 fail closed。只留警告等于偷偷忽略。
+                tasks.append(BeforeLaunchTask(kind: .unknown(raw: taskName), isEnabled: enabled))
                 if enabled {
                     warnings.append(.unsupportedBeforeLaunch(description: taskName))
                 }

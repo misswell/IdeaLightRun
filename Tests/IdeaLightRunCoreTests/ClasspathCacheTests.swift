@@ -15,15 +15,34 @@ final class ClasspathCacheTests: XCTestCase {
     }
 
     func testStoreAndLoadRoundtrip() throws {
+        let variant = ClasspathVariant.maven(module: "user-service", includeProvided: false)
         let cached = CachedClasspath(
             module: "user-service",
             entries: ["/p/user-service/target/classes", "/Users/me/.m2/repository/x.jar"],
             fingerprint: "abc123",
             resolvedAt: Date()
         )
-        ClasspathCache.store(cached, projectRoot: tempProject, moduleName: "user-service")
-        let loaded = ClasspathCache.load(projectRoot: tempProject, moduleName: "user-service")
+        ClasspathCache.store(cached, projectRoot: tempProject, variant: variant)
+        let loaded = ClasspathCache.load(projectRoot: tempProject, variant: variant)
         XCTAssertEqual(loaded, cached)
+    }
+
+    /// §6.1: includeProvided 是缓存身份的一部分，两种取值不能落到同一个目录。
+    func testProvidedVariantHasItsOwnCacheEntry() throws {
+        let without = ClasspathVariant.maven(module: "app", includeProvided: false)
+        let with = ClasspathVariant.maven(module: "app", includeProvided: true)
+        XCTAssertNotEqual(ClasspathCache.cacheDirectory(projectRoot: tempProject, variant: without),
+                          ClasspathCache.cacheDirectory(projectRoot: tempProject, variant: with))
+
+        ClasspathCache.store(
+            CachedClasspath(module: "app", entries: ["/only-runtime.jar"], fingerprint: "f", resolvedAt: Date()),
+            projectRoot: tempProject,
+            variant: without
+        )
+        XCTAssertNil(ClasspathCache.load(projectRoot: tempProject, variant: with), "另一变体不能被读到")
+
+        ClasspathCache.clear(projectRoot: tempProject, moduleName: "app")
+        XCTAssertNil(ClasspathCache.load(projectRoot: tempProject, variant: without))
     }
 
     /// §19/§57: pom 内容变化 → fingerprint 变化

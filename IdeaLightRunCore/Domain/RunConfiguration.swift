@@ -234,6 +234,9 @@ public struct RunConfiguration: Identifiable, Equatable, Codable, Sendable {
     public var workingDirectory: String?
     public var environmentVariables: [String: String]
     public var environmentFiles: [String]
+    /// §4.1/§4.2: IDEA 的 "Include system environment variables"（PASS_PARENT_ENVS）。
+    /// false 时不继承父进程环境，只保留最小启动环境与配置自身的变量。
+    public var passParentEnvironment: Bool
     public var springProfiles: [String]
     public var includeProvidedDependencies: Bool
     public var allowParallelRun: Bool
@@ -255,6 +258,7 @@ public struct RunConfiguration: Identifiable, Equatable, Codable, Sendable {
         workingDirectory: String? = nil,
         environmentVariables: [String: String] = [:],
         environmentFiles: [String] = [],
+        passParentEnvironment: Bool = true,
         springProfiles: [String] = [],
         includeProvidedDependencies: Bool = false,
         allowParallelRun: Bool = false,
@@ -274,6 +278,7 @@ public struct RunConfiguration: Identifiable, Equatable, Codable, Sendable {
         self.workingDirectory = workingDirectory
         self.environmentVariables = environmentVariables
         self.environmentFiles = environmentFiles
+        self.passParentEnvironment = passParentEnvironment
         self.springProfiles = springProfiles
         self.includeProvidedDependencies = includeProvidedDependencies
         self.allowParallelRun = allowParallelRun

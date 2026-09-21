@@ -1,0 +1,11 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="EnvFiles" type="Application" factoryName="Application">
+    <option name="MAIN_CLASS_NAME" value="com.example.env.EnvApplication" />
+    <option name="ENV_FILES" value="$PROJECT_DIR$/.env:$PROJECT_DIR$/.env.local" />
+    <option name="PASS_PARENT_ENVS" value="false" />
+    <envs>
+      <env name="DB_PASSWORD" value="from-run-configuration" />
+    </envs>
+    <method v="2" />
+  </configuration>
+</component>
