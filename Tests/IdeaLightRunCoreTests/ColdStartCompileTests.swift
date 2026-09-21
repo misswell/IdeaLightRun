@@ -39,7 +39,7 @@ final class ColdStartCompileTests: XCTestCase {
     private func prepare(_ name: String) async throws -> [ProcessState] {
         let config = try project.configuration(named: name)
         var states: [ProcessState] = []
-        let plan = try await JavaLauncher().prepare(
+        let plan = try await ExecutionCoordinator().prepare(
             config: config,
             projectRoot: project.root,
             log: { _ in },
@@ -136,23 +136,17 @@ final class ColdStartCompileTests: XCTestCase {
         let mvnw = URL(fileURLWithPath: "/tmp/proj/mvnw")
         XCTAssertEqual(
             MavenBuildService.compileArguments(
-                mavenExecutable: mvnw, noSnapshotUpdates: true, reactorModuleName: "app", hasModules: true
+                mavenExecutable: mvnw, noSnapshotUpdates: true, scope: "app"
             ),
             ["-nsu", "-DskipTests", "-pl", "app", "-am", "compile"]
         )
         XCTAssertEqual(
             MavenBuildService.compileArguments(
-                mavenExecutable: mvnw, noSnapshotUpdates: false, reactorModuleName: nil, hasModules: false
+                mavenExecutable: mvnw, noSnapshotUpdates: false, scope: nil
             ),
             ["-DskipTests", "compile"]
         )
-        // 根模块不需要 -pl；单模块项目也一样
-        XCTAssertEqual(
-            MavenBuildService.compileArguments(
-                mavenExecutable: mvnw, noSnapshotUpdates: false, reactorModuleName: "app", hasModules: false
-            ),
-            ["-DskipTests", "compile"]
-        )
+        // scope 为 nil 就是"整个 reactor"：根模块与单模块项目都走这条
     }
 
     func testClasspathArgumentsCarryCompileOnlyWhenRequested() {
@@ -161,7 +155,7 @@ final class ColdStartCompileTests: XCTestCase {
         XCTAssertEqual(
             MavenBuildService.classpathArguments(
                 mavenExecutable: mvnw, noSnapshotUpdates: false, scope: .runtime,
-                lifecyclePhase: nil, reactorModuleName: "app", hasModules: true, outputFile: out
+                lifecyclePhase: nil, moduleScope: "app", outputFile: out
             ),
             [
                 "-DskipTests", "-pl", "app", "-am",
@@ -170,9 +164,9 @@ final class ColdStartCompileTests: XCTestCase {
         )
         let merged = MavenBuildService.classpathArguments(
             mavenExecutable: mvnw, noSnapshotUpdates: false, scope: .compile,
-            lifecyclePhase: "compile", reactorModuleName: nil, hasModules: false, outputFile: out
+            lifecyclePhase: "compile", moduleScope: nil, outputFile: out
         )
-        XCTAssertEqual(merged.firstIndex(of: "compile").map { merged[($0 + 1)] }, "dependency:build-classpath")
+        XCTAssertEqual(merged.firstIndex(of: "compile").map { merged[$0 + 1] }, "dependency:build-classpath")
         XCTAssertTrue(merged.contains("-DincludeScope=compile"))
     }
 
@@ -181,7 +175,7 @@ final class ColdStartCompileTests: XCTestCase {
         let arguments = MavenBuildService.classpathArguments(
             mavenExecutable: URL(fileURLWithPath: "/usr/local/bin/mvn"),
             noSnapshotUpdates: true, scope: .runtime, lifecyclePhase: nil,
-            reactorModuleName: nil, hasModules: false,
+            moduleScope: nil,
             outputFile: URL(fileURLWithPath: "/tmp/cp.txt")
         )
         XCTAssertEqual(arguments.prefix(2), ["-B", "-nsu"])
@@ -193,10 +187,25 @@ final class ColdStartCompileTests: XCTestCase {
         for scope in MavenClasspathScope.allCases {
             let arguments = MavenBuildService.classpathArguments(
                 mavenExecutable: mvnw, noSnapshotUpdates: false, scope: scope, lifecyclePhase: nil,
-                reactorModuleName: nil, hasModules: false, outputFile: URL(fileURLWithPath: "/tmp/cp.txt")
+                moduleScope: nil, outputFile: URL(fileURLWithPath: "/tmp/cp.txt")
             )
             XCTAssertTrue(arguments.contains("-DincludeScope=\(scope.rawValue)"))
             XCTAssertFalse(arguments.contains { $0.contains("test") }, "\(scope)：\(arguments)")
         }
+    }
+
+    /// §9: `-pl` 范围由适配器自己从 reactor 推导，调用方只给模块目录。
+    func testModuleScopeDerivation() throws {
+        let multi = MavenBuildService(
+            projectRoot: project.root,
+            rootPomURL: project.root.appendingPathComponent("pom.xml"),
+            mavenExecutable: project.root.appendingPathComponent("mvnw"),
+            environment: [:]
+        )
+        let app = ProjectModule(name: "app", directory: project.root.appendingPathComponent("app", isDirectory: true))
+        XCTAssertEqual(multi.moduleScope(for: app), "app")
+
+        let root = ProjectModule(name: "provided-demo", directory: project.root)
+        XCTAssertNil(multi.moduleScope(for: root), "根模块不需要 -pl")
     }
 }

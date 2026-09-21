@@ -11,49 +11,38 @@ public enum MavenClasspathScope: String, Sendable, CaseIterable {
     var includeScopeArgument: String { "-DincludeScope=\(rawValue)" }
 }
 
-/// §14: BuildSystemAdapter 协议。Gradle 实现在 Milestone 4。
-public protocol BuildSystemAdapter {
-    func compile(
-        reactorModuleName: String?,
-        hasModules: Bool,
-        handle: ProcessHandle?,
-        log: @escaping LogCallback
-    ) throws
-    func resolveRuntimeClasspath(
-        reactorModuleName: String?,
-        hasModules: Bool,
-        includeProvided: Bool,
-        withCompile: Bool,
-        runtimeOutputFile: URL,
-        providedOutputFile: URL,
-        handle: ProcessHandle?,
-        log: @escaping LogCallback
-    ) throws -> [String]
-}
-
-/// §15/§17/§18: Maven 适配器。
+/// §15/§17/§18 + §9: Maven 适配器。
 /// - Maven 由 `MavenLocator` 按绝对路径候选定位（不依赖 shell PATH）
 /// - compile 不 clean（增量）
 /// - classpath 交给 Maven 自己解析（dependency:build-classpath），不重写依赖解析
+/// - 模块范围（`-pl <artifactId> -am`）、pom 指纹、classpath 缓存都收在适配器内部，
+///   调用方只给 `BuildTarget`
 /// - handle 非空时：构建进程句柄交给调用方，Stop 可终止构建（对齐 IDEA）
-/// - `buildProject(kind:)` 是 IDEA 的 Build / Rebuild Project 与 Maven clean（整个 reactor）
 public struct MavenBuildService: BuildSystemAdapter, Sendable {
     public let projectRoot: URL
+    /// reactor 的根 pom。`-pl` 范围与缓存指纹都要从它展开，所以在此自己解析。
+    public let rootPomURL: URL
     public let mavenExecutable: URL
     public let environment: [String: String]
+    /// §57: JDK major 参与 classpath 指纹。
+    public let jdkMajorVersion: Int?
     /// 默认 -nsu：跳过 SNAPSHOT 远程更新检查，优先用 ~/.m2 已有依赖（IDEA 下载过的即命中）。
     /// 与 IDEA 点 Run 的行为一致；本地缺失的依赖仍会正常首次下载。
     public let noSnapshotUpdates: Bool
 
     public init(
         projectRoot: URL,
+        rootPomURL: URL,
         mavenExecutable: URL,
         environment: [String: String],
+        jdkMajorVersion: Int? = nil,
         noSnapshotUpdates: Bool = true
     ) {
         self.projectRoot = projectRoot
+        self.rootPomURL = rootPomURL
         self.mavenExecutable = mavenExecutable
         self.environment = environment
+        self.jdkMajorVersion = jdkMajorVersion
         self.noSnapshotUpdates = noSnapshotUpdates
     }
 
@@ -71,60 +60,17 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
         return env
     }
 
+    // MARK: - BuildSystemAdapter（§9）
+
     /// §3.3: Make / Build = 只编译当前模块及其 reactor 依赖（`-pl <module> -am`）。
-    public func compile(
-        reactorModuleName: String?,
-        hasModules: Bool,
+    public func buildModule(
+        _ target: BuildTarget,
         handle: ProcessHandle?,
         log: @escaping LogCallback
     ) throws {
-        let arguments = Self.compileArguments(
-            mavenExecutable: mavenExecutable,
-            noSnapshotUpdates: noSnapshotUpdates,
-            reactorModuleName: reactorModuleName,
-            hasModules: hasModules
-        )
-        let status = try run(arguments: arguments, handle: handle, log: log)
-        guard status == 0 else {
-            throw IdeaLightRunError.buildFailed(detail: "Maven compile 失败（退出码 \(status)），详见控制台输出。")
-        }
-    }
-
-    static func compileArguments(
-        mavenExecutable: URL,
-        noSnapshotUpdates: Bool,
-        reactorModuleName: String?,
-        hasModules: Bool
-    ) -> [String] {
-        styled(
-            moduleFlags(reactorModuleName: reactorModuleName, hasModules: hasModules) + ["compile"],
-            executable: mavenExecutable,
-            noSnapshotUpdates: noSnapshotUpdates
-        )
-    }
-
-    static func classpathArguments(
-        mavenExecutable: URL,
-        noSnapshotUpdates: Bool,
-        scope: MavenClasspathScope,
-        lifecyclePhase: String?,
-        reactorModuleName: String?,
-        hasModules: Bool,
-        outputFile: URL
-    ) -> [String] {
-        var goals: [String] = []
-        // §3.1: compile 只在同一次调用里出现一次。多模块的兄弟依赖（未 install 的
-        // SNAPSHOT）只有当该模块在本次会话里跑过 ≥compile 阶段时才被 Maven 认作
-        // 已解析（ReactorReader 会把 target/classes 标记成 artifact 文件）；
-        // 单跑 dependency:build-classpath 会直接报 "Could not resolve dependencies"。
-        // 所以需要 Build 时合并成一次调用，而不是先 compile 再解析。
-        if let lifecyclePhase { goals.append(lifecyclePhase) }
-        goals += ["dependency:build-classpath", scope.includeScopeArgument, "-Dmdep.outputFile=\(outputFile.path)"]
-        return styled(
-            moduleFlags(reactorModuleName: reactorModuleName, hasModules: hasModules) + goals,
-            executable: mavenExecutable,
-            noSnapshotUpdates: noSnapshotUpdates
-        )
+        let scope = moduleScope(for: target.module)
+        log(LogLine(stream: .system, text: "[IdeaLightRun] 编译 \(scope ?? target.module.name) …"))
+        try compile(scope: scope, handle: handle, log: log)
     }
 
     /// IDEA 的 Build Project / Rebuild Project 与 Maven clean：作用于整个 reactor，不带 `-pl`。
@@ -147,6 +93,133 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
         }
     }
 
+    /// §3.5: 执行 IDEA 保存的构建任务（如 `clean package`）。
+    /// 原文按参数逐项传递，绝不转成 Java 命令（§24 约束 2）。
+    public func runTasks(
+        _ tasks: [String],
+        handle: ProcessHandle?,
+        log: @escaping LogCallback
+    ) throws {
+        let status = try run(arguments: mavenArguments(base: tasks), handle: handle, log: log)
+        guard status == 0 else {
+            throw IdeaLightRunError.buildFailed(
+                detail: "Maven \(tasks.joined(separator: " ")) 失败（退出码 \(status)），详见控制台输出。"
+            )
+        }
+    }
+
+    public func hasFreshClasspathCache(for target: BuildTarget) -> Bool {
+        guard let cached = ClasspathCache.load(projectRoot: projectRoot, variant: target.variant) else {
+            return false
+        }
+        return cached.fingerprint == fingerprint(reactor: collectReactor())
+    }
+
+    /// §3.1: 解析本身不产生编译；`withBuild` 为真时把 compile 合进同一次调用
+    /// （见 `classpathArguments` 的说明），一次编译 + 一次解析。
+    /// §6.2: `includeProvided` 用 Maven 自己的 dependency plugin 分别取 runtime 与
+    /// compile 两段再合并，不重写依赖解析（§24 约束 4），也不会把 test scope 带进来。
+    public func runtimeClasspath(
+        _ target: BuildTarget,
+        withBuild: Bool,
+        handle: ProcessHandle?,
+        log: @escaping LogCallback
+    ) throws -> [String] {
+        let reactor = collectReactor()
+        let current = fingerprint(reactor: reactor)
+        if let cached = ClasspathCache.load(projectRoot: projectRoot, variant: target.variant),
+           cached.fingerprint == current {
+            if withBuild {
+                // 启动前判断需要解析、真要解析时缓存却仍然新鲜（Before Launch 把 pom 改了又改回去）：
+                // 推迟掉的 Build 不能就此消失。
+                try buildModule(target, handle: handle, log: log)
+            }
+            log(LogLine(stream: .system, text: "[IdeaLightRun] classpath 命中缓存（\(cached.entries.count) 项）"))
+            return cached.entries
+        }
+
+        log(LogLine(stream: .system, text: "[IdeaLightRun] 解析 runtime classpath（pom/JDK 变化或首次运行）…"))
+        let scope = moduleScope(for: target.module, reactor: reactor)
+        let rawEntries = try resolveRuntimeClasspath(
+            variant: target.variant,
+            scope: scope,
+            includeProvided: target.variant.includeProvided,
+            withCompile: withBuild,
+            handle: handle,
+            log: log
+        )
+        let entries = MavenClasspathResolver.normalize(
+            entries: rawEntries,
+            reactor: reactor,
+            targetModuleDirectory: target.module.directory
+        )
+        ClasspathCache.store(
+            CachedClasspath(
+                module: target.module.name,
+                entries: entries,
+                fingerprint: current,
+                resolvedAt: Date()
+            ),
+            projectRoot: projectRoot,
+            variant: target.variant
+        )
+        log(LogLine(stream: .system, text: "[IdeaLightRun] classpath 解析完成（\(entries.count) 项），已缓存"))
+        return entries
+    }
+
+    // MARK: - Maven 细节
+
+    func compile(
+        scope: String?,
+        handle: ProcessHandle?,
+        log: @escaping LogCallback
+    ) throws {
+        let arguments = Self.compileArguments(
+            mavenExecutable: mavenExecutable,
+            noSnapshotUpdates: noSnapshotUpdates,
+            scope: scope
+        )
+        let status = try run(arguments: arguments, handle: handle, log: log)
+        guard status == 0 else {
+            throw IdeaLightRunError.buildFailed(detail: "Maven compile 失败（退出码 \(status)），详见控制台输出。")
+        }
+    }
+
+    static func compileArguments(
+        mavenExecutable: URL,
+        noSnapshotUpdates: Bool,
+        scope: String?
+    ) -> [String] {
+        styled(
+            moduleFlags(scope: scope) + ["compile"],
+            executable: mavenExecutable,
+            noSnapshotUpdates: noSnapshotUpdates
+        )
+    }
+
+    static func classpathArguments(
+        mavenExecutable: URL,
+        noSnapshotUpdates: Bool,
+        scope: MavenClasspathScope,
+        lifecyclePhase: String?,
+        moduleScope: String?,
+        outputFile: URL
+    ) -> [String] {
+        var goals: [String] = []
+        // §3.1: compile 只在同一次调用里出现一次。多模块的兄弟依赖（未 install 的
+        // SNAPSHOT）只有当该模块在本次会话里跑过 ≥compile 阶段时才被 Maven 认作
+        // 已解析（ReactorReader 会把 target/classes 标记成 artifact 文件）；
+        // 单跑 dependency:build-classpath 会直接报 "Could not resolve dependencies"。
+        // 所以需要 Build 时合并成一次调用，而不是先 compile 再解析。
+        if let lifecyclePhase { goals.append(lifecyclePhase) }
+        goals += ["dependency:build-classpath", scope.includeScopeArgument, "-Dmdep.outputFile=\(outputFile.path)"]
+        return styled(
+            moduleFlags(scope: moduleScope) + goals,
+            executable: mavenExecutable,
+            noSnapshotUpdates: noSnapshotUpdates
+        )
+    }
+
     static func projectBuildArguments(
         mavenExecutable: URL,
         noSnapshotUpdates: Bool,
@@ -155,20 +228,13 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
         styled(kind.goalArguments, executable: mavenExecutable, noSnapshotUpdates: noSnapshotUpdates)
     }
 
-    /// §3.1: classpath 解析本身不产生编译。
-    /// `withCompile` 由调用方（`JavaLauncher`）依据配置里是否真的有 Build 任务决定：
-    /// 有则把 compile 合进同一次调用（一次编译 + 一次解析，见 classpathArguments 的说明），
-    /// 没有则一次都不编译——"Do not build before run" 必须真的不 Build（§11/§3.3）。
-    /// §6.2: `includeProvided` = IDEA 的 "Include dependencies with 'Provided' scope"，
-    /// 用 Maven 自己的 dependency plugin 分别取 runtime 与 compile 两段再合并，
-    /// 不重写依赖解析（§5），也不会把 test scope 带进来。
-    public func resolveRuntimeClasspath(
-        reactorModuleName: String?,
-        hasModules: Bool,
+    /// 两个 scope 各起一个 Maven 进程；reactor 标记不跨进程保留，
+    /// 因此需要编译时每段都带上 lifecyclePhase。
+    func resolveRuntimeClasspath(
+        variant: ClasspathVariant,
+        scope moduleScope: String?,
         includeProvided: Bool,
         withCompile: Bool,
-        runtimeOutputFile: URL,
-        providedOutputFile: URL,
         handle: ProcessHandle?,
         log: @escaping LogCallback
     ) throws -> [String] {
@@ -176,10 +242,11 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
         var entries = try resolveClasspath(
             scope: .runtime,
             lifecyclePhase: phase,
-            reactorModuleName: reactorModuleName,
-            hasModules: hasModules,
+            moduleScope: moduleScope,
             handle: handle,
-            outputFile: runtimeOutputFile,
+            outputFile: ClasspathCache.mavenOutputFileURL(
+                projectRoot: projectRoot, variant: variant, scope: .runtime
+            ),
             log: log
         )
         guard includeProvided else { return entries }
@@ -187,24 +254,22 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
         log(LogLine(stream: .system, text: "[IdeaLightRun] 合并 provided 依赖（-DincludeScope=compile）…"))
         entries += try resolveClasspath(
             scope: .compile,
-            // 每次解析都是独立的 Maven 进程，reactor 标记不跨进程保留，
-            // 第二段同样带上 compile 才能解析到未 install 的兄弟模块。
             lifecyclePhase: phase,
-            reactorModuleName: reactorModuleName,
-            hasModules: hasModules,
+            moduleScope: moduleScope,
             handle: handle,
-            outputFile: providedOutputFile,
+            outputFile: ClasspathCache.mavenOutputFileURL(
+                projectRoot: projectRoot, variant: variant, scope: .compile
+            ),
             log: log
         )
         return entries
     }
 
     /// 单个 scope 的 `dependency:build-classpath`。
-    public func resolveClasspath(
+    func resolveClasspath(
         scope: MavenClasspathScope,
-        lifecyclePhase: String? = nil,
-        reactorModuleName: String?,
-        hasModules: Bool,
+        lifecyclePhase: String?,
+        moduleScope: String?,
         handle: ProcessHandle?,
         outputFile: URL,
         log: @escaping LogCallback
@@ -220,8 +285,7 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
             noSnapshotUpdates: noSnapshotUpdates,
             scope: scope,
             lifecyclePhase: lifecyclePhase,
-            reactorModuleName: reactorModuleName,
-            hasModules: hasModules,
+            moduleScope: moduleScope,
             outputFile: outputFile
         )
         let status = try run(arguments: arguments, handle: handle, log: log)
@@ -248,28 +312,41 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
             .filter { !$0.isEmpty }
     }
 
-    /// §3.5: 执行 IDEA 保存的 Maven goal（如 `clean package`）。
-    /// goal 原文按参数逐项传递，绝不转成 Java 命令（§2）。
-    public func runGoals(
-        _ goals: [String],
-        handle: ProcessHandle?,
-        log: @escaping LogCallback
-    ) throws {
-        let status = try run(arguments: mavenArguments(base: goals), handle: handle, log: log)
-        guard status == 0 else {
-            throw IdeaLightRunError.buildFailed(
-                detail: "Maven \(goals.joined(separator: " ")) 失败（退出码 \(status)），详见控制台输出。"
-            )
-        }
-    }
-
     // MARK: - 内部
 
+    private func collectReactor() -> [MavenModuleInfo] {
+        MavenPomReader.collectReactor(rootPom: rootPomURL)
+    }
+
+    private func fingerprint(reactor: [MavenModuleInfo]) -> String {
+        ClasspathCache.mavenFingerprint(
+            projectRoot: projectRoot,
+            reactorPoms: reactor.map(\.pomURL),
+            jdkMajor: jdkMajorVersion
+        )
+    }
+
     /// §17: 多模块用 `-pl <module> -am` 限定范围，不 clean（增量）。
-    static func moduleFlags(reactorModuleName: String?, hasModules: Bool) -> [String] {
+    /// 根模块与单模块项目返回 nil：整个 reactor 一起构建就是正确范围。
+    func moduleScope(for module: ProjectModule) -> String? {
+        moduleScope(for: module, reactor: collectReactor())
+    }
+
+    func moduleScope(for module: ProjectModule, reactor: [MavenModuleInfo]) -> String? {
+        let root = projectRoot.standardizedFileURL
+        guard reactor.contains(where: { $0.directory.standardizedFileURL != root }) else { return nil }
+        let directory = module.directory.standardizedFileURL
+        guard let info = reactor.first(where: { $0.directory.standardizedFileURL == directory })
+            ?? reactor.first(where: { $0.artifactId == module.name }) else {
+            return nil
+        }
+        return info.directory.standardizedFileURL == root ? nil : info.artifactId
+    }
+
+    static func moduleFlags(scope: String?) -> [String] {
         var arguments = ["-DskipTests"]
-        if let name = reactorModuleName, hasModules {
-            arguments += ["-pl", name, "-am"]
+        if let scope {
+            arguments += ["-pl", scope, "-am"]
         }
         return arguments
     }
@@ -295,7 +372,7 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
     }
 
     /// 同步执行 Maven，stdout/stderr 由读线程逐行回调（可能来自后台线程）。
-    /// handle.terminate() 可终止构建（§：构建期可停止，对齐 IDEA）。
+    /// handle.terminate() 可终止构建（构建期可停止，对齐 IDEA）。
     func run(arguments: [String], handle: ProcessHandle?, log: @escaping LogCallback) throws -> Int32 {
         let process = Process()
         process.executableURL = mavenExecutable
@@ -364,7 +441,7 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
             }
         }
 
-        // §：构建被 Stop 终止时，不要报"构建失败"而是"已停止"
+        // 构建被 Stop 终止时，不要报"构建失败"而是"已停止"
         if handle?.isCancelled == true {
             throw IdeaLightRunError.launchCancelled(detail: "构建已被用户停止。")
         }

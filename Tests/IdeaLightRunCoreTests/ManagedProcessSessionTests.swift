@@ -1,21 +1,18 @@
 import XCTest
 @testable import IdeaLightRunCore
 
-final class ProcessSessionTests: XCTestCase {
-    func makePlan(executable: String, arguments: [String]) -> JavaLaunchPlan {
-        JavaLaunchPlan(
-            javaExecutable: URL(fileURLWithPath: executable),
-            vmArguments: [],
-            classpath: [],
-            mainClass: "",
-            programArguments: arguments,
+final class ManagedProcessSessionTests: XCTestCase {
+    func makePlan(executable: String, arguments: [String]) -> ExecutableLaunchPlan {
+        ExecutableLaunchPlan(
+            executable: URL(fileURLWithPath: executable),
+            arguments: arguments,
             environment: ProcessInfo.processInfo.environment,
             workingDirectory: FileManager.default.temporaryDirectory
         )
     }
 
     func testCapturesStdoutAndExitCode() throws {
-        let session = try ProcessSession(
+        let session = try ManagedProcessSession(
             configKey: "test", configName: "test",
             plan: makePlan(executable: "/bin/echo", arguments: ["hello-lightrun"])
         )
@@ -43,7 +40,7 @@ final class ProcessSessionTests: XCTestCase {
 
     /// §33: stop() → SIGTERM → 进程退出
     func testStopTerminatesProcess() throws {
-        let session = try ProcessSession(
+        let session = try ManagedProcessSession(
             configKey: "test", configName: "test",
             plan: makePlan(executable: "/bin/sleep", arguments: ["100"])
         )
@@ -58,7 +55,7 @@ final class ProcessSessionTests: XCTestCase {
 
     func testFailedLaunchReportsFailure() throws {
         // 使用不存在的 java 可执行文件 → init 直接抛错
-        XCTAssertThrowsError(try ProcessSession(
+        XCTAssertThrowsError(try ManagedProcessSession(
             configKey: "test", configName: "test",
             plan: makePlan(executable: "/nonexistent/java", arguments: [])
         ))
@@ -73,7 +70,7 @@ final class ProcessSessionTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bogus.path)
         defer { try? FileManager.default.removeItem(at: bogus) }
 
-        let session = try ProcessSession(
+        let session = try ManagedProcessSession(
             configKey: "test", configName: "test",
             plan: makePlan(executable: bogus.path, arguments: [])
         )
@@ -109,7 +106,7 @@ final class ProcessSessionTests: XCTestCase {
     /// 否则 deinit 里 cancel 一个挂起的 DispatchSource 会直接崩溃。
     func testReleaseWithoutStartIsSafe() throws {
         for _ in 0..<20 {
-            let session = try ProcessSession(
+            let session = try ManagedProcessSession(
                 configKey: "test", configName: "test",
                 plan: makePlan(executable: "/bin/echo", arguments: ["unused"])
             )
@@ -119,7 +116,7 @@ final class ProcessSessionTests: XCTestCase {
 
     func testLogBufferCapUnderHeavyOutput() throws {
         // 大量输出时环形缓冲不应无限增长（§37）
-        let session = try ProcessSession(
+        let session = try ManagedProcessSession(
             configKey: "test", configName: "test",
             plan: makePlan(executable: "/bin/sh", arguments: ["-c", "for i in $(seq 1 2000); do echo line-$i; done"])
         )
@@ -133,7 +130,7 @@ final class ProcessSessionTests: XCTestCase {
     /// 回归：readerGroup.notify 原先在 enter() 之前注册，计数为 0 时它会立即投递，
     /// 于是进程刚起来就被判成 .exited(0)——服务在跑，列表却显示"已退出"。
     func testLongRunningProcessIsNotReportedExited() throws {
-        let session = try ProcessSession(
+        let session = try ManagedProcessSession(
             configKey: "test", configName: "test",
             plan: makePlan(executable: "/bin/sleep", arguments: ["30"])
         )
@@ -148,7 +145,7 @@ final class ProcessSessionTests: XCTestCase {
 
     /// 回归：子进程自行关闭 stdout（管道 EOF）不等于进程退出，退出码必须来自真实退出。
     func testStdoutClosedWhileProcessAlive() throws {
-        let session = try ProcessSession(
+        let session = try ManagedProcessSession(
             configKey: "test", configName: "test",
             plan: makePlan(executable: "/bin/sh", arguments: ["-c", "exec 1>&-; sleep 1; exit 7"])
         )
@@ -162,12 +159,53 @@ final class ProcessSessionTests: XCTestCase {
 
     /// 孙进程继承管道写端会让 EOF 迟迟不到；状态必须以进程退出为准，不能卡在"运行中"。
     func testExitDetainedByInheritedPipeStillReports() throws {
-        let session = try ProcessSession(
+        let session = try ManagedProcessSession(
             configKey: "test", configName: "test",
             plan: makePlan(executable: "/bin/sh", arguments: ["-c", "sleep 2 & exit 3"])
         )
         session.start()
         XCTAssertTrue(session.waitUntilExit(timeout: 5), "父进程已退出，不能被挂起的管道拖住状态")
         XCTAssertEqual(session.state, .exited(3))
+    }
+
+    /// §7: 会话不解释参数，只逐项传递——含空格的参数也不会被拆开或改写。
+    func testArgumentsArePassedVerbatim() throws {
+        let session = try ManagedProcessSession(
+            configKey: "test", configName: "test",
+            plan: makePlan(executable: "/bin/echo", arguments: ["-cp", "/tmp/a jar:/tmp/b.jar", "com.example.Main"])
+        )
+        var received: [LogLine] = []
+        let lock = NSLock()
+        session.onLogLines = { batch in
+            lock.lock()
+            received += batch
+            lock.unlock()
+        }
+        session.start()
+        XCTAssertTrue(session.waitUntilExit(timeout: 10))
+        Thread.sleep(forTimeInterval: 0.4)
+        lock.lock()
+        // 只看进程自己的输出：会话另外写了一条 "[IdeaLightRun] 进程已启动" 系统行。
+        let text = received.filter { $0.stream == .stdout }.map(\.text).joined(separator: "\n")
+        lock.unlock()
+        XCTAssertEqual(text, "-cp /tmp/a jar:/tmp/b.jar com.example.Main")
+    }
+
+    /// §7: 计划登记的临时产物（@argfile 等）在进程进入终态时由会话清掉。
+    func testTemporaryArtifactsRemovedOnExit() throws {
+        let artifact = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lightrun-argfile-\(UUID().uuidString)")
+        try Data("-cp /tmp/a.jar".utf8).write(to: artifact)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: artifact.path))
+
+        var plan = makePlan(executable: "/bin/echo", arguments: ["done"])
+        plan.temporaryArtifacts = [artifact]
+        let session = try ManagedProcessSession(configKey: "test", configName: "test", plan: plan)
+        session.start()
+        XCTAssertTrue(session.waitUntilExit(timeout: 10))
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: artifact.path),
+            "会话结束后临时文件必须消失，否则每次启动都在攒垃圾"
+        )
     }
 }

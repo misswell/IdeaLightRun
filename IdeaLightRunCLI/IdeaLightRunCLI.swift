@@ -230,8 +230,8 @@ struct IdeaLightRunCLI {
 
     final class LaunchBox: @unchecked Sendable {
         private let lock = NSLock()
-        private var _session: ProcessSession?
-        var session: ProcessSession? {
+        private var _session: ManagedProcessSession?
+        var session: ManagedProcessSession? {
             get { lock.lock(); defer { lock.unlock() }; return _session }
             set { lock.lock(); _session = newValue; lock.unlock() }
         }
@@ -265,10 +265,7 @@ struct IdeaLightRunCLI {
             FileHandle.standardError.write("找不到配置 “\(name)”。可用：\(names)\n".data(using: .utf8)!)
             exit(2)
         }
-        guard config.type == .application || config.type == .springBoot else {
-            throw IdeaLightRunError.invalidConfiguration(detail: "“\(config.name)”（\(config.type.displayName)）当前不支持直接启动。")
-        }
-
+        // §22: CLI 不自己判断类型，交给 ExecutionCoordinator；不支持的配置会明确报错。
         let logLock = NSLock()
         let emit: (String) -> Void = { text in
             logLock.lock()
@@ -276,19 +273,19 @@ struct IdeaLightRunCLI {
             logLock.unlock()
         }
 
-        let launcher = JavaLauncher()
+        let coordinator = ExecutionCoordinator()
         let box = LaunchBox()
         let pipelineSemaphore = DispatchSemaphore(value: 0)
 
         Task.detached(priority: .userInitiated) {
             do {
-                let plan = try await launcher.prepare(
+                let plan = try await coordinator.prepare(
                     config: config,
                     projectRoot: projectRoot,
                     log: { line in emit(line.text) },
                     progress: { state in emit("[IdeaLightRun] \(state.displayText)…") }
                 )
-                let session = try ProcessSession(configKey: config.uniqueKey, configName: config.name, plan: plan)
+                let session = try ManagedProcessSession(configKey: config.uniqueKey, configName: config.name, plan: plan)
                 session.onLogLines = { batch in
                     for line in batch { emit(line.text) }
                 }

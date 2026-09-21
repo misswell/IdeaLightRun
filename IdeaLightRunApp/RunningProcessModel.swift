@@ -1,7 +1,7 @@
 import Foundation
 import IdeaLightRunCore
 
-/// GUI 侧的单次运行模型：包装 ProcessSession，回调统一切回主线程。
+/// GUI 侧的单次运行模型：包装 ManagedProcessSession，回调统一切回主线程。
 /// 日志经 LogRingBuffer（§37 上限）+ 100ms 批量（§103）进入 NSTextView 控制台。
 @MainActor
 final class RunningProcessModel: LogViewModel, Identifiable {
@@ -19,7 +19,7 @@ final class RunningProcessModel: LogViewModel, Identifiable {
 
     var pendingRestart = false
     var onRestartNeeded: (() -> Void)?
-    private(set) var session: ProcessSession?
+    private(set) var session: ManagedProcessSession?
 
     /// 状态/PID 变更通知。本模型是 AppStore 里的嵌套 ObservableObject，SwiftUI 不会自动
     /// 观察它；不显式冒泡到 AppStore.objectWillChange，列表行状态、顶栏按钮和运行横幅会
@@ -62,7 +62,7 @@ final class RunningProcessModel: LogViewModel, Identifiable {
     }
 
     /// 构建完成后挂接真实进程会话。
-    func attach(session: ProcessSession) {
+    func attach(session: ManagedProcessSession) {
         self.session = session
         setPID(session.pid)
         session.onLogLines = { [weak self] batch in
@@ -83,7 +83,7 @@ final class RunningProcessModel: LogViewModel, Identifiable {
                         self.onRestartNeeded?()
                     }
                 case .failed:
-                    // 失败原因由 ProcessSession 写入 logBuffer 后随批次送达，此处不重复。
+                    // 失败原因由 ManagedProcessSession 写入 logBuffer 后随批次送达，此处不重复。
                     self.setPID(nil)
                 default:
                     break

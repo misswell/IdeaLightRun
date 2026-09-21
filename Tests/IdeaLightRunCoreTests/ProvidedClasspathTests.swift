@@ -35,9 +35,9 @@ final class ProvidedClasspathTests: XCTestCase {
     }
 
     @discardableResult
-    private func prepare(_ name: String) async throws -> JavaLaunchPlan {
+    private func prepare(_ name: String) async throws -> ExecutableLaunchPlan {
         let config = try project.configuration(named: name)
-        return try await JavaLauncher().prepare(
+        return try await ExecutionCoordinator().prepare(
             config: config,
             projectRoot: project.root,
             log: { _ in },

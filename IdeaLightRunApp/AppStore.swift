@@ -84,14 +84,8 @@ final class AppStore: ObservableObject {
               let config = project.result?.configurations.first(where: { $0.uniqueKey == configKey }) else {
             return
         }
-        guard config.type == .application || config.type == .springBoot else {
-            alertMessage = "“\(config.name)”（\(config.type.displayName)）当前不支持直接启动。"
-            return
-        }
-        guard project.result?.buildSystem.maven != nil else {
-            alertMessage = "当前版本仅支持 Maven 项目直接启动；Gradle 支持在 Milestone 4 提供。"
-            return
-        }
+        // §23: 这里不再判断配置类型与构建系统——能不能跑由 Core 决定，
+        // 跑不了的配置会以 unsupportedConfiguration 明确报出来。
         // §35: 已有终态会话时替换；运行/构建中由 UI 禁用 ▶
         if let existing = sessions[configKey], !existing.state.isTerminal {
             return
@@ -110,12 +104,12 @@ final class AppStore: ObservableObject {
         selectedConfigurationKey = configKey
 
         let projectRoot = project.url
-        let launcher = JavaLauncher()
+        let coordinator = ExecutionCoordinator()
         let handle = ProcessHandle()
         model.buildHandle = handle
         Task.detached(priority: .userInitiated) {
             do {
-                let plan = try await launcher.prepare(
+                let plan = try await coordinator.prepare(
                     config: config,
                     projectRoot: projectRoot,
                     log: { line in
@@ -131,7 +125,7 @@ final class AppStore: ObservableObject {
                     await model.setPipelineState(.cancelled)
                     return
                 }
-                let session = try ProcessSession(
+                let session = try ManagedProcessSession(
                     configKey: configKey,
                     configName: config.name,
                     plan: plan,
@@ -148,6 +142,15 @@ final class AppStore: ObservableObject {
                     await model.setPipelineState(.cancelled)
                 } else {
                     await model.pipelineFailed(error.localizedDescription)
+                    // §23: 类型 / 构建系统的判断搬进 Core 之后，「这个配置根本跑不了」
+                    // 仍然要像以前一样弹窗，而不是只在控制台留一行小字。
+                    switch error {
+                    case .unsupportedConfiguration, .buildToolNotFound:
+                        let message = error.localizedDescription
+                        await MainActor.run { [weak self] in self?.alertMessage = message }
+                    default:
+                        break
+                    }
                 }
             } catch {
                 await model.pipelineFailed(error.localizedDescription)

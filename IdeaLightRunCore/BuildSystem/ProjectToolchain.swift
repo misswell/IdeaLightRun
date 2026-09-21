@@ -49,8 +49,10 @@ public struct ProjectToolchain: Sendable {
             rootPomURL: detection.pomURL,
             service: MavenBuildService(
                 projectRoot: projectRoot,
+                rootPomURL: detection.pomURL,
                 mavenExecutable: maven.executable,
-                environment: MavenBuildService.buildEnvironment(javaHome: jdk.home)
+                environment: MavenBuildService.buildEnvironment(javaHome: jdk.home),
+                jdkMajorVersion: jdk.majorVersion
             )
         )
     }

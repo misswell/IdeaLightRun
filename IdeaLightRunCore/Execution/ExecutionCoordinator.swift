@@ -1,12 +1,15 @@
 import Foundation
 
-/// §58: 启动流水线：扫描 → Module/JDK/构建工具 → Before Launch（§3.2）
-/// → classpath（§3.1：只做依赖解析，不夹带 compile）→ 配置解析（§4/§5）→ LaunchPlan。
+/// §8: 唯一的启动入口。GUI 与 CLI 都只调用这里（§24 约束 13），
+/// 「这个配置能不能跑、用什么构建系统、Before Launch 怎么执行」全部在 Core 这条链上决定。
+///
+/// 流水线：类型门禁 → Module（§13）→ BuildSystemResolver（§9）
+/// → Before Launch（§3.2）→ runtime classpath（§3.1）
+/// → RunConfigurationResolver（§4/§5）→ JavaRunPlanner → `ExecutableLaunchPlan`（§7）。
 ///
 /// §3.3: 编译只在配置里真的有 Make / Build Project 时发生。IDEA 勾了
-/// "Do not build before run" 的配置，这里就一次编译都不会跑。
-/// GUI 与 CLI 共用，禁止另起一套（§4）。
-public struct JavaLauncher: Sendable {
+/// "Do not build before run" 的配置，这里一次编译都不会跑。
+public struct ExecutionCoordinator: Sendable {
     public init() {}
 
     public func prepare(
@@ -15,7 +18,7 @@ public struct JavaLauncher: Sendable {
         log: @escaping LogCallback,
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle? = nil
-    ) async throws -> JavaLaunchPlan {
+    ) async throws -> ExecutableLaunchPlan {
         try await prepare(
             config: config,
             projectRoot: projectRoot,
@@ -39,98 +42,62 @@ public struct JavaLauncher: Sendable {
         processHandle: ProcessHandle?,
         gateOwner: BuildGate.Owner?,
         visiting: [String]
-    ) async throws -> JavaLaunchPlan {
-        let scanner = IntelliJProjectScanner()
-        let result = try scanner.scan(projectRoot: projectRoot)
+    ) async throws -> ExecutableLaunchPlan {
+        try Self.ensureRunnable(config)
+        let scan = try IntelliJProjectScanner().scan(projectRoot: projectRoot)
 
         // ① Module 解析（§13）
         let moduleResolution = ModuleResolver.resolveModule(
             named: config.moduleName,
             mainClass: config.mainClass,
             projectRoot: projectRoot,
-            knownModules: result.modules
+            knownModules: scan.modules
         )
         guard let module = moduleResolution.module else {
             let detail = moduleResolution.warnings.map(\.detail).joined(separator: "；")
             throw IdeaLightRunError.moduleNotFound(detail: detail.isEmpty ? "无法定位 module。" : detail)
         }
 
-        // ②③ JDK + 构建工具（§23/§15，与项目级构建共用 ProjectToolchain）
-        let toolchain = try ProjectToolchain.resolve(
+        // ②③ JDK + 构建系统（§23/§15/§9）
+        let build = try BuildSystemResolver.resolve(
             projectRoot: projectRoot,
-            result: result,
-            configJDKName: config.jreReference,
-            context: "启动",
+            result: scan,
+            config: config,
+            module: module,
             log: log
         )
-        let jdk = toolchain.jdk
-
-        let reactor = MavenPomReader.collectReactor(rootPom: toolchain.rootPomURL)
-        let reactorModule = reactor.first { $0.directory.standardizedFileURL == module.directory.standardizedFileURL }
-            ?? reactor.first { $0.artifactId == module.name }
-        // reactor 中存在非根模块即视为多模块（§16）
-        let isMultiModule = reactor.contains { $0.directory.standardizedFileURL != projectRoot.standardizedFileURL }
-        let reactorModuleName: String? = {
-            guard isMultiModule else { return nil }
-            guard let info = reactorModule else { return nil }
-            // 根模块本身不需要 -pl
-            if info.directory.standardizedFileURL == projectRoot.standardizedFileURL { return nil }
-            return info.artifactId
-        }()
-
-        let service = toolchain.service
-        // §6.1: includeProvided 是 classpath 的一部分，不是全局属性——两个配置共用缓存会互相污染。
-        let variant = ClasspathVariant.maven(
-            module: module.name,
-            includeProvided: config.includeProvidedDependencies
-        )
-        let gateKey = projectRoot.standardizedFileURL.path
+        let adapter = build.adapter
+        let target = build.target
         let owner = gateOwner ?? BuildGate.Owner()
-
-        // §3.1/§3.3: 先判断 classpath 是否需要重新解析，再决定 Build 怎么跑。
-        // 需要解析时把 compile 合进那一次 Maven 调用（兄弟模块的未 install
-        // SNAPSHOT 只有在同一次会话里编译过才能被解析到），这样冷启动仍然
-        // 只 compile 一次、只解析一次；缓存命中时 compile 单独跑。
-        let preFingerprint = ClasspathCache.mavenFingerprint(
-            projectRoot: projectRoot,
-            reactorPoms: reactor.map(\.pomURL),
-            jdkMajor: jdk.majorVersion
-        )
-        let needsClasspathResolve = ClasspathCache.load(projectRoot: projectRoot, variant: variant)?
-            .fingerprint != preFingerprint
+        // §3.1/§3.3: 先知道 classpath 要不要重新解析，再决定 Build 怎么跑——
+        // 需要解析时把编译合进那一次调用，冷启动就只 compile 一次、只解析一次。
         let deferredBuild = DeferredBuild()
 
-        return try await BuildGate.shared.run(projectKey: gateKey, owner: owner) {
-            // ④ §3.2: Before Launch（Build / Build Project / Maven goal / 被引用的运行配置）
+        return try await BuildGate.shared.run(projectKey: projectRoot.standardizedFileURL.path, owner: owner) {
+            // ④ Before Launch（§3.2）
             try await BeforeLaunchExecutor().run(
                 for: config,
-                configurations: result.configurations,
+                configurations: scan.configurations,
                 actions: BeforeLaunchExecutor.Actions(
                     build: {
                         progress(.building)
-                        if needsClasspathResolve {
-                            deferredBuild.pending = true
-                            log(LogLine(stream: .system, text: "[IdeaLightRun] 编译将与依赖解析合并为一次 Maven 调用（避免重复 compile）"))
+                        if adapter.hasFreshClasspathCache(for: target) {
+                            try adapter.buildModule(target, handle: processHandle, log: log)
                         } else {
-                            log(LogLine(stream: .system, text: "[IdeaLightRun] 编译 \(reactorModuleName ?? module.name) …"))
-                            try service.compile(
-                                reactorModuleName: reactorModuleName,
-                                hasModules: isMultiModule,
-                                handle: processHandle,
-                                log: log
-                            )
+                            deferredBuild.pending = true
+                            log(LogLine(stream: .system, text: "[IdeaLightRun] 编译将与依赖解析合并为一次调用（避免重复编译）"))
                         }
                     },
                     buildProject: {
                         progress(.building)
-                        try service.buildProject(kind: .build, handle: processHandle, log: log)
+                        try adapter.buildProject(kind: .build, handle: processHandle, log: log)
                     },
                     runMavenGoals: { goals in
                         progress(.building)
-                        try service.runGoals(goals, handle: processHandle, log: log)
+                        try adapter.runTasks(goals, handle: processHandle, log: log)
                     },
                     runReferenced: { referenced, chain in
-                        let referencedPlan = try await prepare(
+                        let referencedPlan = try await self.prepare(
                             config: referenced,
                             projectRoot: projectRoot,
                             log: log,
@@ -152,70 +119,21 @@ public struct JavaLauncher: Sendable {
                 log: log
             )
 
-            // ⑤ classpath：缓存命中 or 只解析依赖（§3.1 起 cold resolve 不再夹带第二次 compile）
+            // ⑤ classpath：缓存命中或只解析依赖（§3.1：解析不夹带编译）
             progress(.resolvingClasspath)
-            // Before Launch 里的 Maven goal 可能改过 pom，指纹按最新内容算
-            let fingerprint = ClasspathCache.mavenFingerprint(
-                projectRoot: projectRoot,
-                reactorPoms: reactor.map(\.pomURL),
-                jdkMajor: jdk.majorVersion
+            let classpath = try adapter.runtimeClasspath(
+                target,
+                withBuild: deferredBuild.pending,
+                handle: processHandle,
+                log: log
             )
-            let classpath: [String]
-            if let cached = ClasspathCache.load(projectRoot: projectRoot, variant: variant),
-               cached.fingerprint == fingerprint {
-                if deferredBuild.pending {
-                    // 启动前判断要解析、解析时却发现命中（pom 被 Before Launch 改回原样）：
-                    // 推迟掉的 Build 不能就此消失。
-                    log(LogLine(stream: .system, text: "[IdeaLightRun] 编译 \(reactorModuleName ?? module.name) …"))
-                    try service.compile(
-                        reactorModuleName: reactorModuleName,
-                        hasModules: isMultiModule,
-                        handle: processHandle,
-                        log: log
-                    )
-                }
-                classpath = cached.entries
-                log(LogLine(stream: .system, text: "[IdeaLightRun] classpath 命中缓存（\(classpath.count) 项）"))
-            } else {
-                log(LogLine(stream: .system, text: "[IdeaLightRun] 解析 runtime classpath（pom/JDK 变化或首次运行）…"))
-                let rawEntries = try service.resolveRuntimeClasspath(
-                    reactorModuleName: reactorModuleName,
-                    hasModules: isMultiModule,
-                    includeProvided: config.includeProvidedDependencies,
-                    withCompile: deferredBuild.pending,
-                    runtimeOutputFile: ClasspathCache.mavenOutputFileURL(
-                        projectRoot: projectRoot, variant: variant, scope: .runtime
-                    ),
-                    providedOutputFile: ClasspathCache.mavenOutputFileURL(
-                        projectRoot: projectRoot, variant: variant, scope: .compile
-                    ),
-                    handle: processHandle,
-                    log: log
-                )
-                classpath = MavenClasspathResolver.normalize(
-                    entries: rawEntries,
-                    reactor: reactor,
-                    targetModuleDirectory: module.directory
-                )
-                ClasspathCache.store(
-                    CachedClasspath(
-                        module: module.name,
-                        entries: classpath,
-                        fingerprint: fingerprint,
-                        resolvedAt: Date()
-                    ),
-                    projectRoot: projectRoot,
-                    variant: variant
-                )
-                log(LogLine(stream: .system, text: "[IdeaLightRun] classpath 解析完成（\(classpath.count) 项），已缓存"))
-            }
 
             // ⑥ 配置解析：宏、环境文件、Working Directory（§4/§5）
             let resolved = try RunConfigurationResolver().resolve(
                 config: config,
                 projectRoot: projectRoot,
                 module: module,
-                jdk: jdk
+                jdk: build.jdk
             )
             // §5: 告警必须看得见——以前 resolve(x).value 把 warnings 直接丢掉。
             for warning in resolved.warnings {
@@ -227,9 +145,22 @@ public struct JavaLauncher: Sendable {
                 log(LogLine(stream: .system, text: "[IdeaLightRun] 环境文件已加载 \(resolved.loadedEnvironmentFiles.count) 个，配置变量 \(keys) 个"))
             }
 
-            // ⑦ LaunchPlan（§26）
+            // ⑦ 启动计划（§26/§7）
             progress(.starting)
-            return try LaunchPlanBuilder.build(resolved: resolved, classpath: classpath, jdk: jdk)
+            return try JavaRunPlanner.plan(resolved: resolved, classpath: classpath, jdk: build.jdk)
+        }
+    }
+
+    // MARK: - 类型门禁（§23）
+
+    /// 运行类型判断留在 Core：GUI / CLI 不许自己 `if Maven`、`if SpringBoot`。
+    /// 支持的类型集合只有 `supportLevel` 一处定义，界面徽标与门禁不会漂移。
+    static func ensureRunnable(_ config: RunConfiguration) throws {
+        guard config.type.supportLevel == .supported else {
+            throw IdeaLightRunError.unsupportedConfiguration(
+                detail: "“\(config.name)”（\(config.type.displayName)）当前不能直接启动；"
+                    + "现在能替代 IDEA Run 按钮的是 Application 与 Spring Boot 配置。"
+            )
         }
     }
 
@@ -238,12 +169,12 @@ public struct JavaLauncher: Sendable {
     /// Before Launch 引用的运行配置要像 IDEA 那样先跑完再回来：
     /// 启动进程、把输出并进当前会话的日志、等它退出；退出码非 0 时中止本次启动。
     private static func runUntilExit(
-        plan: JavaLaunchPlan,
+        plan: ExecutableLaunchPlan,
         configName: String,
         processHandle: ProcessHandle?,
         log: @escaping LogCallback
     ) async throws {
-        let session = try ProcessSession(
+        let session = try ManagedProcessSession(
             configKey: "before-launch::\(configName)",
             configName: configName,
             plan: plan
@@ -294,7 +225,7 @@ public struct JavaLauncher: Sendable {
     }
 }
 
-/// Before Launch 决定要 Build、但 compile 被推迟到依赖解析那一次调用里执行。
+/// Before Launch 决定要 Build、但编译被推迟到依赖解析那一次调用里执行。
 /// 闭包跨线程读写，用锁保证只看到 true/false 两种确定状态。
 private final class DeferredBuild: @unchecked Sendable {
     private let lock = NSLock()

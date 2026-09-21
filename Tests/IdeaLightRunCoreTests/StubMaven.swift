@@ -107,9 +107,28 @@ final class StubMavenProject {
 }
 
 /// 系统上没有可用 JDK 时跳过整组启动流水线测试：
-/// `JavaLauncher` 必须解析出 JDK 才能产出 LaunchPlan，这与桩无关。
+/// `ExecutionCoordinator` 必须解析出 JDK 才能产出启动计划，这与桩无关。
 enum TestToolchain {
     static func availableJDK() -> JDKInstallation? {
         JDKResolver().resolve(configJDKName: nil, projectJDKName: nil).installation
+    }
+}
+
+/// §7: 启动计划只剩 argv。测试仍按 classpath / Main Class 断言，
+/// 就从 `-cp` 位置读回去——顺带钉住"计划里的参数形状和 IDEA 一致"。
+extension ExecutableLaunchPlan {
+    var classpath: [String] {
+        guard let value = classpathValue else { return [] }
+        return value.split(separator: ":").map(String.init)
+    }
+
+    var mainClass: String? {
+        guard let index = arguments.firstIndex(of: "-cp"), index + 2 < arguments.count else { return nil }
+        return arguments[index + 2]
+    }
+
+    private var classpathValue: String? {
+        guard let index = arguments.firstIndex(of: "-cp"), index + 1 < arguments.count else { return nil }
+        return arguments[index + 1]
     }
 }

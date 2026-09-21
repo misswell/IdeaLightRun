@@ -1,46 +1,5 @@
 import Foundation
 
-/// §26: 所有解析完成后的启动计划。UI 不直接拼 Java 命令。
-public struct JavaLaunchPlan: Sendable {
-    public var javaExecutable: URL
-    public var vmArguments: [String]
-    /// §27: classpath 以 ":" 连接后通过 -cp 传递（@argfile 支持在 P1，§112）。
-    public var classpath: [String]
-    public var mainClass: String
-    public var programArguments: [String]
-    public var environment: [String: String]
-    public var workingDirectory: URL
-
-    public init(
-        javaExecutable: URL,
-        vmArguments: [String],
-        classpath: [String],
-        mainClass: String,
-        programArguments: [String],
-        environment: [String: String],
-        workingDirectory: URL
-    ) {
-        self.javaExecutable = javaExecutable
-        self.vmArguments = vmArguments
-        self.classpath = classpath
-        self.mainClass = mainClass
-        self.programArguments = programArguments
-        self.environment = environment
-        self.workingDirectory = workingDirectory
-    }
-
-    /// 用于"复制启动命令"等展示场景；不用于执行。
-    public func displayCommand() -> String {
-        var parts: [String] = [javaExecutable.path]
-        parts.append(contentsOf: vmArguments)
-        parts.append(contentsOf: ["-cp", classpath.joined(separator: ":"), mainClass])
-        parts.append(contentsOf: programArguments)
-        return parts
-            .map { $0.contains(" ") ? "\"" + $0 + "\"" : $0 }
-            .joined(separator: " ")
-    }
-}
-
 /// §32: 进程状态机。
 public enum ProcessState: Equatable, Sendable {
     case preparing

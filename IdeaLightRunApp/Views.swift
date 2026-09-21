@@ -17,7 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model.handle?.terminate()
         }
         // 这里阻塞了主线程，model.state 由 Task { @MainActor } 写入、永远不会更新；
-        // 必须轮询后台线程直接维护的 ProcessSession / Process 状态。
+        // 必须轮询后台线程直接维护的 ManagedProcessSession / Process 状态。
         func stillAlive(_ model: RunningProcessModel) -> Bool {
             if let session = model.session { return !session.state.isTerminal }
             return model.buildHandle?.hasLiveProcess ?? false
@@ -576,8 +576,8 @@ struct ConfigurationDetailView: View {
 
     private func header(project: ProjectEntry) -> some View {
         HStack(spacing: 10) {
-            if let config = store.selectedConfiguration, let result = project.result {
-                configActions(config: config, result: result)
+            if let config = store.selectedConfiguration {
+                configActions(config: config)
             } else {
                 Text(project.name)
                     .font(.title3.weight(.semibold))
@@ -598,9 +598,11 @@ struct ConfigurationDetailView: View {
     }
 
     @ViewBuilder
-    private func configActions(config: RunConfiguration, result: ScanResult) -> some View {
+    private func configActions(config: RunConfiguration) -> some View {
         let model = store.sessions[config.uniqueKey]
-        let launchable = (config.type == .application || config.type == .springBoot) && result.buildSystem.maven != nil
+        // §23: 只读 Core 声明的类型支持级别，不在这里判断构建系统——
+        // 缺 Maven / 不支持的类型由 Core 在点击时给出明确错误。
+        let launchable = config.type.supportLevel == .supported
         // IDEA 行为：构建期与运行期 Stop 都可用
         let stopEnabled = model?.state.isActive == true && model?.state != .stopping
 
@@ -619,7 +621,7 @@ struct ConfigurationDetailView: View {
                 Label("Run", systemImage: "play.fill")
             }
             .keyboardShortcut("r", modifiers: .command)
-            .help(launchable ? "编译并启动" : "仅支持 Maven 的 Application / Spring Boot 配置")
+            .help(launchable ? "编译并启动" : "IdeaLightRun 暂不能启动这类配置")
             .disabled(!launchable || model != nil && !model!.state.isTerminal)
 
             Button {

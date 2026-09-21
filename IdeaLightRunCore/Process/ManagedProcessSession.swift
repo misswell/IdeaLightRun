@@ -1,13 +1,16 @@
 import Foundation
 
-/// §32/§33/§36/§37: 单个 Java 进程会话。
-/// - Process.arguments 数组传参，绝不走 /bin/sh -c（§27）
+/// §32/§33/§36/§37 + §7: 一个受管进程会话。
+/// - 只执行 `ExecutableLaunchPlan`：可执行文件、参数、环境、工作目录，
+///   不认识 Java / Maven / Gradle / Spring Boot / JAR（§7）
+/// - Process.arguments 数组传参，绝不走 /bin/sh -c（§24 约束 1）
 /// - stdout/stderr 分别由读线程捕获进入环形缓冲（§36/§37）
 ///   （读线程而非 readabilityHandler：避免与 readDataToEndOfFile 混用的 Foundation 竞态崩溃）
 /// - 退出以进程本身为准：管道 EOF 只代表"暂时没有输出"，不代表进程退出
 /// - 100ms 批量回调（§103）
 /// - stop(): SIGTERM → 由用户决定 Force Kill（§33）
-public final class ProcessSession {
+/// - 进入终态时删除计划登记的临时产物（@argfile 等）
+public final class ManagedProcessSession {
     public let configKey: String
     public let configName: String
     public let logBuffer: LogRingBuffer
@@ -24,6 +27,7 @@ public final class ProcessSession {
     /// 收尾只生效一次；只在 flushQueue 上读写，无需加锁。
     private var didFinish = false
 
+    private let temporaryArtifacts: [URL]
     private let process: Process
     private let flushTimer: DispatchSourceTimer
     private let flushQueue = DispatchQueue(label: "com.misswell.IdeaLightRun.log-flush", qos: .utility)
@@ -32,26 +36,21 @@ public final class ProcessSession {
     public init(
         configKey: String,
         configName: String,
-        plan: JavaLaunchPlan,
+        plan: ExecutableLaunchPlan,
         logBuffer: LogRingBuffer = LogRingBuffer()
     ) throws {
-        guard FileManager.default.isExecutableFile(atPath: plan.javaExecutable.path) else {
-            throw IdeaLightRunError.jdkNotFound(detail: "Java 可执行文件不存在或不可执行：\(plan.javaExecutable.path)")
+        guard FileManager.default.isExecutableFile(atPath: plan.executable.path) else {
+            throw IdeaLightRunError.launchFailed(detail: "可执行文件不存在或不可执行：\(plan.executable.path)")
         }
         self.configKey = configKey
         self.configName = configName
         self.logBuffer = logBuffer
+        self.temporaryArtifacts = plan.temporaryArtifacts
 
         let process = Process()
-        process.executableURL = plan.javaExecutable
-        // §27: 参数逐项传递。mainClass 为空视为非 Java 启动（测试/工具进程）。
-        if plan.mainClass.isEmpty {
-            process.arguments = plan.vmArguments + plan.programArguments
-        } else {
-            process.arguments = plan.vmArguments
-                + ["-cp", plan.classpath.joined(separator: ":"), plan.mainClass]
-                + plan.programArguments
-        }
+        // §24 约束 2：计划给什么参数就执行什么参数，这里不追加也不解释。
+        process.executableURL = plan.executable
+        process.arguments = plan.arguments
         process.environment = plan.environment
         process.currentDirectoryURL = plan.workingDirectory
         process.standardInput = Pipe()
@@ -249,6 +248,11 @@ public final class ProcessSession {
         lock.lock()
         stateValue = newState
         lock.unlock()
+        // 计划登记的临时文件（@argfile / manifest jar）只服务本次运行：
+        // 进程一进入终态就删掉，不留到下次启动。
+        if newState.isTerminal {
+            temporaryArtifacts.forEach { try? FileManager.default.removeItem(at: $0) }
+        }
         onState?(newState)
     }
 }
