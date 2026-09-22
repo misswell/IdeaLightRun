@@ -4,8 +4,34 @@ import IdeaLightRunCore
 
 /// §66: 退出时默认 Stop services and quit。
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// 关掉最后一个窗口后进程仍然活着（窗口只是没了，App 没退），此时点 Dock 图标
+    /// 默认只做「激活」，SwiftUI 不会重建窗口——看上去就是「点了没反应」。
+    /// 这里补上：没有可见窗口时走 SwiftUI 自己注册的 New Window 菜单项，
+    /// 和按 ⌘N 完全同一条路径，因此带回来的窗口状态与手动新开的一致。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !flag else { return true }
+        sender.activate(ignoringOtherApps: true)
+        // 窗口只是被最小化：交给 AppKit 恢复原窗口，另开一个等于凭空多一份界面
+        if sender.windows.contains(where: { $0.isMiniaturized }) { return true }
+        return performNewWindowCommand(sender) ? false : true
+    }
+
+    private func performNewWindowCommand(_ sender: NSApplication) -> Bool {
+        for top in sender.mainMenu?.items ?? [] {
+            guard let submenu = top.submenu else { continue }
+            for (index, item) in submenu.items.enumerated() {
+                guard item.action != nil,
+                      item.keyEquivalent == "n",
+                      item.keyEquivalentModifierMask.contains(.command) else { continue }
+                submenu.performActionForItem(at: index)
+                return true
+            }
+        }
+        return false
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let store = AppStore.current else { return .terminateNow }
+        let store = AppStore.shared
         let active = store.sessions.values.filter { !$0.state.isTerminal }
         for model in active {
             model.buildHandle?.terminate()
@@ -78,7 +104,7 @@ struct BuildCommands: Commands {
 }
 
 struct RootView: View {
-    @StateObject private var store = AppStore()
+    @ObservedObject private var store = AppStore.shared
     @State private var showImporter = false
 
     var body: some View {

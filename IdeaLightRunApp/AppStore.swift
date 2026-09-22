@@ -17,7 +17,10 @@ struct ProjectEntry: Identifiable, Equatable {
 /// 不写数据库，不修改用户项目目录。
 @MainActor
 final class AppStore: ObservableObject {
-    static var current: AppStore?
+    /// 全应用共用一个 store：窗口可以被关掉再重开（Dock 图标唤回），
+    /// 每个窗口各建一份的话，重开的那份看不到正在跑的会话，
+    /// 既按不了 Stop，退出时 `applicationShouldTerminate` 也漏停子进程。
+    static let shared = AppStore()
 
     @Published private(set) var projects: [ProjectEntry] = []
     @Published var selectedProjectID: String?
@@ -40,7 +43,6 @@ final class AppStore: ObservableObject {
 
     init() {
         updater = SoftwareUpdater()
-        AppStore.current = self
         // updater 是嵌套的 ObservableObject，不转发就不会有人重绘。
         updater.objectWillChange
             .sink { [weak self] in self?.objectWillChange.send() }
@@ -71,8 +73,7 @@ final class AppStore: ObservableObject {
     /// `@MainActor`，闭包没法直接调主 actor 方法；显式走这里，两种工具链都成立。
     nonisolated static func fromMenu(_ action: @escaping @MainActor (AppStore) -> Void) {
         Task { @MainActor in
-            guard let store = current else { return }
-            action(store)
+            action(shared)
         }
     }
 
