@@ -31,39 +31,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        let store = AppStore.shared
-        let active = store.sessions.values.filter { !$0.state.isTerminal }
-        for model in active {
-            model.buildHandle?.terminate()
-            model.session?.stop()
-        }
-        // 项目级构建（Build/Rebuild Project）的 Maven 子进程同样要停，否则退出后留下孤儿 mvn
-        let building = store.builds.values.filter { $0.phase.isBusy }
-        for model in building {
-            model.handle?.terminate()
-        }
-        // 这里阻塞了主线程，model.state 由 Task { @MainActor } 写入、永远不会更新；
-        // 必须轮询后台线程直接维护的 ManagedProcessSession / Process 状态。
-        func stillAlive(_ model: RunningProcessModel) -> Bool {
-            if let session = model.session { return !session.state.isTerminal }
-            return model.buildHandle?.hasLiveProcess ?? false
-        }
-        let deadline = Date().addingTimeInterval(2)
-        while Date() < deadline {
-            if !active.contains(where: stillAlive) && !building.contains(where: { $0.handle?.hasLiveProcess ?? false }) { break }
-            Thread.sleep(forTimeInterval: 0.05)
-        }
-        for model in active {
-            if let session = model.session {
-                if !session.state.isTerminal { session.forceKill() }
-            } else {
-                model.buildHandle?.forceKill()
-            }
-        }
-        for model in building {
-            model.handle?.forceKill()
-        }
+        AppStore.shared.stopActiveWork()
         return .terminateNow
+    }
+
+    /// 在线更新移交后的退出：走一次正常的 terminate，让 §66 的收尾照常在
+    /// `applicationShouldTerminate` 里跑；但它可能被静默吞掉（见
+    /// `SoftwareUpdater.quitAfterHandoff`），而更新助手只等本进程 60s，
+    /// 超时就不替换了。所以 terminate 一旦返回，自己收尾后强制退——
+    /// 不允许留下「助手在等、进程却活着」的僵死状态。
+    @MainActor static func terminateForInstallation() {
+        NSApp.terminate(nil)
+        AppStore.shared.stopActiveWork()
+        exit(0)
     }
 }
 
@@ -140,7 +120,8 @@ struct RootView: View {
             isPresented: Binding(
                 get: { store.updater.isPresented },
                 set: { store.updater.isPresented = $0 }
-            )
+            ),
+            onDismiss: { store.updater.updateSheetDidDismiss() }
         ) {
             UpdateSheet(updater: store.updater, activeSessionCount: store.activeSessionCount)
         }

@@ -146,6 +146,7 @@ Tests/               单元 + Maven 多模块真实集成测试（共 138 用例
 - **镜像链**：`xget.xi-xu.me → ghfast.top → gh-proxy.org → github.com`。第三方源只当传输通道，不当信任来源：每个源落地后都要过 SHA-256，不过就删掉换下一个源。最近一次成功的镜像会记住并提到队首，直连成功则清掉该偏好（避免网络变好后仍绕远路）
 - **主进程内校验（`UpdatePackageValidator`）**：SHA-256 → `ditto` 解包（不是 `unzip`，只有它保留权限与元数据）→ 结构自检（bundle id、可执行文件、版本号、**更新助手在位**）→ `codesign --verify --deep --strict` → TeamIdentifier → 按**语义**比对新旧 app 的 designated requirement（比文本会把合法更新判成身份变更，而这条 requirement 决定系统授权能否延续）→ `spctl --assess` → 递归清除隔离属性（漏掉它，重启后会被 App Translocation 搬到随机只读路径，每项系统授权都要重新点）
 - **进程外安装（`IdeaLightRunUpdater`）**：先把助手拷出 bundle 再执行（它所在的 bundle 即将被换掉）→ 等主进程退出 → 同卷原子替换并留备份 → 直接 exec `Contents/MacOS/IdeaLightRun` 重启（不走 `open`：LaunchServices 对刚替换路径的旧记录会「返回成功却不起进程」）→ 任一步失败则回滚旧版本，并且仍然把可用的 app 拉起来
+- **主进程怎么退**：移交后先收起更新面板，等面板真的没了再 `NSApp.terminate`。AppKit 在应用还挂着 sheet/alert 时会**静默**吞掉 terminate——连 `applicationShouldTerminate` 都不问，而 §66 停子进程的收尾就在那个回调里；助手只等主进程 60s，超时就不替换了。所以退出挂在面板的 `onDismiss` 上，并配 3s 兜底：`terminate` 一旦返回就自己收尾后强退，绝不允许停在「正在安装」的假象里
 
 ## 关键设计约束
 

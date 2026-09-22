@@ -38,6 +38,8 @@ final class SoftwareUpdater: ObservableObject {
     private let session: URLSession
     private let applicationURL: URL
     private var job: Task<Void, Never>?
+    /// 已移交更新助手、正等面板收起好退出。只用来保证退出请求只发一次。
+    private var pendingHandoffQuit = false
 
     init(
         currentVersion: String = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "",
@@ -115,10 +117,44 @@ final class SoftwareUpdater: ObservableObject {
             try Task.checkCancellation()
             try launchInstaller(for: package)
             UpdateLog.append("已移交更新助手：\(release.tagName)")
-            NSApp.terminate(nil)
+            quitAfterHandoff()
         } catch {
             recordFailure(error, stage: "安装")
         }
+    }
+
+    /// 移交完成之后必须让本进程真的消失：更新助手在等它，等满 60s 就放弃替换，
+    /// 而屏幕上会永远停在「正在安装」。
+    ///
+    /// 麻烦在于 AppKit 在应用还挂着模态面板时会**静默**吞掉 `NSApp.terminate`——
+    /// 连 `applicationShouldTerminate` 都不问，也就不会去停正在运行的服务。
+    /// 实测连「同一轮里先把 `isPresented` 置 false 再 terminate」都不够，
+    /// 面板是真的没了才放行，所以退出挂在面板的 onDismiss 上。
+    private func quitAfterHandoff() {
+        guard isPresented else {
+            AppDelegate.terminateForInstallation()
+            return
+        }
+        pendingHandoffQuit = true
+        isPresented = false
+        // onDismiss 万一不来（窗口被关掉、被别的模态挡住），也不能就一直等。
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3))
+            guard let self, self.pendingHandoffQuit else { return }
+            UpdateLog.append("更新面板未能在 3s 内收起，直接请求退出")
+            self.finishHandoffQuit()
+        }
+    }
+
+    /// 更新面板收起的回调（`RootView` 的 `onDismiss`）。
+    func updateSheetDidDismiss() {
+        guard pendingHandoffQuit else { return }
+        finishHandoffQuit()
+    }
+
+    private func finishHandoffQuit() {
+        pendingHandoffQuit = false
+        AppDelegate.terminateForInstallation()
     }
 
     private func recordFailure(_ error: Error, stage: String) {

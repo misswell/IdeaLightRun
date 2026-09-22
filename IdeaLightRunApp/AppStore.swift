@@ -69,6 +69,44 @@ final class AppStore: ObservableObject {
         sessions.values.filter { !$0.state.isTerminal }.count
     }
 
+    /// §66: 退出前把本应用拉起的所有子进程停干净（先 Stop，等不动就强杀）。
+    /// 只有 `applicationShouldTerminate` 一个调用方时它长在 delegate 里；
+    /// 在线更新的退出路径会被 AppKit 的模态规则挡掉，需要一个不依赖 delegate 的
+    /// 收尾入口，所以收在这里由两处共用。
+    func stopActiveWork() {
+        let active = sessions.values.filter { !$0.state.isTerminal }
+        for model in active {
+            model.buildHandle?.terminate()
+            model.session?.stop()
+        }
+        // 项目级构建（Build/Rebuild Project）的 Maven 子进程同样要停，否则退出后留下孤儿 mvn
+        let building = builds.values.filter { $0.phase.isBusy }
+        for model in building {
+            model.handle?.terminate()
+        }
+        // 这里阻塞了主线程，model.state 由 Task { @MainActor } 写入、永远不会更新；
+        // 必须轮询后台线程直接维护的 ManagedProcessSession / Process 状态。
+        func stillAlive(_ model: RunningProcessModel) -> Bool {
+            if let session = model.session { return !session.state.isTerminal }
+            return model.buildHandle?.hasLiveProcess ?? false
+        }
+        let deadline = Date().addingTimeInterval(2)
+        while Date() < deadline {
+            if !active.contains(where: stillAlive) && !building.contains(where: { $0.handle?.hasLiveProcess ?? false }) { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        for model in active {
+            if let session = model.session {
+                if !session.state.isTerminal { session.forceKill() }
+            } else {
+                model.buildHandle?.forceKill()
+            }
+        }
+        for model in building {
+            model.handle?.forceKill()
+        }
+    }
+
     /// 菜单命令的入口。`Commands.body` 在旧 SDK（CI 的 Xcode 15 / Swift 5.10）上不是
     /// `@MainActor`，闭包没法直接调主 actor 方法；显式走这里，两种工具链都成立。
     nonisolated static func fromMenu(_ action: @escaping @MainActor (AppStore) -> Void) {
