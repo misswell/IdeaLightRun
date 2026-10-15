@@ -69,6 +69,11 @@ final class AppStore: ObservableObject {
         sessions.values.filter { !$0.state.isTerminal }.count
     }
 
+    /// 进行中的项目级构建数：退出确认弹窗用。
+    var activeBuildCount: Int {
+        builds.values.filter { $0.phase.isBusy }.count
+    }
+
     /// §66: 退出前把本应用拉起的所有子进程停干净（先 Stop，等不动就强杀）。
     /// 只有 `applicationShouldTerminate` 一个调用方时它长在 delegate 里；
     /// 在线更新的退出路径会被 AppKit 的模态规则挡掉，需要一个不依赖 delegate 的
@@ -103,6 +108,17 @@ final class AppStore: ObservableObject {
             }
         }
         for model in building {
+            model.handle?.forceKill()
+        }
+    }
+
+    /// 「强制结束并退出」：跳过 SIGTERM 的宽限期，直接 SIGKILL 所有子进程。
+    func forceKillAllWork() {
+        for model in sessions.values where !model.state.isTerminal {
+            model.session?.forceKill()
+            model.buildHandle?.forceKill()
+        }
+        for model in builds.values where model.phase.isBusy {
             model.handle?.forceKill()
         }
     }

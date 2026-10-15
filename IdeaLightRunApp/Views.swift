@@ -4,6 +4,10 @@ import IdeaLightRunCore
 
 /// §66: 退出时默认 Stop services and quit。
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// 更新移交触发的退出：更新面板里已说明会停掉服务，`applicationShouldTerminate`
+    /// 不再弹退出确认，直接走 §66 收尾。
+    static var isTerminatingForInstallation = false
+
     /// 关掉最后一个窗口后进程仍然活着（窗口只是没了，App 没退），此时点 Dock 图标
     /// 默认只做「激活」，SwiftUI 不会重建窗口——看上去就是「点了没反应」。
     /// 这里补上：没有可见窗口时走 SwiftUI 自己注册的 New Window 菜单项，
@@ -31,8 +35,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        AppStore.shared.stopActiveWork()
-        return .terminateNow
+        if Self.isTerminatingForInstallation {
+            AppStore.shared.stopActiveWork()
+            return .terminateNow
+        }
+        let services = AppStore.shared.activeSessionCount
+        let builds = AppStore.shared.activeBuildCount
+        guard services > 0 || builds > 0 else {
+            return .terminateNow
+        }
+        return Self.confirmTerminate(services: services, builds: builds)
+    }
+
+    /// 有任务在跑时的退出确认。runModal 同步拿结果，不需要 terminateLater/reply 簿记。
+    /// 更新移交路径不进这里：面板里已说明会停服务，而且更新助手只等本进程 60s。
+    @MainActor
+    private static func confirmTerminate(services: Int, builds: Int) -> NSApplication.TerminateReply {
+        var subjects: [String] = []
+        if services > 0 { subjects.append("\(services) 个运行中的服务") }
+        if builds > 0 { subjects.append("\(builds) 个进行中的构建") }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "退出前还有任务未结束"
+        alert.informativeText = "当前有 \(subjects.joined(separator: "、"))，退出会一并结束这些子进程。"
+            + "「停止并退出」先正常终止（SIGTERM），最多等 2 秒再强制结束；「强制结束」立即杀掉，可能丢失未落盘的输出。"
+        alert.addButton(withTitle: "停止并退出")
+        alert.addButton(withTitle: "强制结束")
+        alert.addButton(withTitle: "取消")
+        alert.buttons[2].keyEquivalent = "\u{1b}"
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            AppStore.shared.stopActiveWork()
+            return .terminateNow
+        case .alertSecondButtonReturn:
+            AppStore.shared.forceKillAllWork()
+            return .terminateNow
+        default:
+            return .terminateCancel
+        }
     }
 
     /// 在线更新移交后的退出：走一次正常的 terminate，让 §66 的收尾照常在
@@ -41,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 超时就不替换了。所以 terminate 一旦返回，自己收尾后强制退——
     /// 不允许留下「助手在等、进程却活着」的僵死状态。
     @MainActor static func terminateForInstallation() {
+        isTerminatingForInstallation = true
         NSApp.terminate(nil)
         AppStore.shared.stopActiveWork()
         exit(0)
@@ -864,7 +905,86 @@ struct ConfigurationDetailView: View {
 
 // MARK: - 控制台（§38: NSTextView，不用 SwiftUI List 渲染日志）
 
-struct LogConsoleView: NSViewRepresentable {
+/// 控制台 = 过滤条（搜索 + 来源筛选）+ NSTextView。运行会话与项目构建共用。
+struct LogConsoleView: View {
+    @ObservedObject var model: LogViewModel
+    @State private var searchDraft = ""
+    @State private var searchCommitTask: Task<Void, Never>?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            filterBar
+                .padding(.horizontal, 16)
+                .padding(.vertical, 6)
+            Divider()
+            LogTextView(model: model)
+        }
+        .onAppear { searchDraft = model.displayFilter.searchText }
+        .onChange(of: searchDraft) { newValue in
+            // 每敲一个字就全量重渲染一次太重（缓冲上限 2 万行），稍微攒一下再提交
+            searchCommitTask?.cancel()
+            searchCommitTask = Task {
+                try? await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled else { return }
+                model.displayFilter.searchText = newValue
+            }
+        }
+    }
+
+    private var filterBar: some View {
+        HStack(spacing: 10) {
+            searchField
+            Picker("筛选", selection: $model.displayFilter.stream) {
+                ForEach(ConsoleStreamFilter.allCases, id: \.self) { option in
+                    Text(option.title).tag(option)
+                }
+            }
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+            .frame(width: 190)
+            .help("按日志来源筛选")
+            if model.displayFilter.isActive {
+                Text("\(model.visibleLineCount) / \(model.lines.count) 行")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
+            Spacer()
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "magnifyingglass")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("搜索日志", text: $searchDraft)
+                .textFieldStyle(.plain)
+                .font(.callout)
+            if !searchDraft.isEmpty {
+                Button {
+                    searchCommitTask?.cancel()
+                    searchDraft = ""
+                    model.displayFilter.searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("清除搜索")
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
+        .frame(maxWidth: 240)
+        .help("按内容过滤（忽略大小写）")
+    }
+}
+
+private struct LogTextView: NSViewRepresentable {
     @ObservedObject var model: LogViewModel
 
     func makeCoordinator() -> Coordinator {
@@ -892,14 +1012,27 @@ struct LogConsoleView: NSViewRepresentable {
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
         let coordinator = context.coordinator
+        let filter = model.displayFilter
 
-        if coordinator.generation != model.clearGeneration {
+        // 清空或过滤条件变化：从当前缓冲按过滤全量重渲染
+        if coordinator.generation != model.clearGeneration || coordinator.filter != filter {
             coordinator.generation = model.clearGeneration
-            coordinator.nextAbsolute = 0
-            textView.textStorage?.setAttributedString(NSAttributedString(string: ""))
+            coordinator.filter = filter
+            coordinator.nextAbsolute = model.firstLineIndex + model.lines.count
+            let attributed = NSMutableAttributedString()
+            for line in model.lines where filter.matches(line) {
+                attributed.append(Self.attributed(line))
+            }
+            textView.textStorage?.setAttributedString(attributed)
+            textView.needsDisplay = true
+            if coordinator.follow {
+                textView.scrollToEndOfDocument(nil)
+            }
+            return
         }
 
-        // 增量渲染：用绝对行号对齐（model.lines 有环形截断，firstLineIndex 会前移）
+        // 增量渲染：用绝对行号对齐（model.lines 有环形截断，firstLineIndex 会前移）。
+        // 不匹配过滤的行只跳过渲染，绝对行号照常推进；过滤条件一变就走上面的全量重渲染。
         let firstAbsolute = model.firstLineIndex
         var startOffset = coordinator.nextAbsolute - firstAbsolute
         if startOffset < 0 {
@@ -912,7 +1045,7 @@ struct LogConsoleView: NSViewRepresentable {
             coordinator.nextAbsolute = firstAbsolute + model.lines.count
 
             let attributed = NSMutableAttributedString()
-            for line in newLines {
+            for line in newLines where filter.matches(line) {
                 attributed.append(Self.attributed(line))
             }
             if let storage = textView.textStorage {
@@ -953,5 +1086,6 @@ struct LogConsoleView: NSViewRepresentable {
         var nextAbsolute = 0
         var generation = 0
         var follow = true
+        var filter = ConsoleFilter()
     }
 }
