@@ -22,18 +22,19 @@ enum ConsoleStreamFilter: String, CaseIterable, Hashable {
     }
 }
 
-/// 控制台的显示过滤：内容关键字（忽略大小写）+ 来源档位。
-/// 只影响显示，不改变 LogRingBuffer / LogViewModel 的保留上限（§37）。
+/// 控制台的行筛选：内容关键字（忽略大小写）+ 来源档位。
+/// 未命中的行从显示里过滤掉；只影响显示，不改变
+/// LogRingBuffer / LogViewModel 的保留上限（§37）。
 struct ConsoleFilter: Equatable {
-    var searchText: String = ""
+    var filterText: String = ""
     var stream: ConsoleStreamFilter = .all
 
-    var isActive: Bool { !searchText.isEmpty || stream != .all }
+    var isActive: Bool { !filterText.isEmpty || stream != .all }
 
     func matches(_ line: LogLine) -> Bool {
         if let source = stream.source, line.stream != source { return false }
-        if !searchText.isEmpty,
-           line.text.range(of: searchText, options: [.caseInsensitive, .diacriticInsensitive]) == nil {
+        if !filterText.isEmpty,
+           line.text.range(of: filterText, options: [.caseInsensitive, .diacriticInsensitive]) == nil {
             return false
         }
         return true
@@ -49,14 +50,18 @@ class LogViewModel: ObservableObject {
 
     @Published private(set) var lines: [LogLine] = []
     @Published private(set) var clearGeneration = 0
-    /// 显示过滤。放在模型而不是视图本地 @State：切换信息/控制台页签会销毁视图，
-    /// 回来时过滤器应当保持原样。
+    /// 行筛选（漏斗）。放在模型而不是视图本地 @State：切换信息/控制台页签会销毁视图，
+    /// 回来时条件应当保持原样。
     @Published var displayFilter = ConsoleFilter()
+    /// 搜索关键词：只做高亮与上一个/下一个定位，不参与行筛选。
+    @Published var searchText = ""
+    /// 当前命中的匹配序号（0 基），▲▼ 在匹配之间跳转。
+    @Published var searchCurrentIndex = 0
 
     /// lines[0] 对应的绝对行号（配合环形截断，供控制台增量渲染）。
     private(set) var firstLineIndex = 0
 
-    /// 当前过滤下的可见行数（过滤条上的「M / N 行」）。
+    /// 当前筛选下的可见行数（筛选条上的「M / N 行」）。
     var visibleLineCount: Int {
         guard displayFilter.isActive else { return lines.count }
         return lines.filter { displayFilter.matches($0) }.count

@@ -912,11 +912,20 @@ struct ConfigurationDetailView: View {
 
 // MARK: - 控制台（§38: NSTextView，不用 SwiftUI List 渲染日志）
 
-/// 控制台 = 过滤条（搜索 + 来源筛选）+ NSTextView。运行会话与项目构建共用。
+/// 控制台 = 查找条（搜索高亮 + 行筛选）+ NSTextView。运行会话与项目构建共用。
+/// 搜索与筛选语义不同：搜索只高亮、可在匹配间跳转，不改显示的行；
+/// 筛选把未命中的行从显示里过滤掉。
 struct LogConsoleView: View {
     @ObservedObject var model: LogViewModel
     @State private var searchDraft = ""
+    @State private var filterDraft = ""
     @State private var searchCommitTask: Task<Void, Never>?
+    @State private var filterCommitTask: Task<Void, Never>?
+
+    /// 匹配总次数：按缓冲里的行统计；高亮与跳转在 NSTextView 侧按已渲染内容算。
+    private var searchMatchCount: Int {
+        LogTextView.matchCount(of: model.searchText, in: model.lines)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -926,14 +935,32 @@ struct LogConsoleView: View {
             Divider()
             LogTextView(model: model)
         }
-        .onAppear { searchDraft = model.displayFilter.searchText }
+        .onAppear {
+            searchDraft = model.searchText
+            filterDraft = model.displayFilter.filterText
+        }
         .onChange(of: searchDraft) { newValue in
-            // 每敲一个字就全量重渲染一次太重（缓冲上限 2 万行），稍微攒一下再提交
+            // 每敲一个字就全量重扫一遍太重（缓冲上限 2 万行），稍微攒一下再提交
             searchCommitTask?.cancel()
             searchCommitTask = Task {
                 try? await Task.sleep(for: .milliseconds(200))
                 guard !Task.isCancelled else { return }
-                model.displayFilter.searchText = newValue
+                model.searchCurrentIndex = 0
+                model.searchText = newValue
+            }
+        }
+        .onChange(of: filterDraft) { newValue in
+            filterCommitTask?.cancel()
+            filterCommitTask = Task {
+                try? await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled else { return }
+                model.displayFilter.filterText = newValue
+            }
+        }
+        .onChange(of: searchMatchCount) { newCount in
+            // 匹配数变少后索引可能越界
+            if model.searchCurrentIndex >= max(newCount, 1) {
+                model.searchCurrentIndex = max(newCount - 1, 0)
             }
         }
     }
@@ -941,15 +968,9 @@ struct LogConsoleView: View {
     private var filterBar: some View {
         HStack(spacing: 10) {
             searchField
-            Picker("筛选", selection: $model.displayFilter.stream) {
-                ForEach(ConsoleStreamFilter.allCases, id: \.self) { option in
-                    Text(option.title).tag(option)
-                }
-            }
-            .pickerStyle(.segmented)
-            .controlSize(.small)
-            .frame(width: 190)
-            .help("按日志来源筛选")
+            navigationControls
+            filterField
+            streamPicker
             if model.displayFilter.isActive {
                 Text("\(model.visibleLineCount) / \(model.lines.count) 行")
                     .font(.caption)
@@ -958,6 +979,7 @@ struct LogConsoleView: View {
             }
             Spacer()
         }
+        .controlSize(.small)
     }
 
     private var searchField: some View {
@@ -965,14 +987,15 @@ struct LogConsoleView: View {
             Image(systemName: "magnifyingglass")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            TextField("搜索日志", text: $searchDraft)
+            TextField("搜索（只高亮）", text: $searchDraft)
                 .textFieldStyle(.plain)
                 .font(.callout)
             if !searchDraft.isEmpty {
                 Button {
                     searchCommitTask?.cancel()
                     searchDraft = ""
-                    model.displayFilter.searchText = ""
+                    model.searchCurrentIndex = 0
+                    model.searchText = ""
                 } label: {
                     Image(systemName: "xmark.circle.fill")
                         .font(.caption)
@@ -986,8 +1009,85 @@ struct LogConsoleView: View {
         .padding(.vertical, 3)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor)))
         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
-        .frame(maxWidth: 240)
-        .help("按内容过滤（忽略大小写）")
+        .frame(minWidth: 100, maxWidth: 170)
+        .help("高亮匹配内容，不改变显示的行")
+    }
+
+    @ViewBuilder
+    private var navigationControls: some View {
+        let count = searchMatchCount
+        HStack(spacing: 2) {
+            Button {
+                stepMatch(-1)
+            } label: {
+                Image(systemName: "chevron.up")
+            }
+            .buttonStyle(.borderless)
+            .disabled(count == 0)
+            .help("上一个匹配")
+            Button {
+                stepMatch(1)
+            } label: {
+                Image(systemName: "chevron.down")
+            }
+            .buttonStyle(.borderless)
+            .disabled(count == 0)
+            .help("下一个匹配")
+        }
+        if !model.searchText.isEmpty {
+            Text(count == 0 ? "0/0" : "\(model.searchCurrentIndex + 1)/\(count)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .help(count == 0 ? "无匹配" : "当前匹配 / 匹配总数")
+        }
+    }
+
+    private func stepMatch(_ delta: Int) {
+        let count = searchMatchCount
+        guard count > 0 else { return }
+        model.searchCurrentIndex = (model.searchCurrentIndex + delta + count) % count
+    }
+
+    private var filterField: some View {
+        HStack(spacing: 4) {
+            Image(systemName: "line.3.horizontal.decrease")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextField("筛选：过滤掉未匹配的行", text: $filterDraft)
+                .textFieldStyle(.plain)
+                .font(.callout)
+            if !filterDraft.isEmpty {
+                Button {
+                    filterCommitTask?.cancel()
+                    filterDraft = ""
+                    model.displayFilter.filterText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("清除筛选")
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor)))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
+        .frame(minWidth: 90, maxWidth: 160)
+        .help("只显示包含关键词的行（可与来源筛选叠加）")
+    }
+
+    private var streamPicker: some View {
+        Picker("筛选", selection: $model.displayFilter.stream) {
+            ForEach(ConsoleStreamFilter.allCases, id: \.self) { option in
+                Text(option.title).tag(option)
+            }
+        }
+        .pickerStyle(.segmented)
+        .controlSize(.small)
+        .frame(width: 170)
+        .help("按日志来源筛选")
     }
 }
 
@@ -1017,12 +1117,14 @@ private struct LogTextView: NSViewRepresentable {
     }
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        guard let textView = scrollView.documentView as? NSTextView else { return }
+        guard let textView = scrollView.documentView as? NSTextView,
+              let storage = textView.textStorage else { return }
         let coordinator = context.coordinator
         let filter = model.displayFilter
+        let searchChanged = coordinator.appliedSearchText != model.searchText
 
-        // 清空或过滤条件变化：从当前缓冲按过滤全量重渲染
         if coordinator.generation != model.clearGeneration || coordinator.filter != filter {
+            // 清空或筛选条件变化：从当前缓冲按筛选全量重渲染
             coordinator.generation = model.clearGeneration
             coordinator.filter = filter
             coordinator.nextAbsolute = model.firstLineIndex + model.lines.count
@@ -1030,43 +1132,60 @@ private struct LogTextView: NSViewRepresentable {
             for line in model.lines where filter.matches(line) {
                 attributed.append(Self.attributed(line))
             }
-            textView.textStorage?.setAttributedString(attributed)
+            storage.setAttributedString(attributed)
+            // 渲染内容整个换掉了，搜索高亮从头重扫
+            coordinator.searchRanges = []
+            coordinator.scannedLength = 0
+            coordinator.appliedCurrentIndex = -1
+            coordinator.needsHighlightScan = true
             textView.needsDisplay = true
             if coordinator.follow {
                 textView.scrollToEndOfDocument(nil)
             }
-            return
-        }
-
-        // 增量渲染：用绝对行号对齐（model.lines 有环形截断，firstLineIndex 会前移）。
-        // 不匹配过滤的行只跳过渲染，绝对行号照常推进；过滤条件一变就走上面的全量重渲染。
-        let firstAbsolute = model.firstLineIndex
-        var startOffset = coordinator.nextAbsolute - firstAbsolute
-        if startOffset < 0 {
-            // 早期行已被截断丢弃，跳过
-            coordinator.nextAbsolute = firstAbsolute
-            startOffset = 0
-        }
-        if startOffset < model.lines.count {
-            let newLines = model.lines[startOffset...]
-            coordinator.nextAbsolute = firstAbsolute + model.lines.count
-
-            let attributed = NSMutableAttributedString()
-            for line in newLines where filter.matches(line) {
-                attributed.append(Self.attributed(line))
+        } else {
+            // 增量渲染：用绝对行号对齐（model.lines 有环形截断，firstLineIndex 会前移）。
+            // 不匹配筛选的行只跳过渲染，绝对行号照常推进；筛选条件一变就走上面的全量重渲染。
+            let firstAbsolute = model.firstLineIndex
+            var startOffset = coordinator.nextAbsolute - firstAbsolute
+            if startOffset < 0 {
+                // 早期行已被截断丢弃，跳过
+                coordinator.nextAbsolute = firstAbsolute
+                startOffset = 0
             }
-            if let storage = textView.textStorage {
-                storage.append(attributed)
-                // TextStorage 自身也设上限，防止无限膨胀
-                let maxCharacters = 2_000_000
-                if storage.length > maxCharacters {
-                    storage.deleteCharacters(in: NSRange(location: 0, length: storage.length - maxCharacters))
+            if startOffset < model.lines.count {
+                let newLines = model.lines[startOffset...]
+                coordinator.nextAbsolute = firstAbsolute + model.lines.count
+
+                let attributed = NSMutableAttributedString()
+                for line in newLines where filter.matches(line) {
+                    attributed.append(Self.attributed(line))
+                }
+                if attributed.length > 0 {
+                    storage.append(attributed)
+                    // TextStorage 自身也设上限，防止无限膨胀
+                    let maxCharacters = 2_000_000
+                    if storage.length > maxCharacters {
+                        let deleted = storage.length - maxCharacters
+                        storage.deleteCharacters(in: NSRange(location: 0, length: deleted))
+                        coordinator.shiftRangesAfterDeletion(deleted)
+                    }
+                    coordinator.needsHighlightScan = true
+                    textView.needsDisplay = true
+                    if coordinator.follow {
+                        textView.scrollToEndOfDocument(nil)
+                    }
                 }
             }
-            textView.needsDisplay = true
-            if coordinator.follow {
-                textView.scrollToEndOfDocument(nil)
-            }
+        }
+
+        // —— 搜索：只高亮 + 上一个/下一个，不动显示的行 ——
+        if searchChanged {
+            coordinator.recomputeAllHighlights(storage, needle: model.searchText, currentIndex: model.searchCurrentIndex)
+        } else if coordinator.needsHighlightScan {
+            coordinator.scanNewRanges(storage, currentIndex: model.searchCurrentIndex)
+        }
+        if coordinator.appliedCurrentIndex != model.searchCurrentIndex {
+            coordinator.applyCurrentIndex(storage, index: model.searchCurrentIndex, textView: textView)
         }
     }
 
@@ -1089,10 +1208,119 @@ private struct LogTextView: NSViewRepresentable {
         )
     }
 
+    // MARK: 搜索匹配
+
+    /// 统计关键词在所有缓冲行里的出现次数（忽略大小写）。
+    static func matchCount(of needle: String, in lines: [LogLine]) -> Int {
+        guard !needle.isEmpty else { return 0 }
+        var total = 0
+        for line in lines {
+            total += occurrenceRanges(of: needle, in: line.text as NSString).count
+        }
+        return total
+    }
+
+    /// 关键词在指定区间内的全部出现位置（忽略大小写、互不重叠、按出现顺序）。
+    static func occurrenceRanges(of needle: String, in haystack: NSString, range limit: NSRange? = nil) -> [NSRange] {
+        guard !needle.isEmpty else { return [] }
+        let domain = limit ?? NSRange(location: 0, length: haystack.length)
+        var ranges: [NSRange] = []
+        var location = domain.location
+        let end = domain.location + domain.length
+        while location < end {
+            let found = haystack.range(
+                of: needle,
+                options: [.caseInsensitive],
+                range: NSRange(location: location, length: end - location)
+            )
+            guard found.location != NSNotFound, found.length > 0 else { break }
+            ranges.append(found)
+            location = found.location + found.length
+        }
+        return ranges
+    }
+
     final class Coordinator {
         var nextAbsolute = 0
         var generation = 0
         var follow = true
         var filter = ConsoleFilter()
+
+        // 搜索高亮状态：只作用于 NSTextView 已渲染的内容
+        var searchRanges: [NSRange] = []
+        var scannedLength = 0
+        var appliedSearchText = ""
+        var appliedCurrentIndex = -1
+        var needsHighlightScan = false
+
+        static let normalHighlight = NSColor.systemYellow.withAlphaComponent(0.4)
+        static let currentHighlight = NSColor.systemOrange.withAlphaComponent(0.8)
+
+        /// 搜索词变化：清掉全部旧高亮，从头重扫（输入有 200ms 防抖，可承受）。
+        func recomputeAllHighlights(_ storage: NSTextStorage, needle: String, currentIndex: Int) {
+            searchRanges = []
+            scannedLength = 0
+            appliedCurrentIndex = -1
+            needsHighlightScan = false
+            if storage.length > 0 {
+                storage.beginEditing()
+                storage.removeAttribute(.backgroundColor, range: NSRange(location: 0, length: storage.length))
+                storage.endEditing()
+            }
+            appliedSearchText = needle
+            guard !needle.isEmpty else { return }
+            scanNewRanges(storage, currentIndex: currentIndex)
+        }
+
+        /// 增量：只扫 [scannedLength, length) 的新增区域，把新命中追加到 searchRanges。
+        func scanNewRanges(_ storage: NSTextStorage, currentIndex: Int) {
+            let total = storage.length
+            guard total > scannedLength else { return }
+            let domain = NSRange(location: scannedLength, length: total - scannedLength)
+            scannedLength = total
+            guard !appliedSearchText.isEmpty else { return }
+            let newRanges = LogTextView.occurrenceRanges(of: appliedSearchText, in: storage.string as NSString, range: domain)
+            guard !newRanges.isEmpty else { return }
+            let normal = Self.normalHighlight
+            let current = Self.currentHighlight
+            storage.beginEditing()
+            for (offset, range) in newRanges.enumerated() {
+                let index = searchRanges.count + offset
+                storage.addAttribute(.backgroundColor, value: index == currentIndex ? current : normal, range: range)
+            }
+            storage.endEditing()
+            searchRanges.append(contentsOf: newRanges)
+            if currentIndex < searchRanges.count {
+                appliedCurrentIndex = currentIndex
+            }
+        }
+
+        /// 当前匹配切换：把旧「当前」染回普通色、新「当前」染色并滚动到它。
+        func applyCurrentIndex(_ storage: NSTextStorage, index: Int, textView: NSTextView) {
+            storage.beginEditing()
+            if searchRanges.indices.contains(appliedCurrentIndex) {
+                storage.addAttribute(.backgroundColor, value: Self.normalHighlight, range: searchRanges[appliedCurrentIndex])
+            }
+            if searchRanges.indices.contains(index) {
+                let range = searchRanges[index]
+                storage.addAttribute(.backgroundColor, value: Self.currentHighlight, range: range)
+                textView.scrollRangeToVisible(range)
+            }
+            storage.endEditing()
+            appliedCurrentIndex = index
+        }
+
+        /// 环形截断删掉头部字符后，所有命中位置整体前移。
+        func shiftRangesAfterDeletion(_ deleted: Int) {
+            guard !searchRanges.isEmpty else { return }
+            searchRanges = searchRanges.compactMap { range in
+                let end = range.location + range.length
+                guard end > deleted else { return nil }
+                let newLocation = max(range.location - deleted, 0)
+                let newLength = end - deleted - newLocation
+                return newLength > 0 ? NSRange(location: newLocation, length: newLength) : nil
+            }
+            appliedCurrentIndex = -1
+        }
     }
 }
