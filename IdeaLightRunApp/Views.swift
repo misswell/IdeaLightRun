@@ -921,6 +921,8 @@ struct LogConsoleView: View {
     @State private var filterDraft = ""
     @State private var searchCommitTask: Task<Void, Never>?
     @State private var filterCommitTask: Task<Void, Never>?
+    /// 自动换行偏好：全局共享并跨启动记忆，默认不换行（长行横向滚动查看）。
+    @AppStorage("consoleWrapText") private var wrapText = false
 
     /// 匹配总次数：按缓冲里的行统计；高亮与跳转在 NSTextView 侧按已渲染内容算。
     private var searchMatchCount: Int {
@@ -933,7 +935,7 @@ struct LogConsoleView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 6)
             Divider()
-            LogTextView(model: model)
+            LogTextView(model: model, wrapText: wrapText)
         }
         .onAppear {
             searchDraft = model.searchText
@@ -971,6 +973,9 @@ struct LogConsoleView: View {
             navigationControls
             filterField
             streamPicker
+            Toggle("换行", isOn: $wrapText)
+                .toggleStyle(.checkbox)
+                .help("开启后长行自动折行；默认关闭，长行横向滚动查看")
             if model.displayFilter.isActive {
                 Text("\(model.visibleLineCount) / \(model.lines.count) 行")
                     .font(.caption)
@@ -1093,6 +1098,7 @@ struct LogConsoleView: View {
 
 private struct LogTextView: NSViewRepresentable {
     @ObservedObject var model: LogViewModel
+    var wrapText: Bool
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -1113,6 +1119,8 @@ private struct LogTextView: NSViewRepresentable {
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
         scrollView.autohidesScrollers = true
+        context.coordinator.wrap = wrapText
+        Self.configureWrap(wrapText, textView: textView, scrollView: scrollView)
         return scrollView
     }
 
@@ -1120,6 +1128,10 @@ private struct LogTextView: NSViewRepresentable {
         guard let textView = scrollView.documentView as? NSTextView,
               let storage = textView.textStorage else { return }
         let coordinator = context.coordinator
+        if coordinator.wrap != wrapText {
+            coordinator.wrap = wrapText
+            Self.configureWrap(wrapText, textView: textView, scrollView: scrollView)
+        }
         let filter = model.displayFilter
         let searchChanged = coordinator.appliedSearchText != model.searchText
 
@@ -1140,7 +1152,15 @@ private struct LogTextView: NSViewRepresentable {
             coordinator.needsHighlightScan = true
             textView.needsDisplay = true
             if coordinator.follow {
+                let previousOrigin = scrollView.contentView.bounds.origin
                 textView.scrollToEndOfDocument(nil)
+                if !wrapText {
+                    // 纵向跟到底；不换行时横向留在原地，不跳到最长行的末尾
+                    scrollView.contentView.scroll(
+                        to: NSPoint(x: previousOrigin.x, y: scrollView.contentView.bounds.origin.y)
+                    )
+                    scrollView.reflectScrolledClipView(scrollView.contentView)
+                }
             }
         } else {
             // 增量渲染：用绝对行号对齐（model.lines 有环形截断，firstLineIndex 会前移）。
@@ -1172,7 +1192,15 @@ private struct LogTextView: NSViewRepresentable {
                     coordinator.needsHighlightScan = true
                     textView.needsDisplay = true
                     if coordinator.follow {
+                        let previousOrigin = scrollView.contentView.bounds.origin
                         textView.scrollToEndOfDocument(nil)
+                        if !wrapText {
+                            // 纵向跟到底；不换行时横向留在原地，不跳到最长行的末尾
+                            scrollView.contentView.scroll(
+                                to: NSPoint(x: previousOrigin.x, y: scrollView.contentView.bounds.origin.y)
+                            )
+                            scrollView.reflectScrolledClipView(scrollView.contentView)
+                        }
                     }
                 }
             }
@@ -1187,6 +1215,31 @@ private struct LogTextView: NSViewRepresentable {
         if coordinator.appliedCurrentIndex != model.searchCurrentIndex {
             coordinator.applyCurrentIndex(storage, index: model.searchCurrentIndex, textView: textView)
         }
+    }
+
+    /// 自动换行开关：换行时文本视图宽度跟随容器；不换行时容器宽度无限、
+    /// 文本视图随内容横向生长，靠水平滚动条查看长行。
+    private static func configureWrap(_ wrap: Bool, textView: NSTextView, scrollView: NSScrollView) {
+        scrollView.hasHorizontalScroller = !wrap
+        if wrap {
+            textView.isHorizontallyResizable = false
+            textView.autoresizingMask = [.width]
+            textView.textContainer?.widthTracksTextView = true
+            // 把不换行时已经撑开的宽度收回来
+            if scrollView.contentSize.width > 0 {
+                textView.frame.size.width = scrollView.contentSize.width
+            }
+        } else {
+            textView.isHorizontallyResizable = true
+            textView.autoresizingMask = []
+            textView.textContainer?.widthTracksTextView = false
+            textView.textContainer?.containerSize = NSSize(
+                width: CGFloat.greatestFiniteMagnitude,
+                height: CGFloat.greatestFiniteMagnitude
+            )
+            textView.sizeToFit()
+        }
+        textView.layoutManager?.ensureLayout(for: textView.textContainer!)
     }
 
     private static func attributed(_ line: LogLine) -> NSAttributedString {
@@ -1245,6 +1298,7 @@ private struct LogTextView: NSViewRepresentable {
         var generation = 0
         var follow = true
         var filter = ConsoleFilter()
+        var wrap = false
 
         // 搜索高亮状态：只作用于 NSTextView 已渲染的内容
         var searchRanges: [NSRange] = []
