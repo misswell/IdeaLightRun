@@ -818,6 +818,13 @@ struct ConfigurationDetailView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            if !model.listeningPorts.isEmpty {
+                Text("端口 \(model.listeningPorts.map(String.init).joined(separator: "、"))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .help("本机 lsof 探测到的 LISTEN TCP 端口")
+            }
             Spacer()
             Button("清空日志") {
                 model.clearLogs()

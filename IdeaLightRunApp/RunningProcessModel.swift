@@ -13,6 +13,8 @@ final class RunningProcessModel: LogViewModel, Identifiable {
 
     @Published private(set) var state: ProcessState = .preparing
     @Published private(set) var pid: Int32?
+    /// 进程正在 LISTEN 的 TCP 端口（本机 lsof 探测，仅进程存活期间轮询）。
+    @Published private(set) var listeningPorts: [Int] = []
 
     /// 构建期（classpath 解析/编译）进程句柄，Stop 用它终止 Maven。
     var buildHandle: ProcessHandle?
@@ -20,6 +22,7 @@ final class RunningProcessModel: LogViewModel, Identifiable {
     var pendingRestart = false
     var onRestartNeeded: (() -> Void)?
     private(set) var session: ManagedProcessSession?
+    private var portPollTask: Task<Void, Never>?
 
     /// 状态/PID 变更通知。本模型是 AppStore 里的嵌套 ObservableObject，SwiftUI 不会自动
     /// 观察它；不显式冒泡到 AppStore.objectWillChange，列表行状态、顶栏按钮和运行横幅会
@@ -65,6 +68,7 @@ final class RunningProcessModel: LogViewModel, Identifiable {
     func attach(session: ManagedProcessSession) {
         self.session = session
         setPID(session.pid)
+        startPortPolling()
         session.onLogLines = { [weak self] batch in
             Task { @MainActor [weak self] in
                 self?.appendLog(batch)
@@ -77,6 +81,7 @@ final class RunningProcessModel: LogViewModel, Identifiable {
                 switch newState {
                 case .exited(let code):
                     self.setPID(nil)
+                    self.listeningPorts = []
                     self.appendLog(LogLine(stream: .system, text: "[IdeaLightRun] 进程退出，退出码 \(code)"))
                     if self.pendingRestart {
                         self.pendingRestart = false
@@ -85,9 +90,37 @@ final class RunningProcessModel: LogViewModel, Identifiable {
                 case .failed:
                     // 失败原因由 ManagedProcessSession 写入 logBuffer 后随批次送达，此处不重复。
                     self.setPID(nil)
+                    self.listeningPorts = []
                 default:
                     break
                 }
+            }
+        }
+    }
+
+    /// 探测「启动了哪些端口」：Spring Boot 之类要几秒才 bind，轮询到进程终态为止。
+    /// 只读本机 lsof（§64 不涉网），端口集合变化时发布并在控制台补一条系统消息。
+    private func startPortPolling() {
+        portPollTask?.cancel()
+        portPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                if self.state.isTerminal { return }
+                if let pid = self.pid {
+                    let ports = await Task.detached(priority: .utility) {
+                        ListeningPortScanner.listeningPorts(pid: pid)
+                    }.value
+                    guard !Task.isCancelled, !self.state.isTerminal else { return }
+                    if ports != self.listeningPorts {
+                        self.listeningPorts = ports
+                        self.onChange?()
+                        if !ports.isEmpty {
+                            let text = ports.map(String.init).joined(separator: "、")
+                            self.appendLog(LogLine(stream: .system, text: "[IdeaLightRun] 正在监听端口: \(text)"))
+                        }
+                    }
+                }
+                try? await Task.sleep(for: .seconds(3))
             }
         }
     }
