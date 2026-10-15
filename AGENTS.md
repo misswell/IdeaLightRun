@@ -1,5 +1,11 @@
 # IdeaLightRun 项目规则
 
+## 项目概览
+
+- macOS 启动器：读取 IntelliJ IDEA 的 Run Configuration，不打开 IDEA 就能编译并启动 Java / Spring Boot 项目。SwiftPM 多 target，macOS 13+，纯 Swift + SwiftUI。
+- `README.md` 是权威文档（使用手册、工程结构、在线更新实现要点、关键设计约束都在其中）；文中 § 编号指向项目需求文档，需求文档不在仓库里。
+- target 分层（见 Package.swift）：`IdeaLightRunCore`（GUI 与 CLI 共用的解析/编译/启动流水线，禁止另起一套启动逻辑）、`IdeaLightRunUpdate`（App 与更新助手共用的更新内核）、`IdeaLightRunApp`（SwiftUI GUI）、`IdeaLightRunCLI`（开发期验证：scan/run/build/clean）、`IdeaLightRunUpdater`（进程外安装助手）。
+
 ## 发布偏好
 
 - 每次改动完成并验证通过后：提交并推送 GitHub、创建新的 patch 版本 tag、创建 GitHub Release，回复 commit 与 Release 链接。
@@ -36,6 +42,27 @@
 - 其余 CI secrets：`APPLE_CERTIFICATE_P12`、`APPLE_CERTIFICATE_PASSWORD`、
   `APPLE_DEVELOPER_ID`、`APPLE_TEAM_ID`。凭据值只存在本机钥匙串和 GitHub Secrets 里，
   不写入仓库、日志或聊天。
+
+## 构建与测试
+
+- `swift build` 是唯一覆盖 GUI target 的全量编译；`swift test` 本地全量跑，CI 用
+  `swift test --skip MavenClasspathIntegrationTests`。
+- CLI 冒烟验证：`swift run IdeaLightRunCLI scan|run|build|clean <项目路径>`。
+- 本机打包 `./scripts/build-app.sh release`（版本号默认取最近 git tag，`IDEALIGHTRUN_VERSION`
+  可覆盖，写入 Info.plist 的两个版本键）；正式包只能走 `./scripts/distribute-app.sh`。
+
+## 硬性设计约束
+
+- 进程一律用 `Process.arguments` 数组传参，绝不走 `/bin/sh -c`（§27）。
+- XML 宽松解析：未知字段进 `rawOptions` 不丢弃，未知类型标 `UNSUPPORTED`（§78）；
+  `$Prompt$` 等上下文宏不伪造值，只产生 warning（§11）。
+- Maven 固定 `-B -nsu`（用项目 `mvnw` 时不加 `-B`）；reactor 依赖解析到 `target/classes`
+  而非 SNAPSHOT jar（§92/§93）。
+- AppKit 陷阱：应用挂着 sheet/alert 时 `NSApp.terminate` 会被静默吞掉（连
+  `applicationShouldTerminate` 都不问）。更新移交后的退出挂在更新面板 `onDismiss` 上并配
+  3s 兜底强退，动更新 UI 时别破坏这条链，否则更新会永远停在「正在安装」。
+- 签名顺序：`build-app.sh` 先签嵌套的更新助手再签外层 bundle；反着做，外层封存记录的
+  哈希对不上，助手在替换时会被判签名无效。
 
 ## 推送与测试注意
 
