@@ -26,6 +26,10 @@ final class AppStore: ObservableObject {
     @Published var selectedProjectID: String?
     @Published var selectedConfigurationKey: String?
     @Published var alertMessage: String?
+    /// 待确认移除的项目。移除会停掉该项目正在跑的服务，属于不可逆操作：
+    /// 顶栏垃圾桶与侧栏右键菜单都先置这里，由 RootView 统一弹确认，
+    /// 不在各视图各写一份（避免两条入口行为不一致）。
+    @Published var projectPendingRemoval: ProjectEntry?
     /// configKey → 运行会话（含构建阶段）
     @Published private(set) var sessions: [String: RunningProcessModel] = [:]
     /// projectID → 最近一次项目级构建（IDEA 的 Build / Rebuild Project）

@@ -126,6 +126,18 @@ struct BuildCommands: Commands {
 
 struct RootView: View {
     @ObservedObject private var store = AppStore.shared
+    /// 移除确认的说明文字：有服务在跑时必须讲清会被一并停掉，
+    /// 否则用户以为只是从列表里删掉一行。
+    private var removalMessage: String {
+        guard let project = store.projectPendingRemoval else { return "" }
+        let running = store.sessions.values.filter { $0.projectPath == project.id && !$0.state.isTerminal }
+        var text = "把「\(project.name)」从列表移除？\n\n这只会移除本应用里的项目记录，不会删除磁盘上的项目文件。"
+        if !running.isEmpty {
+            text += "\n\n该项目有 \(running.count) 个服务正在运行，移除会一并停止它们。"
+        }
+        return text
+    }
+
     @State private var showImporter = false
 
     var body: some View {
@@ -159,6 +171,23 @@ struct RootView: View {
             Button("好", role: .cancel) {}
         } message: {
             Text(store.alertMessage ?? "")
+        }
+        .alert(
+            "移除项目",
+            isPresented: Binding(
+                get: { store.projectPendingRemoval != nil },
+                set: { if !$0 { store.projectPendingRemoval = nil } }
+            )
+        ) {
+            Button("移除", role: .destructive) {
+                if let project = store.projectPendingRemoval {
+                    store.removeProject(id: project.id)
+                }
+                store.projectPendingRemoval = nil
+            }
+            Button("取消", role: .cancel) { store.projectPendingRemoval = nil }
+        } message: {
+            Text(removalMessage)
         }
         .sheet(
             isPresented: Binding(
@@ -229,7 +258,7 @@ struct SidebarView: View {
                         Divider()
                         Button("重新扫描") { store.rescan(entryID: project.id) }
                         Divider()
-                        Button("移除", role: .destructive) { store.removeProject(id: project.id) }
+                        Button("移除", role: .destructive) { store.projectPendingRemoval = project }
                     }
                 }
             }
@@ -308,7 +337,7 @@ struct ConfigurationListView: View {
                         OpenWithMenu(projectURL: project.url)
 
                         Button(role: .destructive) {
-                            store.removeProject(id: project.id)
+                            store.projectPendingRemoval = project
                         } label: {
                             Image(systemName: "trash")
                         }
