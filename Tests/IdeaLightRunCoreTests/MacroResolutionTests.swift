@@ -201,4 +201,66 @@ final class MacroResolutionTests: XCTestCase {
             XCTAssertTrue(detail.contains("$PROJECT_DIR$"), "错误里要保留未展开的原始值：\(detail)")
         }
     }
+
+    // MARK: - §P0-8 环境先于字段解析
+
+    /// VM Options 里的 ${VAR} 引用的是拼装后的有效环境
+    /// （父进程 + env 文件 + Run Configuration），不是启动器的父进程环境。
+    /// 回归——旧实现用父环境展开 VM Options，Run Configuration 里定义的变量
+    /// 在 VM Options / Program Arguments / Working Directory 中永远取不到。
+    func testVMOptionsResolveAgainstEffectiveEnvironment() throws {
+        let resolved = try resolve(makeConfig(
+            vmOptions: "-Dapp.home=${APP_HOME}",
+            environmentVariables: ["APP_HOME": "$PROJECT_DIR$"]
+        ))
+        XCTAssertEqual(resolved.vmArguments, ["-Dapp.home=\(projectRoot.path)"])
+        XCTAssertTrue(resolved.warnings.isEmpty, "有效环境里存在的变量不该告警：\(resolved.warnings)")
+    }
+
+    func testProgramArgumentsResolveAgainstEnvFileValues() throws {
+        let envProject = Fixtures.url("EnvironmentFileProject")
+        let resolved = try RunConfigurationResolver().resolve(
+            config: RunConfiguration(
+                name: "EnvArgs",
+                type: .application,
+                mainClass: "com.example.env.EnvApplication",
+                programArguments: "${SPRING_PROFILES_ACTIVE}",
+                environmentFiles: ["$PROJECT_DIR$/.env"],
+                passParentEnvironment: false,
+                source: ConfigurationSource(kind: .dotRun, file: envProject.appendingPathComponent("x.run.xml"), modifiedAt: nil)
+            ),
+            projectRoot: envProject,
+            module: nil,
+            parentEnvironment: [:]
+        )
+        XCTAssertEqual(resolved.programArguments, ["dev"], ".env 里的值必须能被 Program Arguments 引用")
+    }
+
+    func testWorkingDirectoryResolvesAgainstRunConfigurationEnvironment() throws {
+        let resolved = try resolve(makeConfig(
+            workingDirectory: "${RUN_DIR}",
+            environmentVariables: ["RUN_DIR": "$MODULE_DIR$"]
+        ))
+        XCTAssertEqual(resolved.workingDirectory.path, moduleDir.path)
+    }
+
+    /// env 文件路径与 env 值本身仍按父环境展开（IDEA 不允许 env 自引用：
+    /// Run Configuration 变量引用自己取不到值）。
+    func testEnvironmentValuesDoNotSeeEachOther() throws {
+        let resolved = try resolve(makeConfig(
+            environmentVariables: [
+                "BASE": "$PROJECT_DIR$",
+                "DERIVED": "${MISSING_FROM_PARENT}",
+            ],
+            passParentEnvironment: false
+        ))
+        XCTAssertEqual(resolved.environment["BASE"], projectRoot.path)
+        XCTAssertEqual(resolved.environment["DERIVED"], "${MISSING_FROM_PARENT}", "env 值只查父环境，不查同批变量")
+        XCTAssertTrue(
+            resolved.warnings.contains { warning in
+                if case .unresolvedMacro(let token, _) = warning { return token == "${MISSING_FROM_PARENT}" }
+                return false
+            }
+        )
+    }
 }

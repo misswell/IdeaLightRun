@@ -17,8 +17,28 @@ public struct RunConfigurationResolver: Sendable {
         let macros = MacroResolver(projectDir: projectRoot, moduleDir: moduleDirectory)
         var warnings = config.warnings
 
+        // §P0-8: 环境先于一切字段装配。IDEA 语义：VM Options / Program Arguments /
+        // Working Directory 里的 ${ENV_VAR} 引用的是拼装后的有效环境
+        // （父进程 + .env 文件 + Run Configuration 显式变量），不是启动器的父进程环境；
+        // 反过来 env 文件路径与 env 值本身仍按父环境展开，不允许自引用。
+        let environment = try EnvironmentResolver.resolve(
+            passParentEnvironment: config.passParentEnvironment,
+            environmentFiles: config.environmentFiles,
+            environmentVariables: config.environmentVariables,
+            macros: macros,
+            parentEnvironment: parentEnvironment
+        )
+        for warning in environment.warnings {
+            MacroResolver.appendWarning(warning, into: &warnings)
+        }
+        let effectiveMacros = MacroResolver(
+            projectDir: projectRoot,
+            moduleDir: moduleDirectory,
+            environment: environment.values
+        )
+
         func resolveField(_ raw: String) -> String {
-            let resolution = macros.resolve(raw)
+            let resolution = effectiveMacros.resolve(raw)
             for warning in resolution.warnings {
                 MacroResolver.appendWarning(warning, into: &warnings)
             }
@@ -41,18 +61,6 @@ public struct RunConfigurationResolver: Sendable {
             programArguments = CommandLineTokenizer.tokenize(raw).map(resolveField)
         } else {
             programArguments = []
-        }
-
-        // §4.1: System < Env File 1 < … < Run Configuration env
-        let environment = try EnvironmentResolver.resolve(
-            passParentEnvironment: config.passParentEnvironment,
-            environmentFiles: config.environmentFiles,
-            environmentVariables: config.environmentVariables,
-            macros: macros,
-            parentEnvironment: parentEnvironment
-        )
-        for warning in environment.warnings {
-            MacroResolver.appendWarning(warning, into: &warnings)
         }
 
         var mainClass: String?
