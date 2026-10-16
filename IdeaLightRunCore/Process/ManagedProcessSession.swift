@@ -245,14 +245,16 @@ public final class ManagedProcessSession {
     }
 
     private func setState(_ newState: ProcessState) {
-        lock.lock()
-        stateValue = newState
-        lock.unlock()
         // 计划登记的临时文件（@argfile / manifest jar）只服务本次运行：
         // 进程一进入终态就删掉，不留到下次启动。
+        // 必须先删再落终态——状态在锁内发布后，任何观察者（如 waitUntilExit 的
+        // 轮询）都可能立刻看到终态；先删后发，才不存在「已退出、文件还在」的窗口。
         if newState.isTerminal {
             temporaryArtifacts.forEach { try? FileManager.default.removeItem(at: $0) }
         }
+        lock.lock()
+        stateValue = newState
+        lock.unlock()
         onState?(newState)
     }
 }
