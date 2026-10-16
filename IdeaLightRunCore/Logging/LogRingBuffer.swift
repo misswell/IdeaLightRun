@@ -28,12 +28,29 @@ public final class LogRingBuffer: @unchecked Sendable {
             lines.append(line)
             totalBytes += line.text.utf8.count + 1
         }
-        while lines.count > maxLines || totalBytes > maxBytes {
-            let removed = lines.removeFirst()
-            totalBytes -= removed.text.utf8.count + 1
-        }
+        trimLocked()
         pending.append(contentsOf: newLines)
         lock.unlock()
+    }
+
+    /// 批量裁剪：一次算出要丢多少行，一次 `removeFirst(k)`。
+    /// 原实现是 `while 超限 { lines.removeFirst() }`——每丢一行都要把整个数组尾部
+    /// 前移一格，缓冲满之后每来一行就是 O(上限)，十万行级别的日志会让 IO 线程把
+    /// 时间全花在搬移上（行数、字节数双上限下尤其明显）。
+    private func trimLocked() {
+        // 行数上限决定至少丢这么多
+        var k = lines.count > maxLines ? lines.count - maxLines : 0
+        for index in 0..<k {
+            totalBytes -= lines[index].text.utf8.count + 1
+        }
+        // 字节上限可能要求丢得更多（单行很长的日志光看行数不够）
+        while k < lines.count, totalBytes > maxBytes {
+            totalBytes -= lines[k].text.utf8.count + 1
+            k += 1
+        }
+        if k > 0 {
+            lines.removeFirst(k)
+        }
     }
 
     /// §103: 取走待推送的批次。

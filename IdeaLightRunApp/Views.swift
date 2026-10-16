@@ -537,7 +537,14 @@ struct ConfigurationRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .layoutPriority(1)
+                    // 端口是运行期的关键信息，必须始终可见：v0.1.22 把它的优先级
+                    // 排在副标题之下，而 Spring Boot 的全限定类名理想宽度普遍超过
+                    // 列宽，端口每轮布局都被压成零宽——用户在「运行中」前面永远
+                    // 看不到端口（探测本身是好的，lsof 21ms 就能探到）。
+                    // 与状态同级最高优先 + 固定宽度，最多 140pt，超长部分悬停看全称。
+                    .fixedSize()
+                    .frame(maxWidth: 140, alignment: .trailing)
+                    .layoutPriority(3)
                     .help("监听端口：\(ports.map(String.init).joined(separator: ", "))")
             }
             Text(statusLabel)
@@ -1209,6 +1216,11 @@ private struct LogTextView: NSViewRepresentable {
     @ObservedObject var model: LogViewModel
     var wrapText: Bool
 
+    /// NSTextStorage 的字符水位：涨过上限就一次回收到下水位。
+    /// 与 LogViewModel.maxViewLines（行数）互为兜底——超长单行也可能撑爆字符数。
+    static let storageHighWaterMark = 2_000_000
+    static let storageLowWaterMark = 1_600_000
+
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
@@ -1223,6 +1235,10 @@ private struct LogTextView: NSViewRepresentable {
         textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
         textView.backgroundColor = NSColor.textBackgroundColor
         textView.autoresizingMask = [.width]
+        // 大文本的关键开关：默认排版管理器会把整篇文档都算好行盒，
+        // 200 万字符时追加一行就要重排全文，滚动也跟着卡。
+        // 打开后只排可见区域（懒排版），与前面的分块回收配合，十万行级别才谈得上流畅。
+        textView.layoutManager?.allowsNonContiguousLayout = true
 
         let scrollView = NSScrollView()
         scrollView.documentView = textView
@@ -1291,12 +1307,15 @@ private struct LogTextView: NSViewRepresentable {
                 }
                 if attributed.length > 0 {
                     storage.append(attributed)
-                    // TextStorage 自身也设上限，防止无限膨胀
-                    let maxCharacters = 2_000_000
-                    if storage.length > maxCharacters {
-                        let deleted = storage.length - maxCharacters
+                    // TextStorage 自身也设上限，防止无限膨胀。
+                    // 分块回收：越过上限时一次删到下水位，而不是「删到刚好等于上限」。
+                    // 后者意味着缓冲满了以后每个 100ms 批次都对整个 200 万字符做一次
+                    // 头部删除 + 全量重排，十万行级别的日志足以把主线程压死；
+                    // 分块后这笔代价按「每新增约 40 万字符付一次」摊薄一百倍。
+                    if storage.length > Self.storageHighWaterMark {
+                        let deleted = storage.length - Self.storageLowWaterMark
                         storage.deleteCharacters(in: NSRange(location: 0, length: deleted))
-                        coordinator.shiftRangesAfterDeletion(deleted)
+                        coordinator.noteFrontDeletion(deleted)
                     }
                     coordinator.needsHighlightScan = true
                     textView.needsDisplay = true
@@ -1351,6 +1370,16 @@ private struct LogTextView: NSViewRepresentable {
         textView.layoutManager?.ensureLayout(for: textView.textContainer!)
     }
 
+    /// 每行都新建 NSMutableParagraphStyle / Date.FormatStyle 在大流量下是纯浪费：
+    /// 段落样式按流只有三种，格式化器完全可复用。十万行级别时这两处是渲染侧的主要开销。
+    private static let paragraphStyle: NSParagraphStyle = {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 1
+        return paragraph
+    }()
+
+    private static let timeStyle = Date.FormatStyle(date: .omitted, time: .standard)
+
     private static func attributed(_ line: LogLine) -> NSAttributedString {
         let color: NSColor
         switch line.stream {
@@ -1358,14 +1387,12 @@ private struct LogTextView: NSViewRepresentable {
         case .stderr: color = .systemRed
         case .system: color = .secondaryLabelColor
         }
-        let timeText = line.timestamp.formatted(date: .omitted, time: .standard)
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 1
+        let timeText = line.timestamp.formatted(Self.timeStyle)
         return NSAttributedString(
             string: "\(timeText) \(line.text)\n",
             attributes: [
                 .foregroundColor: color,
-                .paragraphStyle: paragraph,
+                .paragraphStyle: Self.paragraphStyle,
             ]
         )
     }
@@ -1474,7 +1501,12 @@ private struct LogTextView: NSViewRepresentable {
         }
 
         /// 环形截断删掉头部字符后，所有命中位置整体前移。
-        func shiftRangesAfterDeletion(_ deleted: Int) {
+        /// 注意 `scannedLength` 也必须减：扫描游标是相对 storage 的绝对偏移，
+        /// 头部一删就全部失效。原来的 `shiftRangesAfterDeletion` 在没有命中时
+        /// 直接 return，游标却照旧指着旧位置，下一次增量扫描会漏掉一段（甚至
+        /// 因为 `scannedLength > total` 而永远不再扫）。所以这里无条件调整游标。
+        func noteFrontDeletion(_ deleted: Int) {
+            scannedLength = max(scannedLength - deleted, 0)
             guard !searchRanges.isEmpty else { return }
             searchRanges = searchRanges.compactMap { range in
                 let end = range.location + range.length
