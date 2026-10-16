@@ -7,7 +7,7 @@ final class BeforeLaunchTests: XCTestCase {
     private final class Recorder: @unchecked Sendable {
         private let lock = NSLock()
         private var _calls: [String] = []
-        private(set) var goalInvocations: [[String]] = []
+        private(set) var goalInvocations: [(goals: [String], pomFile: String?)] = []
         private(set) var referencedInvocations: [(name: String, chain: [String])] = []
 
         var calls: [String] {
@@ -20,7 +20,9 @@ final class BeforeLaunchTests: XCTestCase {
             _calls.append(call)
             lock.unlock()
         }
-        func recordGoals(_ goals: [String]) { goalInvocations.append(goals) }
+        func recordGoals(_ goals: [String], pomFile: String?) {
+            goalInvocations.append((goals, pomFile))
+        }
         func recordReferenced(name: String, chain: [String]) {
             referencedInvocations.append((name, chain))
         }
@@ -30,9 +32,9 @@ final class BeforeLaunchTests: XCTestCase {
         BeforeLaunchExecutor.Actions(
             build: { recorder.record("build") },
             buildProject: { recorder.record("buildProject") },
-            runMavenGoals: { goals in
+            runMavenGoals: { goals, pomFile in
                 recorder.record("maven")
-                recorder.recordGoals(goals)
+                recorder.recordGoals(goals, pomFile: pomFile)
             },
             runReferenced: { config, chain in
                 recorder.record("run:\(config.name)")
@@ -109,7 +111,7 @@ final class BeforeLaunchTests: XCTestCase {
         let recorder = Recorder()
         try await BeforeLaunchExecutor().run(
             for: config("Order", tasks: [
-                BeforeLaunchTask(kind: .mavenGoal(goal: "clean"), isEnabled: true),
+                BeforeLaunchTask(kind: .mavenGoal(goal: "clean", pomFile: nil), isEnabled: true),
                 BeforeLaunchTask(kind: .build, isEnabled: true),
                 BeforeLaunchTask(kind: .buildProject, isEnabled: true),
             ]),
@@ -126,20 +128,37 @@ final class BeforeLaunchTests: XCTestCase {
         let recorder = Recorder()
         try await BeforeLaunchExecutor().run(
             for: config("MVN", tasks: [
-                BeforeLaunchTask(kind: .mavenGoal(goal: "clean package -DskipTests"), isEnabled: true),
+                BeforeLaunchTask(kind: .mavenGoal(goal: "clean package -DskipTests", pomFile: nil), isEnabled: true),
             ]),
             configurations: [],
             actions: actions(recorder),
             log: silence
         )
-        XCTAssertEqual(recorder.goalInvocations, [["clean", "package", "-DskipTests"]])
+        XCTAssertEqual(recorder.goalInvocations.map(\.goals), [["clean", "package", "-DskipTests"]])
+        XCTAssertEqual(recorder.goalInvocations.first?.pomFile, nil)
+    }
+
+    /// §P0-9: 任务保存的 `file`（对哪个 pom 执行）必须原样交给执行动作，
+    /// 丢弃它等于把任务静默改写到项目根。
+    func testMavenGoalsCarryPomFileThrough() async throws {
+        let recorder = Recorder()
+        try await BeforeLaunchExecutor().run(
+            for: config("MVN", tasks: [
+                BeforeLaunchTask(kind: .mavenGoal(goal: "install", pomFile: "$PROJECT_DIR$/sub/pom.xml"), isEnabled: true),
+            ]),
+            configurations: [],
+            actions: actions(recorder),
+            log: silence
+        )
+        XCTAssertEqual(recorder.goalInvocations.map(\.goals), [["install"]])
+        XCTAssertEqual(recorder.goalInvocations.first?.pomFile, "$PROJECT_DIR$/sub/pom.xml")
     }
 
     func testEmptyMavenGoalBlocks() async throws {
         let recorder = Recorder()
         do {
             try await BeforeLaunchExecutor().run(
-                for: config("MVN", tasks: [BeforeLaunchTask(kind: .mavenGoal(goal: "  "), isEnabled: true)]),
+                for: config("MVN", tasks: [BeforeLaunchTask(kind: .mavenGoal(goal: "  ", pomFile: nil), isEnabled: true)]),
                 configurations: [],
                 actions: actions(recorder),
                 log: silence
@@ -205,7 +224,7 @@ final class BeforeLaunchTests: XCTestCase {
         let failing = BeforeLaunchExecutor.Actions(
             build: { throw IdeaLightRunError.buildFailed(detail: "编译失败") },
             buildProject: { recorder.record("buildProject") },
-            runMavenGoals: { _ in recorder.record("maven") },
+            runMavenGoals: { _, _ in recorder.record("maven") },
             runReferenced: { _, _ in recorder.record("referenced") }
         )
         do {
@@ -332,10 +351,61 @@ final class BeforeLaunchTests: XCTestCase {
         XCTAssertEqual(parsed.beforeLaunchTasks, [
             BeforeLaunchTask(kind: .build, isEnabled: true),
             BeforeLaunchTask(kind: .buildProject, isEnabled: true),
-            BeforeLaunchTask(kind: .mavenGoal(goal: "clean package"), isEnabled: true),
+            BeforeLaunchTask(kind: .mavenGoal(goal: "clean package", pomFile: nil), isEnabled: true),
             BeforeLaunchTask(kind: .gradleTask(task: "assemble"), isEnabled: true),
             BeforeLaunchTask(kind: .runConfiguration(name: "Pre", type: "Application"), isEnabled: true),
         ])
+    }
+
+    /// §P0-9: Maven.BeforeRunTask 的 `file` 属性（对哪个 pom 执行）必须保留。
+    func testMapperKeepsMavenPomFile() throws {
+        let parsed = try parseConfiguration("""
+        <configuration default="false" name="Sub" type="Application" factoryName="Application">
+          <option name="MAIN_CLASS_NAME" value="com.example.App" />
+          <method v="2">
+            <option name="Maven.BeforeRunTask" enabled="true" file="$PROJECT_DIR$/sub/pom.xml" goal="clean install" />
+          </method>
+        </configuration>
+        """)
+        XCTAssertEqual(
+            parsed.beforeLaunchTasks,
+            [BeforeLaunchTask(kind: .mavenGoal(goal: "clean install", pomFile: "$PROJECT_DIR$/sub/pom.xml"), isEnabled: true)]
+        )
+    }
+
+    /// §P0-9: runTasks 把 `file` 映射成 `-f`，宏与相对路径都以项目根展开。
+    func testResolvePomPathVariants() {
+        let root = URL(fileURLWithPath: "/work/demo")
+        XCTAssertEqual(
+            MavenBuildService.resolvePomPath("$PROJECT_DIR$/sub/pom.xml", projectRoot: root),
+            "/work/demo/sub/pom.xml"
+        )
+        XCTAssertEqual(
+            MavenBuildService.resolvePomPath("submodule/pom.xml", projectRoot: root),
+            "/work/demo/submodule/pom.xml",
+            "相对路径按项目根展开"
+        )
+        XCTAssertEqual(
+            MavenBuildService.resolvePomPath("/abs/pom.xml", projectRoot: root),
+            "/abs/pom.xml"
+        )
+    }
+
+    /// §P0-9: 任务指向的 pom 不存在时必须报错，不能悄悄回退到项目根。
+    func testRunTasksRejectsMissingPomFile() throws {
+        let service = MavenBuildService(
+            projectRoot: URL(fileURLWithPath: "/tmp/lr-p0-9-\(UUID().uuidString)"),
+            rootPomURL: URL(fileURLWithPath: "/tmp/lr-p0-9-\(UUID().uuidString)/pom.xml"),
+            mavenExecutable: URL(fileURLWithPath: "/tmp/does-not-matter"),
+            environment: [:]
+        )
+        do {
+            try service.runTasks(["clean"], pomFile: "$PROJECT_DIR$/ghost/pom.xml", handle: nil, log: { _ in })
+            XCTFail("pom 不存在必须报错")
+        } catch let error as IdeaLightRunError {
+            guard case .invalidConfiguration(let detail) = error else { return XCTFail("实际：\(error)") }
+            XCTAssertTrue(detail.contains("ghost/pom.xml"), "错误里要带上解析后的路径：\(detail)")
+        }
     }
 
     /// §3.2/§10: 未知任务既要在 GUI 上看得见（warning），也要留在任务列表里让 Core 拦下。

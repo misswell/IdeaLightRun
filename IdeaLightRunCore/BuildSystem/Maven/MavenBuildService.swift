@@ -95,17 +95,41 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
 
     /// §3.5: 执行 IDEA 保存的构建任务（如 `clean package`）。
     /// 原文按参数逐项传递，绝不转成 Java 命令（§24 约束 2）。
+    /// §P0-9: 任务保存的 `file` 属性映射成 `-f <pom>`——子模块任务必须跑到
+    /// 子模块的 pom 上，丢掉它就等于静默改写到项目根。
     public func runTasks(
         _ tasks: [String],
+        pomFile: String?,
         handle: ProcessHandle?,
         log: @escaping LogCallback
     ) throws {
-        let status = try run(arguments: mavenArguments(base: tasks), handle: handle, log: log)
+        var base = tasks
+        if let pomFile, !pomFile.isEmpty {
+            let resolved = Self.resolvePomPath(pomFile, projectRoot: projectRoot)
+            guard FileManager.default.fileExists(atPath: resolved) else {
+                throw IdeaLightRunError.invalidConfiguration(
+                    detail: "Before Launch 的 Maven 任务指向的 pom 不存在：\(resolved)（原始值：\(pomFile)）"
+                )
+            }
+            base = ["-f", resolved] + base
+        }
+        let status = try run(arguments: mavenArguments(base: base), handle: handle, log: log)
         guard status == 0 else {
             throw IdeaLightRunError.buildFailed(
                 detail: "Maven \(tasks.joined(separator: " ")) 失败（退出码 \(status)），详见控制台输出。"
             )
         }
+    }
+
+    /// IDEA 的 `file` 属性可以是 `$PROJECT_DIR$/$MODULE_DIR$` 宏、绝对路径或相对项目根的路径。
+    /// 适配器不知道 module 目录，`$MODULE_DIR$` 退化为项目根（Before Launch 的 Maven 任务
+    /// 实际都保存 `$PROJECT_DIR$` 或相对路径）。
+    static func resolvePomPath(_ raw: String, projectRoot: URL) -> String {
+        var path = raw
+            .replacingOccurrences(of: "$PROJECT_DIR$", with: projectRoot.path)
+            .replacingOccurrences(of: "$MODULE_DIR$", with: projectRoot.path)
+        if path.hasPrefix("/") { return path }
+        return projectRoot.appendingPathComponent(path).path
     }
 
     public func hasFreshClasspathCache(for target: BuildTarget) -> Bool {

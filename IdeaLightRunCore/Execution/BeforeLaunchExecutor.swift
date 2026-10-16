@@ -11,15 +11,16 @@ public struct BeforeLaunchExecutor: Sendable {
         public var build: @Sendable () async throws -> Void
         /// §3.4: Build Project = 整个 reactor 增量编译。
         public var buildProject: @Sendable () async throws -> Void
-        /// §3.5: Maven.BeforeRunTask = 原样执行 IDEA 保存的 goal。
-        public var runMavenGoals: @Sendable (_ goals: [String]) async throws -> Void
+        /// §3.5: Maven.BeforeRunTask = 原样执行 IDEA 保存的 goal；pomFile 是任务保存的
+        /// `file` 属性（§P0-9，可为 nil），调用方负责把它映射成 `-f`。
+        public var runMavenGoals: @Sendable (_ goals: [String], _ pomFile: String?) async throws -> Void
         /// §3.7: Run Another Configuration = 先跑完被引用的配置；chain 为当前引用链，用于循环检测。
         public var runReferenced: @Sendable (_ config: RunConfiguration, _ chain: [String]) async throws -> Void
 
         public init(
             build: @escaping @Sendable () async throws -> Void,
             buildProject: @escaping @Sendable () async throws -> Void,
-            runMavenGoals: @escaping @Sendable ([String]) async throws -> Void,
+            runMavenGoals: @escaping @Sendable ([String], String?) async throws -> Void,
             runReferenced: @escaping @Sendable (RunConfiguration, [String]) async throws -> Void
         ) {
             self.build = build
@@ -56,7 +57,7 @@ public struct BeforeLaunchExecutor: Sendable {
             case .buildProject:
                 log(LogLine(stream: .system, text: "[IdeaLightRun] Before Launch：Build Project（整个项目）…"))
                 try await actions.buildProject()
-            case .mavenGoal(let goal):
+            case .mavenGoal(let goal, let pomFile):
                 let goals = CommandLineTokenizer.tokenize(goal)
                 guard !goals.isEmpty else {
                     throw IdeaLightRunError.unsupportedBeforeLaunch(
@@ -64,8 +65,9 @@ public struct BeforeLaunchExecutor: Sendable {
                             + "无法确定要执行什么。请在 IDEA 中填写 Command line 后重试。"
                     )
                 }
-                log(LogLine(stream: .system, text: "[IdeaLightRun] Before Launch：mvn \(goals.joined(separator: " "))…"))
-                try await actions.runMavenGoals(goals)
+                let target = pomFile.map { " -f \($0)" } ?? ""
+                log(LogLine(stream: .system, text: "[IdeaLightRun] Before Launch：mvn\(target) \(goals.joined(separator: " "))…"))
+                try await actions.runMavenGoals(goals, pomFile)
             case .gradleTask(let gradleTask):
                 throw IdeaLightRunError.unsupportedBeforeLaunch(
                     detail: "配置 “\(config.name)” 的 Before Launch 需要执行 Gradle 任务“\(gradleTask)”；"

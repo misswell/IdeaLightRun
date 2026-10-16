@@ -92,9 +92,9 @@ public struct ExecutionCoordinator: Sendable {
                         progress(.building)
                         try adapter.buildProject(kind: .build, handle: processHandle, log: log)
                     },
-                    runMavenGoals: { goals in
+                    runMavenGoals: { goals, pomFile in
                         progress(.building)
-                        try adapter.runTasks(goals, handle: processHandle, log: log)
+                        try adapter.runTasks(goals, pomFile: pomFile, handle: processHandle, log: log)
                     },
                     runReferenced: { referenced, chain in
                         let referencedPlan = try await self.prepare(

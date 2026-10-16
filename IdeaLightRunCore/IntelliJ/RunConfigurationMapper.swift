@@ -153,7 +153,10 @@ public enum RunConfigurationMapper {
                     ?? option.attribute("runnerParams")
                     ?? option.firstChild("param")?.attribute("value")
                     ?? ""
-                tasks.append(BeforeLaunchTask(kind: .mavenGoal(goal: goal), isEnabled: enabled))
+                // §P0-9: `file` 指定对哪个 pom 执行（子模块任务时是子模块 pom），
+                // 丢弃它等于把任务静默改写到项目根，语义完全变了。
+                let pomFile = option.attribute("file")
+                tasks.append(BeforeLaunchTask(kind: .mavenGoal(goal: goal, pomFile: pomFile), isEnabled: enabled))
             case "Gradle.BeforeRunTask":
                 let task = option.attribute("tasks")
                     ?? option.attribute("taskName")

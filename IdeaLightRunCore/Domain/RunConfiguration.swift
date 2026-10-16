@@ -114,7 +114,9 @@ public struct BeforeLaunchTask: Equatable, Hashable, Codable, Sendable {
         case build
         case buildProject
         case runConfiguration(name: String, type: String?)
-        case mavenGoal(goal: String)
+        /// §P0-9: IDEA 的 Maven.BeforeRunTask 除 goal 外还保存 `file`（对哪个 pom 执行，
+        /// 常见于子模块）。pomFile 丢了任务就会跑到项目根上去，语义完全变了。
+        case mavenGoal(goal: String, pomFile: String?)
         case gradleTask(task: String)
         case unknown(raw: String)
     }
@@ -132,7 +134,7 @@ public struct BeforeLaunchTask: Equatable, Hashable, Codable, Sendable {
         case .build: return "Build"
         case .buildProject: return "Build Project"
         case .runConfiguration(let name, _): return "Run \(name)"
-        case .mavenGoal(let goal): return "Maven: \(goal)"
+        case .mavenGoal(let goal, _): return "Maven: \(goal)"
         case .gradleTask(let task): return "Gradle: \(task)"
         case .unknown(let raw): return raw
         }

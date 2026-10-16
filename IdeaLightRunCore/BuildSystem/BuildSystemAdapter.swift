@@ -33,8 +33,10 @@ public protocol BuildSystemAdapter: Sendable {
     ) throws
 
     /// Before Launch 里配置的构建任务（Maven goal / Gradle task），原文逐项传递（§3.2）。
+    /// `pomFile` 是任务保存的 `file` 属性（§P0-9）：对哪个 pom 执行；nil 表示项目根。
     func runTasks(
         _ tasks: [String],
+        pomFile: String?,
         handle: ProcessHandle?,
         log: @escaping LogCallback
     ) throws
