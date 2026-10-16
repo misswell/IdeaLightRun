@@ -368,6 +368,9 @@ struct ProjectSummaryView: View {
             if let result = project.result {
                 chip(icon: "square.stack.3d.up", text: "\(result.modules.count) 模块")
             }
+            // .id 让切换项目时重建模型，重新读新项目的分支
+            GitControls(project: project)
+                .id(project.id)
             Spacer()
             buildControls
         }
