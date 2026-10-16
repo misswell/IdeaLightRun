@@ -278,12 +278,7 @@ struct ConfigurationListView: View {
                         .help("重新扫描")
                         .disabled(project.isScanning)
 
-                        Button {
-                            NSWorkspace.shared.open(project.url)
-                        } label: {
-                            Image(systemName: "folder.badge.gearshape")
-                        }
-                        .help("在 Finder 中显示项目")
+                        OpenWithMenu(projectURL: project.url)
 
                         Button(role: .destructive) {
                             store.removeProject(id: project.id)
