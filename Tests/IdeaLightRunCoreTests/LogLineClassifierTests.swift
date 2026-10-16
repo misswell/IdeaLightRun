@@ -41,6 +41,21 @@ final class LogLineClassifierTests: XCTestCase {
         XCTAssertEqual(kind("Compilation finished: 0 errors, 0 warnings"), .normal)
     }
 
+    func testMavenWarningLineIsWarning() {
+        XCTAssertEqual(kind("[WARNING] The POM for com.alibaba:druid:jar:1.2.6 is invalid, transitive dependencies (if any) will not be available: 2 problems were encountered while building the effective model for com.alibaba:druid:1.2.6"), .warning)
+    }
+
+    /// druid 上游 POM 的 systemPath 明细行：Maven 打的是 [ERROR] 字样，但语义是警告
+    /// （外层总述行是 [WARNING]，构建照常成功），不能着红色冒充构建失败。
+    func testDruidSystemPathDetailLinesAreWarningNotError() {
+        XCTAssertEqual(kind("[ERROR] 'dependencies.dependency.systemPath' for com.sun:tools:jar must specify an absolute path but is ${project.basedir}/lib/openjdk-1.8-tools.jar @ "), .warning)
+        XCTAssertEqual(kind("[ERROR] 'dependencies.dependency.systemPath' for com.sun:jconsole:jar must specify an absolute path but is ${project.basedir}/lib/openjdk-1.8-jconsole.jar @ "), .warning)
+    }
+
+    func testRealMavenFailureStaysError() {
+        XCTAssertEqual(kind("[ERROR] Failed to execute goal org.apache.maven.plugins:maven-compiler-plugin:3.8.1:compile (default-compile) on project tg-tenant-server: Compilation failure"), .error)
+    }
+
     func testEnglishSentenceStartingWithAtIsNotFrame() {
         XCTAssertEqual(kind("at least one (attempt) was made"), .normal)
     }

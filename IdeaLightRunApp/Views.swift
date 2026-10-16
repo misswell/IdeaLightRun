@@ -1456,6 +1456,13 @@ private struct LogTextView: NSViewRepresentable {
             : NSColor(srgbRed: 0x24/255, green: 0x70/255, blue: 0xB8/255, alpha: 1)
     }
 
+    /// Maven [WARNING] 的黄：暗色用柔和金（照抄会太暗看不清），亮色用深橄榄。
+    private static let warningColor = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0xD6/255, green: 0xBC/255, blue: 0x71/255, alpha: 1)
+            : NSColor(srgbRed: 0x9A/255, green: 0x7B/255, blue: 0x00/255, alpha: 1)
+    }
+
     /// 正文按 `LogLine.kind` 着色（IDEA 语义）：异常红、堆栈帧蓝、stderr 红；
     /// 时间戳淡化成次要色，避免把堆栈缩进视觉上顶平。
     private static func attributed(_ line: LogLine) -> NSAttributedString {
@@ -1470,6 +1477,7 @@ private struct LogTextView: NSViewRepresentable {
         let color: NSColor
         switch line.kind {
         case .error: color = .systemRed
+        case .warning: color = Self.warningColor
         case .frame: color = Self.frameColor
         case .normal:
             color = line.stream == .system ? .secondaryLabelColor : .textColor

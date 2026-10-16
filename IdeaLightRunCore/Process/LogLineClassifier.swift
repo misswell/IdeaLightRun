@@ -8,6 +8,8 @@ public enum LogLineKind: Equatable, Sendable {
     case normal
     /// 异常头、Caused by / Suppressed、日志里的 ERROR 级别行，以及全部 stderr。
     case error
+    /// Maven [WARNING] 等：有问题但不影响构建成败的行。
+    case warning
     /// 堆栈帧（`at com.foo.Bar.run(Bar.java:12)`）与「... 53 more」折叠行。
     case frame
 }
@@ -28,6 +30,17 @@ public enum LogLineClassifier {
             #"|\bERROR\b"#
     )
 
+    // druid 等第三方 POM 自带 systemPath（${project.basedir}/...）时，被别的项目依赖
+    // 会让 Maven 打 [ERROR] 明细行——但 Maven 自己按警告处理（外层总述行是 [WARNING]
+    // "The POM for … is invalid, transitive dependencies will not be available"），
+    // 构建照常成功。按实际严重度着黄色，不冒充失败。
+    private static let benignSystemPathRegex = try! NSRegularExpression(
+        pattern: #"^\[ERROR\].*dependencies\.dependency\.systemPath"#
+    )
+    private static let mavenWarningRegex = try! NSRegularExpression(
+        pattern: #"^\[WARNING\]"#
+    )
+
     public static func kind(stream: LogStream, text: String) -> LogLineKind {
         switch stream {
         case .stderr: return .error
@@ -35,7 +48,9 @@ public enum LogLineClassifier {
         case .stdout: break
         }
         if isFrame(text) { return .frame }
+        if matches(benignSystemPathRegex, text) { return .warning }
         if isError(text) { return .error }
+        if matches(mavenWarningRegex, text) { return .warning }
         return .normal
     }
 
