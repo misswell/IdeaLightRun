@@ -5,6 +5,10 @@ import IdeaLightRunCore
 /// 不是 git 仓库时整个区块隐藏。切换/拉取只影响 git，不碰运行中的服务。
 struct GitControls: View {
     @StateObject private var model: GitViewModel
+    /// 分支弹层的关键字过滤与显隐
+    @State private var branchFilter = ""
+    @State private var showsBranchPopover = false
+    @FocusState private var filterFocused: Bool
 
     init(project: ProjectEntry) {
         _model = StateObject(wrappedValue: GitViewModel(projectURL: project.url))
@@ -38,23 +42,9 @@ struct GitControls: View {
     }
 
     private var branchMenu: some View {
-        Menu {
-            if model.branches.isEmpty {
-                Text("没有本地分支").foregroundStyle(.secondary)
-            } else {
-                ForEach(model.branches, id: \.self) { name in
-                    Button {
-                        model.switchBranch(name)
-                    } label: {
-                        if name == model.currentBranch {
-                            Label(name, systemImage: "checkmark")
-                        } else {
-                            Text(name)
-                        }
-                    }
-                    .disabled(name == model.currentBranch)
-                }
-            }
+        Button {
+            branchFilter = ""
+            showsBranchPopover = true
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: "arrow.triangle.branch")
@@ -64,13 +54,105 @@ struct GitControls: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .frame(maxWidth: 180, alignment: .leading)
+                Image(systemName: "chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
             }
+            .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.visible)
-        .fixedSize()
+        .buttonStyle(.plain)
         .disabled(model.status.blocksActions)
-        .help(model.currentBranch.map { "当前分支：\($0)。点开切换本地分支" } ?? "点开切换本地分支")
+        .popover(isPresented: $showsBranchPopover, arrowEdge: .bottom) {
+            branchPickerPopover
+        }
+        .help(model.currentBranch.map { "当前分支：\($0)。点开搜索并切换本地分支" } ?? "点开搜索并切换本地分支")
+    }
+
+    /// 分支选择弹层：顶部搜索框按关键字过滤，下面是过滤后的本地分支。
+    /// SwiftUI 的 Menu 塞不进输入框，只能自己搭 popover。
+    private var branchPickerPopover: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("搜索分支", text: $branchFilter)
+                    .textFieldStyle(.plain)
+                    .font(.callout)
+                    .focused($filterFocused)
+                if !branchFilter.isEmpty {
+                    Button {
+                        branchFilter = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("清除搜索")
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            Divider()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    if filteredBranches.isEmpty {
+                        Text(model.branches.isEmpty ? "没有本地分支" : "没有匹配的分支")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.vertical, 14)
+                    } else {
+                        ForEach(filteredBranches, id: \.self) { name in
+                            branchRow(name)
+                        }
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .frame(width: 260, height: popoverListHeight)
+        }
+        .onAppear { filterFocused = true }
+    }
+
+    /// 行高 26（上下 padding 4 + 行内容）；有上限防止分支过多时弹层顶天立地。
+    private var popoverListHeight: CGFloat {
+        let contentHeight = filteredBranches.isEmpty
+            ? CGFloat(44)
+            : CGFloat(filteredBranches.count) * 26 + 8
+        return min(contentHeight, 280)
+    }
+
+    private func branchRow(_ name: String) -> some View {
+        let isCurrent = name == model.currentBranch
+        return Button {
+            showsBranchPopover = false
+            model.switchBranch(name)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(isCurrent ? Color.accentColor : .clear)
+                Text(name)
+                    .font(.callout)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isCurrent || model.status.blocksActions)
+        .help(isCurrent ? "当前分支" : "切换到 \(name)")
+    }
+
+    private var filteredBranches: [String] {
+        let query = branchFilter.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else { return model.branches }
+        return model.branches.filter { $0.localizedCaseInsensitiveContains(query) }
     }
 
     private var branchTitle: String {
