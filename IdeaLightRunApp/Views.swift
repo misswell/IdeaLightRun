@@ -305,7 +305,8 @@ struct ConfigurationListView: View {
                     ForEach(result.configurations) { config in
                         ConfigurationRow(
                             config: config,
-                            runtimeState: store.sessions[config.uniqueKey]?.state
+                            runtimeState: store.sessions[config.uniqueKey]?.state,
+                            ports: store.sessions[config.uniqueKey]?.listeningPorts ?? []
                         )
                         .tag(config.uniqueKey)
                     }
@@ -440,6 +441,8 @@ struct ProjectSummaryView: View {
 struct ConfigurationRow: View {
     let config: RunConfiguration
     let runtimeState: ProcessState?
+    /// 运行中探测到的监听端口；显示在状态文字左侧。
+    var ports: [Int] = []
 
     var body: some View {
         HStack(spacing: 10) {
@@ -456,11 +459,24 @@ struct ConfigurationRow: View {
                     .lineLimit(1)
             }
             Spacer()
+            if !ports.isEmpty {
+                Text(portsText)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .layoutPriority(1)
+                    .help("监听端口：\(ports.map(String.init).joined(separator: ", "))")
+            }
             Text(statusLabel)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(statusColor)
         }
         .padding(.vertical, 3)
+    }
+
+    private var portsText: String {
+        ":" + ports.map(String.init).joined(separator: " :")
     }
 
     private var subtitle: String {
