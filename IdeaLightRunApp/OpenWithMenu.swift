@@ -5,6 +5,7 @@ import SwiftUI
 /// 探测顺序：bundle id（LaunchServices）→ 常见安装路径；都找不到则菜单项置灰。
 struct OpenTarget: Identifiable {
     let name: String
+    /// 菜单里真正的显示名（带图标的那个）。`nil` 时直接用 bundle id 探测结果。
     var bundleIDs: [String] = []
     var fallbackPaths: [String] = []
 
@@ -28,6 +29,7 @@ struct OpenTarget: Identifiable {
         return nil
     }
 
+    /// 兜底用的路径：没装对应应用时，图标要落到项目目录本身（否则菜单项没法显示图标）。
     func icon(for projectURL: URL, applicationURL: URL?) -> NSImage {
         let path = applicationURL?.path ?? projectURL.path
         let icon = NSWorkspace.shared.icon(forFile: path)
@@ -45,7 +47,9 @@ struct OpenTarget: Identifiable {
     }
 
     /// 菜单顺序对齐参考实现；bundle id 探测不到时按常见路径兜底。
+    /// 第 0 项必须是「访达」：它是默认动作，用户说它始终显示在列表里。
     static let catalog: [OpenTarget] = [
+        OpenTarget(name: "访达", bundleIDs: ["com.apple.finder"], fallbackPaths: ["/System/Library/CoreServices/Finder.app"]),
         OpenTarget(name: "VS Code", bundleIDs: ["com.microsoft.VSCode"], fallbackPaths: ["/Applications/Visual Studio Code.app", "~/Applications/Visual Studio Code.app"]),
         OpenTarget(name: "Cursor", bundleIDs: ["com.todesktop.230313mzl4w4u92"], fallbackPaths: ["/Applications/Cursor.app", "~/Applications/Cursor.app"]),
         OpenTarget(name: "Zed", bundleIDs: ["dev.zed.Zed"], fallbackPaths: ["/Applications/Zed.app", "~/Applications/Zed.app"]),
@@ -60,35 +64,88 @@ struct OpenTarget: Identifiable {
             fallbackPaths: ["/Applications/IntelliJ IDEA Ultimate.app", "/Applications/IntelliJ IDEA CE.app", "/Applications/IntelliJ IDEA.app"]
         ),
     ]
+
+    /// 访达：默认动作，始终可用（系统自带）。
+    static var finder: OpenTarget { catalog[0] }
+
+    /// 默认选中的项是访达；存过的偏好优先。
+    static func preferredTarget(storedName: String?) -> OpenTarget {
+        if let storedName, let stored = catalog.first(where: { $0.name == storedName }) {
+            return stored
+        }
+        return finder
+    }
 }
 
-/// 中栏顶栏的「打开」菜单：用外部应用打开当前项目（对齐 Codex 的打开方式）。
+/// 中栏顶栏的「打开」按钮：图标即动作。
+///
+/// 图标本身是按钮——默认用访达打开项目目录；点开下拉选别的应用后，图标换成
+/// 所选应用的图标并记在偏好里，此后点图标就是用它打开。「访达」始终留在列表里。
 struct OpenWithMenu: View {
     let projectURL: URL
 
+    @AppStorage("openWithApp") private var preferredName = ""
+
+    private var target: OpenTarget {
+        OpenTarget.preferredTarget(storedName: preferredName.isEmpty ? nil : preferredName)
+    }
+
+    private var resolvedURL: URL? { target.applicationURL }
+
     var body: some View {
-        Menu {
-            ForEach(OpenTarget.catalog) { target in
-                let appURL = target.applicationURL
-                Button {
-                    target.open(projectURL)
-                } label: {
-                    Label {
-                        Text(target.name)
-                    } icon: {
-                        Image(nsImage: target.icon(for: projectURL, applicationURL: appURL))
+        HStack(spacing: 4) {
+            Button {
+                target.open(projectURL)
+            } label: {
+                Image(nsImage: target.icon(for: projectURL, applicationURL: resolvedURL))
+                    .frame(width: 16, height: 16)
+            }
+            .buttonStyle(OpenIconStyle())
+            .help("用\(target.name)打开项目（点右侧箭头切换应用）")
+
+            Menu {
+                ForEach(OpenTarget.catalog) { candidate in
+                    let appURL = candidate.applicationURL
+                    Button {
+                        preferredName = candidate.name
+                        candidate.open(projectURL)
+                    } label: {
+                        Label {
+                            Text(candidate.name)
+                        } icon: {
+                            Image(nsImage: candidate.icon(for: projectURL, applicationURL: appURL))
+                        }
                     }
+                    .disabled(candidate.requiresApp && appURL == nil)
                 }
-                .disabled(target.requiresApp && appURL == nil)
+            } label: {
+                HStack(spacing: 4) {
+                    Text("打开")
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                }
             }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "folder")
-                Text("打开")
-                Image(systemName: "chevron.down")
-                    .font(.caption2.weight(.semibold))
-            }
+            .fixedSize()
+            .menuStyle(.borderlessButton)
+            .help("选择用哪个应用打开项目")
         }
-        .help("用外部应用打开项目")
+    }
+}
+
+/// 图标按钮外观：只在悬停时显示浅灰圆角底，避免在工具栏里出现方形描边。
+private struct OpenIconStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(isEnabled ? (configuration.isPressed ? 0.6 : 1) : 0.4)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .opacity(configuration.isPressed ? 0 : 0.75)
+            )
+            .contentShape(Rectangle())
     }
 }
