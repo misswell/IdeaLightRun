@@ -408,7 +408,9 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
             DispatchQueue.global(qos: .utility).async {
                 defer { readerGroup.leave() }
                 while true {
-                    let data = fileHandle.readData(ofLength: 65536)
+                    // availableData 而非 readData(ofLength:)：后者要凑满 64KB 或 EOF 才返回，
+                    // 编译日志会成段攒住（和运行期日志一样的症状）。
+                    let data = fileHandle.availableData
                     if data.isEmpty { return }  // EOF
                     ingest(data, stream: stream)
                 }

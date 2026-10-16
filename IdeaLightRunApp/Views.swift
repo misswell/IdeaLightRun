@@ -133,6 +133,9 @@ struct RootView: View {
             SidebarView(store: store, showImporter: $showImporter)
         } content: {
             ConfigurationListView(store: store)
+                // 中栏留出「配置名 + 状态」都放得下的最小宽度：压到更窄时
+                // 状态会被挤成 "R"、配置名从左侧被裁（§51）。
+                .navigationSplitViewColumnWidth(min: 360, ideal: 460)
         } detail: {
             ConfigurationDetailView(store: store)
         }
@@ -171,6 +174,19 @@ struct RootView: View {
 
 // MARK: - 侧栏：项目列表（§50 第一栏）
 
+/// 侧栏状态点：把 AppStore 的汇总活动翻译成颜色。
+/// 颜色由 SwiftUI 层决定，AppStore 只负责汇总语义（不引 SwiftUI）。
+extension AppStore.ProjectActivity {
+    var presentation: (color: Color, title: String)? {
+        switch self {
+        case .none: return nil
+        case .running: return (.green, "有服务正在运行")
+        case .busy: return (.orange, "正在编译或启动")
+        case .failed: return (.red, "最近一次运行失败")
+        }
+    }
+}
+
 struct SidebarView: View {
     @ObservedObject var store: AppStore
     @Binding var showImporter: Bool
@@ -180,11 +196,22 @@ struct SidebarView: View {
             Section("项目") {
                 ForEach(store.projects) { project in
                     HStack(spacing: 8) {
-                        Image(systemName: "folder")
-                            .foregroundStyle(.secondary)
+                        // 有活动就把文件夹换成状态点：左栏是扫视用的，
+                        // 「哪个项目在跑、哪个出过事」要一眼可见（§50）。
+                        if let activity = store.activity(forProject: project.id).presentation {
+                            Circle()
+                                .fill(activity.color)
+                                .frame(width: 8, height: 8)
+                                .help(activity.title)
+                        } else {
+                            Image(systemName: "folder")
+                                .foregroundStyle(.secondary)
+                        }
                         VStack(alignment: .leading, spacing: 2) {
                             Text(project.name)
                                 .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(project.name)
                             subtitle(for: project)
                         }
                     }
@@ -449,20 +476,32 @@ struct ConfigurationRow: View {
     var ports: [Int] = []
 
     var body: some View {
-        HStack(spacing: 10) {
+        // 空间分配优先级：状态（最右，始终完整）＞ 标题/副标题 ＞ 端口 ＞ 空白。
+        // 中栏被压窄时先牺牲端口与副标题，用省略号收尾并可悬浮看全称，
+        // 而不是把状态文字挤成 "R"、把配置名裁掉（§51）。
+        HStack(spacing: 8) {
             Circle()
                 .fill(statusColor)
                 .frame(width: 8, height: 8)
+                .help(statusLabel)
             VStack(alignment: .leading, spacing: 2) {
                 Text(config.name)
                     .fontWeight(.medium)
                     .lineLimit(1)
+                    .truncationMode(.tail)
+                    .help(config.name)
                 Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(subtitle)
             }
-            Spacer()
+            // maxWidth: .infinity —— 让文字区吃下剩余宽度并自己截断。
+            // 少了这句，VStack 会按理想宽度（超长副标题）撑破行宽，List 从左侧裁切
+            // 内容（截图里 "TgTenantApplication" 变成 "gTenantApplication"）。
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(2)
             if !ports.isEmpty {
                 Text(portsText)
                     .font(.caption2.monospacedDigit())
@@ -475,6 +514,11 @@ struct ConfigurationRow: View {
             Text(statusLabel)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(statusColor)
+                .lineLimit(1)
+                // 状态是这一行最该看清的信息：固定理想宽度 + 最高优先级，绝不参与压缩
+                .fixedSize()
+                .layoutPriority(3)
+                .help(statusLabel)
         }
         .padding(.vertical, 3)
     }

@@ -209,3 +209,40 @@ final class ManagedProcessSessionTests: XCTestCase {
         )
     }
 }
+
+extension ManagedProcessSessionTests {
+    /// §103 复测：进程边跑边打印时，日志必须在一个 flush 周期内（≈100ms）送达回调，
+    /// 而不是压到进程退出才一次性出现。
+    func testStreamingArrivesDuringProcessLifetime() throws {
+        // 每秒打印一行、共 4 行；打印完成后自身退出
+        let session = try ManagedProcessSession(
+            configKey: "test", configName: "test",
+            plan: makePlan(
+                executable: "/usr/bin/python3",
+                arguments: ["-c", "import time\nfor i in range(4):\n    print(f'line-{i}', flush=True)\n    time.sleep(1)\n"]
+            )
+        )
+        var arrivals: [(text: String, at: TimeInterval)] = []
+        let lock = NSLock()
+        session.onLogLines = { batch in
+            lock.lock()
+            let now = Date().timeIntervalSinceReferenceDate
+            arrivals += batch.map { ($0.text, now) }
+            lock.unlock()
+        }
+        let startedAt = Date().timeIntervalSinceReferenceDate
+        session.start()
+        XCTAssertTrue(session.waitUntilExit(timeout: 15))
+        Thread.sleep(forTimeInterval: 0.5) // 等最后一个 flush 周期
+
+        lock.lock()
+        defer { lock.unlock() }
+        let lines = arrivals.filter { $0.text.hasPrefix("line-") }
+        XCTAssertEqual(lines.count, 4, "4 行都应送达，实际：\(arrivals.map(\.text))")
+        for (index, arrival) in lines.enumerated() {
+            // line-i 在进程启动后第 i 秒打印；超过 +2s 才到就说明流式断了
+            let delay = arrival.at - startedAt - Double(index)
+            XCTAssertLessThan(delay, 2.0, "line-\(index) 迟到 \(delay)s，日志被攒到退出才吐")
+        }
+    }
+}

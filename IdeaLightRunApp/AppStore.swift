@@ -59,6 +59,53 @@ final class AppStore: ObservableObject {
         return selectedProject?.result?.configurations.first { $0.uniqueKey == key }
     }
 
+    /// 侧栏标识：把该项目下所有配置会话与项目级构建汇总成一个颜色。
+    /// 优先级 failed ＞ busy ＞ running —— 出事要盖过"还在跑"，
+    /// 因为用户扫一眼左侧列表就是为了找需要处理的项。
+    enum ProjectActivity: Equatable {
+        case none
+        case running
+        case busy
+        case failed
+
+        var title: String? {
+            switch self {
+            case .none: return nil
+            case .running: return "有服务正在运行"
+            case .busy: return "正在编译或启动"
+            case .failed: return "最近一次运行失败"
+            }
+        }
+    }
+
+    func activity(forProject projectID: String) -> ProjectActivity {
+        var activity: ProjectActivity = .none
+        for model in sessions.values where model.projectPath == projectID {
+            switch model.state {
+            case .failed:
+                return .failed
+            case .running:
+                activity = .running
+            case .exited, .cancelled:
+                break
+            default:
+                // preparing / building / resolvingClasspath / starting / stopping
+                if activity == .none { activity = .busy }
+            }
+        }
+        if let build = builds[projectID] {
+            switch build.phase {
+            case .failed:
+                return .failed
+            case .running, .stopping:
+                if activity == .none { activity = .busy }
+            case .succeeded, .cancelled:
+                break
+            }
+        }
+        return activity
+    }
+
     /// 当前项目的最近一次构建（菜单项"停止构建"用）
     var currentBuild: ProjectBuildModel? {
         selectedProjectID.flatMap { builds[$0] }
