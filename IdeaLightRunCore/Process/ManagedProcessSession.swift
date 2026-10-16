@@ -18,12 +18,18 @@ public final class ManagedProcessSession {
     /// 回调可能来自后台线程，调用方负责线程切换。
     public var onState: ((ProcessState) -> Void)?
     public var onLogLines: (([LogLine]) -> Void)?
+    /// §P0-2: 进程真正 run() 成功后才回调；此前 pid 属性不可信，UI 不得提前读取。
+    public var onStarted: ((Int32) -> Void)?
 
     private let lock = NSLock()
     private var stateValue: ProcessState = .starting
     private var splitters: [LogStream: LineSplitter] = [:]
     private var exitStatusValue: Int32?
     private var hasTerminated = false
+    /// §P0-3: Stop 落在 init 与 run() 之间时先登记，start() 跑起进程后立刻终止。
+    private var stopRequested = false
+    /// process.run() 是否已成功过；决定 stop()/forceKill() 能否向真实 PID 发信号。
+    private var hasStarted = false
     /// 收尾只生效一次；只在 flushQueue 上读写，无需加锁。
     private var didFinish = false
 
@@ -99,8 +105,22 @@ public final class ManagedProcessSession {
             return
         }
 
+        // §P0-2: PID 只在进程真正启动后产生并发布；.running 的迁移必须在锁内
+        // 与 stopRequested 一起判定，否则"Stop 已落、running 晚到"会把终态覆盖回运行态。
+        lock.lock()
+        hasStarted = true
+        let pendingStop = stopRequested
+        if !pendingStop { stateValue = .running }
+        lock.unlock()
+
         logBuffer.append(LogLine(stream: .system, text: "[IdeaLightRun] 进程已启动，PID \(process.processIdentifier)"))
-        setState(.running)
+        onStarted?(process.processIdentifier)
+        if pendingStop {
+            logBuffer.append(LogLine(stream: .system, text: "[IdeaLightRun] 启动期间收到停止请求，正在终止进程"))
+            ProcessTree.terminate(root: process.processIdentifier, escalationSeconds: 3)
+        } else {
+            onState?(.running)
+        }
 
         // 退出状态以进程本身为准；管道只决定日志何时读完。
         process.terminationHandler = { [weak self] terminatedProcess in
@@ -124,23 +144,32 @@ public final class ManagedProcessSession {
         }
     }
 
-    /// §33: 先 SIGTERM；仍存活则保持 .stopping，等待用户 Force Kill。
+    /// §33/§5.5: 统一停止流程——SIGTERM 整棵进程树（`mvn → java → helper` 不留孤儿），
+    /// 3 秒后仍有幸存者自动升级 SIGKILL。.starting 期间也可停止：
+    /// 先登记请求，start() 在进程跑起来后立即终止它。
     public func stop() {
         lock.lock()
-        guard stateValue == .running else {
+        switch stateValue {
+        case .running, .starting:
+            stateValue = .stopping
+            stopRequested = true
+            let started = hasStarted
             lock.unlock()
-            return
+            onState?(.stopping)
+            if started {
+                ProcessTree.terminate(root: process.processIdentifier, escalationSeconds: 3)
+            }
+        default:
+            lock.unlock()
         }
-        stateValue = .stopping
-        lock.unlock()
-        onState?(.stopping)
-        guard process.isRunning else { return }
-        kill(process.processIdentifier, SIGTERM)
     }
 
     public func forceKill() {
-        guard process.isRunning else { return }
-        kill(process.processIdentifier, SIGKILL)
+        lock.lock()
+        let started = hasStarted
+        lock.unlock()
+        guard started, process.isRunning else { return }
+        ProcessTree.signal(root: process.processIdentifier, sig: SIGKILL)
     }
 
     /// 用于 Restart 前等待旧进程退出（§34）。

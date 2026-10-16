@@ -22,10 +22,17 @@ public final class ProcessHandle: @unchecked Sendable {
 
     public init() {}
 
+    /// §P0-3: attach 必须尊重此前已发生的 cancel——取消先到、进程后挂上时，
+    /// 拿到进程的第一时间就终止它，不能让"已取消"的构建继续跑完。
     func attach(_ process: Process) {
         lock.lock()
         self.process = process
+        let shouldTerminate = cancelledValue
         lock.unlock()
+
+        if shouldTerminate {
+            ProcessTree.signal(root: process.processIdentifier, sig: SIGTERM)
+        }
     }
 
     func detach() {
@@ -34,23 +41,24 @@ public final class ProcessHandle: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// 发送 SIGTERM；对已退出的进程无副作用。
+    /// 发送 SIGTERM（含整棵子进程树）；对已退出的进程无副作用。
+    /// 3 秒后仍有幸存者自动升级 SIGKILL（§5.5 统一停止流程）。
     public func terminate() {
         lock.lock()
         cancelledValue = true
         let process = self.process
         lock.unlock()
         guard let process, process.isRunning else { return }
-        kill(process.processIdentifier, SIGTERM)
+        ProcessTree.terminate(root: process.processIdentifier, escalationSeconds: 3)
     }
 
-    /// 发送 SIGKILL（构建进程卡死时的兜底）。
+    /// 发送 SIGKILL（构建进程卡死时的兜底），作用于整棵子进程树。
     public func forceKill() {
         lock.lock()
         cancelledValue = true
         let process = self.process
         lock.unlock()
         guard let process, process.isRunning else { return }
-        kill(process.processIdentifier, SIGKILL)
+        ProcessTree.signal(root: process.processIdentifier, sig: SIGKILL)
     }
 }

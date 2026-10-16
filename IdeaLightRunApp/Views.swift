@@ -359,10 +359,12 @@ struct ConfigurationListView: View {
             } else {
                 List(selection: $store.selectedConfigurationKey) {
                     ForEach(result.configurations) { config in
+                        let model = store.displaySession(projectID: project.id, configKey: config.uniqueKey)
                         ConfigurationRow(
                             config: config,
-                            runtimeState: store.sessions[config.uniqueKey]?.state,
-                            ports: store.sessions[config.uniqueKey]?.listeningPorts ?? []
+                            runtimeState: model?.state,
+                            ports: model?.listeningPorts ?? [],
+                            instanceCount: store.activeSessions(projectID: project.id, configKey: config.uniqueKey).count
                         )
                         .tag(config.uniqueKey)
                     }
@@ -371,12 +373,14 @@ struct ConfigurationListView: View {
                 .contextMenu(forSelectionType: String.self) { keys in
                     if let key = keys.first {
                         // 可用性跟随运行态，避免点了没反应的菜单项
-                        let model = store.sessions[key]
-                        Button("运行 ▶") { store.run(configKey: key) }
-                            .disabled(model.map { !$0.state.isTerminal } ?? false)
-                        Button("重启 ↻") { store.restart(configKey: key) }
+                        let model = store.displaySession(projectID: project.id, configKey: key)
+                        let config = project.result?.configurations.first { $0.uniqueKey == key }
+                        let launchable = config.map { store.canLaunch(projectID: project.id, config: $0) } ?? false
+                        Button("运行 ▶") { store.run(configKey: key, projectID: project.id) }
+                            .disabled(!launchable)
+                        Button("重启 ↻") { store.restart(configKey: key, projectID: project.id) }
                             .disabled(model.map { $0.isBuilding || $0.state == .stopping } ?? false)
-                        Button("停止 ■", role: .destructive) { store.stop(configKey: key) }
+                        Button("停止 ■", role: .destructive) { store.stop(configKey: key, projectID: project.id) }
                             .disabled(model.map { !$0.state.isActive || $0.state == .stopping } ?? true)
                     }
                 } primaryAction: { keys in
@@ -503,6 +507,8 @@ struct ConfigurationRow: View {
     let runtimeState: ProcessState?
     /// 运行中探测到的监听端口；显示在状态文字左侧。
     var ports: [Int] = []
+    /// 并行运行的活跃实例数（allowParallelRun 配置可以同时跑多个）。
+    var instanceCount: Int = 0
 
     var body: some View {
         // 空间分配优先级：状态（最右，始终完整）＞ 标题/副标题 ＞ 端口 ＞ 空白。
@@ -617,6 +623,8 @@ struct ConfigurationDetailView: View {
     @State private var resolvedModuleDirectory: URL?
     @State private var resolvedWorkDir: String?
     @State private var detailTab: DetailTab = .info
+    /// 多实例（P0-6 allowParallelRun）时控制台显示哪个会话；存 instanceID 字符串。
+    @State private var consoleSessionInstanceID: String?
 
     enum DetailTab: String, CaseIterable {
         case info = "信息"
@@ -651,13 +659,13 @@ struct ConfigurationDetailView: View {
         switch detailTab {
         case .info:
             if let config = store.selectedConfiguration, let result = project.result {
-                infoDetail(config: config, result: result)
+                infoDetail(project: project, config: config, result: result)
             } else {
                 emptyPane(icon: "doc.text.magnifyingglass", text: "选择一个配置查看详情")
             }
         case .console:
-            if let config = store.selectedConfiguration, let model = store.sessions[config.uniqueKey] {
-                LogConsoleView(model: model)
+            if let config = store.selectedConfiguration {
+                consoleDetail(project: project, config: config)
             } else {
                 emptyPane(icon: "terminal", text: "尚未启动，无运行日志")
             }
@@ -676,6 +684,57 @@ struct ConfigurationDetailView: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: 控制台（P0-6 多实例感知）
+
+    @ViewBuilder
+    private func consoleDetail(project: ProjectEntry, config: RunConfiguration) -> some View {
+        let sessions = store.sessionModels(projectID: project.id, configKey: config.uniqueKey)
+        if sessions.isEmpty {
+            emptyPane(icon: "terminal", text: "尚未启动，无运行日志")
+        } else if sessions.count == 1, let only = sessions.first {
+            LogConsoleView(model: only)
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                instancePicker(sessions: sessions)
+                Divider()
+                if let selected = selectedConsoleSession(in: sessions) {
+                    LogConsoleView(model: selected)
+                }
+            }
+        }
+    }
+
+    private func selectedConsoleSession(in sessions: [RunningProcessModel]) -> RunningProcessModel? {
+        if let id = consoleSessionInstanceID, let match = sessions.first(where: { $0.id == id }) {
+            return match
+        }
+        return sessions.first
+    }
+
+    private func instancePicker(sessions: [RunningProcessModel]) -> some View {
+        Picker("", selection: Binding(
+            get: { selectedConsoleSession(in: sessions)?.id ?? "" },
+            set: { consoleSessionInstanceID = $0 }
+        )) {
+            ForEach(sessions, id: \.id) { session in
+                Text(consoleInstanceLabel(session)).tag(session.id)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func consoleInstanceLabel(_ session: RunningProcessModel) -> String {
+        let started = session.startedAt.formatted(date: .omitted, time: .standard)
+        if let pid = session.pid {
+            return "PID \(pid) · \(started)"
+        }
+        return "\(session.state.displayText) · \(started)"
     }
 
     // MARK: 构建页（IDEA 的 Build 窗口）
@@ -745,7 +804,7 @@ struct ConfigurationDetailView: View {
 
             HStack(spacing: 10) {
                 if let config = store.selectedConfiguration {
-                    configActions(config: config)
+                    configActions(config: config, project: project)
                 }
                 Spacer(minLength: 8)
                 Picker("", selection: $detailTab) {
@@ -762,27 +821,29 @@ struct ConfigurationDetailView: View {
     }
 
     @ViewBuilder
-    private func configActions(config: RunConfiguration) -> some View {
-        let model = store.sessions[config.uniqueKey]
+    private func configActions(config: RunConfiguration, project: ProjectEntry) -> some View {
+        let model = store.displaySession(projectID: project.id, configKey: config.uniqueKey)
         // §23: 只读 Core 声明的类型支持级别，不在这里判断构建系统——
         // 缺 Maven / 不支持的类型由 Core 在点击时给出明确错误。
-        let launchable = config.type.supportLevel == .supported
+        // P0-6: allowParallelRun=false 时同一配置同时只允许一个活动实例，
+        // 由 AppStore.canLaunch 统一裁决，视图只消费结果。
+        let launchable = store.canLaunch(projectID: project.id, config: config)
         // IDEA 行为：构建期与运行期 Stop 都可用
         let stopEnabled = model?.state.isActive == true && model?.state != .stopping
 
         HStack(spacing: 10) {
             Button {
-                store.run(configKey: config.uniqueKey)
+                store.run(configKey: config.uniqueKey, projectID: project.id)
                 detailTab = .console
             } label: {
                 Label("Run", systemImage: "play.fill")
             }
             .keyboardShortcut("r", modifiers: .command)
             .help(launchable ? "编译并启动" : "IdeaLightRun 暂不能启动这类配置")
-            .disabled(!launchable || model != nil && !model!.state.isTerminal)
+            .disabled(!launchable)
 
             Button {
-                store.stop(configKey: config.uniqueKey)
+                store.stop(configKey: config.uniqueKey, projectID: project.id)
             } label: {
                 Label("Stop", systemImage: "stop.fill")
             }
@@ -792,7 +853,7 @@ struct ConfigurationDetailView: View {
 
             if model?.state == .stopping {
                 Button(role: .destructive) {
-                    store.forceKill(configKey: config.uniqueKey)
+                    store.forceKill(configKey: config.uniqueKey, projectID: project.id)
                 } label: {
                     Label("Force Kill", systemImage: "xmark.octagon.fill")
                 }
@@ -800,7 +861,7 @@ struct ConfigurationDetailView: View {
             }
 
             Button {
-                store.restart(configKey: config.uniqueKey)
+                store.restart(configKey: config.uniqueKey, projectID: project.id)
                 detailTab = .console
             } label: {
                 Label("Restart", systemImage: "arrow.triangle.2.circlepath")
@@ -816,10 +877,10 @@ struct ConfigurationDetailView: View {
 
     // MARK: 信息页
 
-    private func infoDetail(config: RunConfiguration, result: ScanResult) -> some View {
+    private func infoDetail(project: ProjectEntry, config: RunConfiguration, result: ScanResult) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                if let model = store.sessions[config.uniqueKey] {
+                if let model = store.displaySession(projectID: project.id, configKey: config.uniqueKey) {
                     runtimeBanner(model: model)
                 }
 

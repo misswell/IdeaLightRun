@@ -30,8 +30,9 @@ final class AppStore: ObservableObject {
     /// 顶栏垃圾桶与侧栏右键菜单都先置这里，由 RootView 统一弹确认，
     /// 不在各视图各写一份（避免两条入口行为不一致）。
     @Published var projectPendingRemoval: ProjectEntry?
-    /// configKey → 运行会话（含构建阶段）
-    @Published private(set) var sessions: [String: RunningProcessModel] = [:]
+    /// 运行会话（含构建阶段），键 = 项目 + 配置 + 实例（§P0-1）。
+    /// 以前键只是 configKey，两个项目里的同名配置会互相覆盖会话。
+    @Published private(set) var sessions: [RunSessionID: RunningProcessModel] = [:]
     /// projectID → 最近一次项目级构建（IDEA 的 Build / Rebuild Project）
     @Published private(set) var builds: [String: ProjectBuildModel] = [:]
     /// 每次开始构建自增，UI 据此切到"构建"页看输出
@@ -61,6 +62,32 @@ final class AppStore: ObservableObject {
     var selectedConfiguration: RunConfiguration? {
         guard let key = selectedConfigurationKey else { return nil }
         return selectedProject?.result?.configurations.first { $0.uniqueKey == key }
+    }
+
+    // MARK: - 会话查询（§P0-1）
+
+    /// 某项目某配置的全部会话实例，最新在前。
+    func sessionModels(projectID: String, configKey: String) -> [RunningProcessModel] {
+        sessions.values
+            .filter { $0.projectPath == projectID && $0.configKey == configKey }
+            .sorted { $0.startedAt > $1.startedAt }
+    }
+
+    /// 仍在运行（未到终态）的实例。
+    func activeSessions(projectID: String, configKey: String) -> [RunningProcessModel] {
+        sessionModels(projectID: projectID, configKey: configKey).filter { !$0.state.isTerminal }
+    }
+
+    /// 界面单模型展示用：优先还在跑的实例，否则最近一次（含失败）。
+    func displaySession(projectID: String, configKey: String) -> RunningProcessModel? {
+        let models = sessionModels(projectID: projectID, configKey: configKey)
+        return models.first { !$0.state.isTerminal } ?? models.first
+    }
+
+    /// 能否再启动一个实例：不并行运行的配置同一时刻只允许一个活跃实例（§P0-6）。
+    func canLaunch(projectID: String, config: RunConfiguration) -> Bool {
+        guard config.type.supportLevel == .supported else { return false }
+        return config.allowParallelRun || activeSessions(projectID: projectID, configKey: config.uniqueKey).isEmpty
     }
 
     /// 侧栏标识：把该项目下所有配置会话与项目级构建汇总成一个颜色。
@@ -184,6 +211,10 @@ final class AppStore: ObservableObject {
 
     // MARK: - 运行管理（§32–§35）
 
+    /// 启动一个新实例。
+    /// - `allowParallelRun=false`（IDEA 默认）：该配置已有活跃实例时拒绝再次启动，
+    ///   UI 的 ▶ 也会禁用；要换代码重启请用 Restart。
+    /// - `allowParallelRun=true`：每次调用都创建新实例，各自拥有 PID / 日志 / 端口。
     func run(configKey: String, projectID: String? = nil) {
         let project = projectID.flatMap { id in projects.first { $0.id == id } } ?? selectedProject
         guard let project,
@@ -192,13 +223,18 @@ final class AppStore: ObservableObject {
         }
         // §23: 这里不再判断配置类型与构建系统——能不能跑由 Core 决定，
         // 跑不了的配置会以 unsupportedConfiguration 明确报出来。
-        // §35: 已有终态会话时替换；运行/构建中由 UI 禁用 ▶
-        if let existing = sessions[configKey], !existing.state.isTerminal {
+        if !canLaunch(projectID: project.id, config: config) {
             return
         }
-        sessions.removeValue(forKey: configKey)
+        // 新实例启动时清掉同配置的历史终态模型，字典不无界增长；
+        // 活跃实例（并行运行时）不受影响。
+        for (sessionID, model) in sessions
+        where model.projectPath == project.id && model.configKey == configKey && model.state.isTerminal {
+            sessions.removeValue(forKey: sessionID)
+        }
 
-        let model = RunningProcessModel(configKey: configKey, configName: config.name, projectPath: project.id)
+        let sessionID = RunSessionID(projectID: project.id, configurationID: configKey)
+        let model = RunningProcessModel(sessionID: sessionID, configName: config.name)
         model.onChange = { [weak self] in
             self?.objectWillChange.send()
         }
@@ -206,7 +242,7 @@ final class AppStore: ObservableObject {
         model.onRestartNeeded = { [weak self] in
             self?.run(configKey: configKey, projectID: project.id)
         }
-        sessions[configKey] = model
+        sessions[sessionID] = model
         selectedConfigurationKey = configKey
 
         let projectRoot = project.url
@@ -238,10 +274,8 @@ final class AppStore: ObservableObject {
                     logBuffer: model.logBuffer
                 )
                 await model.attach(session: session)
-                if handle.isCancelled {
-                    await model.setPipelineState(.cancelled)
-                    return
-                }
+                // attach 与 start 之间的 Stop 由会话内部登记（stopRequested），
+                // 进程跑起来后立即终止，不会漏停（§P0-3）。
                 session.start()
             } catch let error as IdeaLightRunError {
                 if case .launchCancelled = error {
@@ -264,26 +298,33 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// §33: 构建期 Stop → 终止 Maven 构建；运行期 Stop → SIGTERM，
-    /// 3 秒后仍存活由用户决定 Force Kill。
-    func stop(configKey: String) {
-        guard let model = sessions[configKey], !model.state.isTerminal else { return }
-        // model.state 经主线程异步投递，构建期/运行期的边界上可能仍是旧值；
-        // 两个通道都发一次，避免 Stop 落空（已结束的句柄是 no-op）。
-        model.buildHandle?.terminate()
-        model.session?.stop()
+    /// §33: 构建期 Stop → 终止 Maven 构建；运行期 Stop → SIGTERM 整棵进程树，
+    /// 3 秒后仍有幸存者自动升级 SIGKILL。作用于该配置的全部活跃实例。
+    func stop(configKey: String, projectID: String? = nil) {
+        let id = projectID ?? selectedProjectID
+        guard let id else { return }
+        for model in activeSessions(projectID: id, configKey: configKey) {
+            // model.state 经主线程异步投递，构建期/运行期的边界上可能仍是旧值；
+            // 两个通道都发一次，避免 Stop 落空（已结束的句柄是 no-op）。
+            model.buildHandle?.terminate()
+            model.session?.stop()
+        }
     }
 
-    func forceKill(configKey: String) {
-        guard let model = sessions[configKey], !model.state.isTerminal else { return }
-        model.session?.forceKill()
-        model.buildHandle?.forceKill()
+    func forceKill(configKey: String, projectID: String? = nil) {
+        let id = projectID ?? selectedProjectID
+        guard let id else { return }
+        for model in sessionModels(projectID: id, configKey: configKey) where !model.state.isTerminal {
+            model.session?.forceKill()
+            model.buildHandle?.forceKill()
+        }
     }
 
-    /// §34: 等旧进程退出后再重新走完整流水线。
-    func restart(configKey: String) {
-        let projectID = sessions[configKey]?.projectPath
-        if let model = sessions[configKey], !model.state.isTerminal {
+    /// §34: 等旧实例退出后再重新走完整流水线。多实例时针对最新的活跃实例。
+    func restart(configKey: String, projectID: String? = nil) {
+        let id = projectID ?? selectedProjectID
+        guard let id else { return }
+        if let model = activeSessions(projectID: id, configKey: configKey).first {
             if model.isRunning {
                 model.pendingRestart = true
                 model.session?.stop()
@@ -291,8 +332,7 @@ final class AppStore: ObservableObject {
             // 构建期不允许重启（Stop 后可重新 Run）
             return
         }
-        sessions.removeValue(forKey: configKey)
-        run(configKey: configKey, projectID: projectID)
+        run(configKey: configKey, projectID: id)
     }
 
     // MARK: - 项目级构建（IDEA 的 Build / Rebuild Project）
@@ -377,14 +417,50 @@ final class AppStore: ObservableObject {
         rescan(entryID: entry.id)
     }
 
+    /// §P0-5: 移除项目前必须先停干净该项目拉起的所有进程：
+    /// Stop 全部会话与项目级构建 → 等待落终态 → 仍存活则强杀 → 确认后再删除。
+    /// 绝不能出现"项目删了、后台进程还在跑"。
     func removeProject(id: String) {
-        // 停掉该项目正在运行的服务，并丢弃其会话（否则 configKey 会残留到同名项目重新添加时）
-        let ownedKeys = sessions.compactMap { $0.value.projectPath == id ? $0.key : nil }
-        for key in ownedKeys {
-            stop(configKey: key)
-            sessions.removeValue(forKey: key)
+        let owned = sessions.values.filter { $0.projectPath == id }
+        for model in owned {
+            model.buildHandle?.terminate()
+            model.session?.stop()
         }
         builds[id]?.handle?.terminate()
+
+        // model.state 由 Task { @MainActor } 异步投递，阻塞等待期间不会更新；
+        // 与 stopActiveWork 一样轮询后台线程直接维护的会话状态。
+        func allStopped() -> Bool {
+            let sessionAlive = owned.contains { model in
+                if let session = model.session { return !session.state.isTerminal }
+                return model.buildHandle?.hasLiveProcess ?? false
+            }
+            let buildAlive = builds[id]?.handle?.hasLiveProcess ?? false
+            return !sessionAlive && !buildAlive
+        }
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline, !allStopped() {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        // 等不动的强杀
+        for model in owned {
+            if let session = model.session {
+                if !session.state.isTerminal { session.forceKill() }
+            } else {
+                model.buildHandle?.forceKill()
+            }
+        }
+        if builds[id]?.handle?.hasLiveProcess == true {
+            builds[id]?.handle?.forceKill()
+        }
+        let killDeadline = Date().addingTimeInterval(1)
+        while Date() < killDeadline, !allStopped() {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+
+        for (sessionID, model) in sessions where model.projectPath == id {
+            sessions.removeValue(forKey: sessionID)
+        }
         builds.removeValue(forKey: id)
         projects.removeAll { $0.id == id }
         if selectedProjectID == id {

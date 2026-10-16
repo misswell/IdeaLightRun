@@ -3,15 +3,21 @@ import IdeaLightRunCore
 
 /// GUI 侧的单次运行模型：包装 ManagedProcessSession，回调统一切回主线程。
 /// 日志经 LogRingBuffer（§37 上限）+ 100ms 批量（§103）进入 NSTextView 控制台。
+/// 一个模型对应一个运行实例（RunSessionID），同一配置可并行多个实例（allowParallelRun）。
 @MainActor
 final class RunningProcessModel: LogViewModel, Identifiable {
     nonisolated let id: String
-    let configKey: String
+    /// 本实例的身份：项目 + 配置 + 实例 UUID（§P0-1）。
+    let sessionID: RunSessionID
+    var configKey: String { sessionID.configurationID }
+    var projectPath: String { sessionID.projectID }
     let configName: String
-    let projectPath: String
+    /// 实例启动时刻；多实例列表按它倒序展示。
+    let startedAt = Date()
     let logBuffer = LogRingBuffer()
 
     @Published private(set) var state: ProcessState = .preparing
+    /// 进程真正 run() 成功后才有的 PID（onStarted 回调写入，§P0-2）。
     @Published private(set) var pid: Int32?
     /// 进程正在 LISTEN 的 TCP 端口（本机 lsof 探测，仅进程存活期间轮询）。
     @Published private(set) var listeningPorts: [Int] = []
@@ -29,11 +35,10 @@ final class RunningProcessModel: LogViewModel, Identifiable {
     /// 永远冻结在 Run 那一刻的快照上（进程已退出仍显示"准备中"）。
     var onChange: (() -> Void)?
 
-    init(configKey: String, configName: String, projectPath: String) {
-        self.configKey = configKey
+    init(sessionID: RunSessionID, configName: String) {
+        self.sessionID = sessionID
         self.configName = configName
-        self.projectPath = projectPath
-        self.id = configKey
+        self.id = sessionID.instanceID.uuidString
         super.init()
     }
 
@@ -65,10 +70,15 @@ final class RunningProcessModel: LogViewModel, Identifiable {
     }
 
     /// 构建完成后挂接真实进程会话。
+    /// PID 不在这里读取：会话在 onStarted（run() 成功）后才发布 PID（§P0-2）。
     func attach(session: ManagedProcessSession) {
         self.session = session
-        setPID(session.pid)
         startPortPolling()
+        session.onStarted = { [weak self] newPID in
+            Task { @MainActor [weak self] in
+                self?.setPID(newPID)
+            }
+        }
         session.onLogLines = { [weak self] batch in
             Task { @MainActor [weak self] in
                 self?.appendLog(batch)
