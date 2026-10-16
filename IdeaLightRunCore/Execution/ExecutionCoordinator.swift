@@ -43,6 +43,8 @@ public struct ExecutionCoordinator: Sendable {
         gateOwner: BuildGate.Owner?,
         visiting: [String]
     ) async throws -> ExecutableLaunchPlan {
+        // §P0-10: 清掉上次异常遗留的启动产物（@argfile / manifest jar）
+        LaunchArtifactStore.cleanupOrphans()
         try Self.ensureRunnable(config)
         let scan = try IntelliJProjectScanner().scan(projectRoot: projectRoot)
 
