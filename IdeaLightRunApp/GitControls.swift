@@ -14,9 +14,16 @@ struct GitControls: View {
         Group {
             switch model.status {
             case .idle:
-                EmptyView()
+                // 非 git 仓库也占住这一行的高度：摘要条总高度在项目间来回跳更难受
+                Color.clear.frame(height: 0)
             case .loading:
-                chip(ProgressView().controlSize(.mini))
+                HStack(spacing: 5) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .foregroundStyle(.secondary)
+                    ProgressView()
+                        .controlSize(.mini)
+                        .frame(width: 14, height: 14)
+                }
             case .ready, .busy:
                 HStack(spacing: 10) {
                     branchMenu
@@ -25,6 +32,8 @@ struct GitControls: View {
                 }
             }
         }
+        // 定死区块高度：busy 态的进度圈（比文字高）不再把摘要条撑高一截
+        .frame(height: 20, alignment: .leading)
         .task { model.load() }
     }
 
@@ -85,19 +94,24 @@ struct GitControls: View {
     private var statusText: some View {
         switch model.status {
         case .busy(let text):
+            // 进度圈限在 14pt：mini 指示器自身更高，会把整行撑高
             ProgressView()
                 .controlSize(.mini)
+                .frame(width: 14, height: 14)
             Text(text)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         case .ready:
+            // git 独占一行，错误/提示放得下了：给足宽度，超出悬停看全文
             if let error = model.errorMessage {
                 Text(error)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .frame(maxWidth: 260, alignment: .leading)
+                    .frame(maxWidth: 520, alignment: .leading)
                     .help(error)
             } else if let notice = model.notice {
                 Text(notice)
@@ -105,19 +119,11 @@ struct GitControls: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .frame(maxWidth: 260, alignment: .leading)
+                    .frame(maxWidth: 520, alignment: .leading)
                     .help(notice)
             }
         default:
             EmptyView()
-        }
-    }
-
-    private func chip(_ content: some View) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: "arrow.triangle.branch")
-                .foregroundStyle(.secondary)
-            content
         }
     }
 }

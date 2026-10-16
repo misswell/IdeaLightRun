@@ -361,22 +361,26 @@ struct ProjectSummaryView: View {
     let project: ProjectEntry
 
     var body: some View {
-        HStack(spacing: 14) {
-            chip(icon: "wrench.and.screwdriver", text: buildSystemText)
-            if let jdk = project.projectJDK?.installation {
-                chip(icon: "cpu", text: "JDK \(jdk.majorVersion.map(String.init) ?? "?") · \(jdk.displayName ?? jdk.home.lastPathComponent)")
-            }
-            if let result = project.result {
-                chip(icon: "square.stack.3d.up", text: "\(result.modules.count) 模块")
+        // 两行布局：信息芯片 + 构建按钮一行，git 分支/拉取独占一行。
+        // git 的加载状态（进度圈 + 长错误信息）不再挤占信息行，高度也恒定。
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 14) {
+                chip(icon: "wrench.and.screwdriver", text: buildSystemText)
+                if let jdk = project.projectJDK?.installation {
+                    chip(icon: "cpu", text: "JDK \(jdk.majorVersion.map(String.init) ?? "?") · \(jdk.displayName ?? jdk.home.lastPathComponent)")
+                }
+                if let result = project.result {
+                    chip(icon: "square.stack.3d.up", text: "\(result.modules.count) 模块")
+                }
+                Spacer()
+                buildControls
             }
             // .id 让切换项目时重建模型，重新读新项目的分支
             GitControls(project: project)
                 .id(project.id)
-            Spacer()
-            buildControls
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
     }
 
     /// IDEA 的 Build Project / Rebuild Project 与 Maven clean：项目级、作用于整个 reactor。
