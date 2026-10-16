@@ -44,8 +44,9 @@ public enum ProjectBuildKind: String, CaseIterable, Sendable {
 /// - Clean：只清空产物（`clean`），不编译
 ///
 /// 与启动流水线共用 `ProjectToolchain`（§4）与 `BuildGate`（§42）。
-/// classpath 缓存不随 Rebuild / Clean 失效：clean 只删 `target/`，依赖坐标由 §57 的
-/// pom/JDK/settings fingerprint 守护；缓存重解另有 §69 的 Rebuild Classpath。
+/// classpath 缓存不随 Rebuild / Clean 主动删除：clean 只删 `target/`，依赖坐标由 §57 的
+/// pom/JDK/settings fingerprint 守护；clean 后条目已不存在，命中前按 §P0-7 校验条目
+/// 存在性自动失效并重解（自修复），无需用户手动 Rebuild Classpath（§69 仍可手动清）。
 public struct ProjectBuilder: Sendable {
     public init() {}
 

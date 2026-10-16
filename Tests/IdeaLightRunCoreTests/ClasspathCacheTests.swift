@@ -46,8 +46,7 @@ final class ClasspathCacheTests: XCTestCase {
     }
 
     /// §19/§57: pom 内容变化 → fingerprint 变化
-    func testFingerprintChangesWhenPomChanges() throws {
-        let pom = tempProject.appendingPathComponent("pom.xml")
+    func testFingerprintChangesWhenPomChanges() throws {        let pom = tempProject.appendingPathComponent("pom.xml")
         try "<project/>".write(to: pom, atomically: true, encoding: .utf8)
         let before = ClasspathCache.mavenFingerprint(projectRoot: tempProject, reactorPoms: [pom], jdkMajor: 8)
 
@@ -102,5 +101,58 @@ final class ClasspathCacheTests: XCTestCase {
         XCTAssertTrue(normalized.contains(MavenClasspathResolver.canonicalPath(commonDir.appendingPathComponent("target/classes").path)), "common 的 SNAPSHOT jar 应替换为 target/classes")
         XCTAssertFalse(normalized.contains { $0.hasSuffix("common-1.0.0-SNAPSHOT.jar") }, "不应保留 reactor SNAPSHOT jar")
         XCTAssertTrue(normalized.contains(MavenClasspathResolver.canonicalPath(entries[0])), "外部依赖 jar 保留")
+    }
+
+    // MARK: - §P0-7 缓存可用性（条目存在性）
+
+    private func makeClassesDir() throws -> URL {
+        let dir = tempProject.appendingPathComponent("target/classes", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// 条目全部存在 + fingerprint 匹配 → 可用
+    func testValidateAcceptsCacheWithExistingEntries() throws {
+        let classes = try makeClassesDir()
+        let validity = ClasspathCache.validate(
+            CachedClasspath(module: "app", entries: [classes.path], fingerprint: "f", resolvedAt: Date()),
+            fingerprint: "f"
+        )
+        XCTAssertEqual(validity, .usable)
+    }
+
+    /// clean 只删 target/、pom 未变（fingerprint 不变）：缓存必须判为条目缺失，
+    /// 而不是命中指向已删产物的死路径。
+    func testValidateRejectsCacheAfterCleanRemovedEntries() throws {
+        let classes = try makeClassesDir()
+        let cached = CachedClasspath(module: "app", entries: [classes.path], fingerprint: "f", resolvedAt: Date())
+        XCTAssertEqual(ClasspathCache.validate(cached, fingerprint: "f"), .usable)
+
+        try FileManager.default.removeItem(at: classes) // 模拟 clean
+        guard case .entriesMissing(let missing) = ClasspathCache.validate(cached, fingerprint: "f") else {
+            return XCTFail("clean 后必须报条目缺失，实际：\(ClasspathCache.validate(cached, fingerprint: "f"))")
+        }
+        XCTAssertEqual(missing, [classes.path])
+    }
+
+    /// fingerprint 不匹配仍报 stale（P0-7 只加强条目校验，不改 fingerprint 语义）
+    func testValidateRejectsStaleFingerprint() throws {
+        let classes = try makeClassesDir()
+        let validity = ClasspathCache.validate(
+            CachedClasspath(module: "app", entries: [classes.path], fingerprint: "old", resolvedAt: Date()),
+            fingerprint: "new"
+        )
+        XCTAssertEqual(validity, .stale)
+    }
+
+    /// 空缓存不可用
+    func testValidateRejectsEmptyEntries() {
+        XCTAssertEqual(
+            ClasspathCache.validate(
+                CachedClasspath(module: "app", entries: [], fingerprint: "f", resolvedAt: Date()),
+                fingerprint: "f"
+            ),
+            .empty
+        )
     }
 }

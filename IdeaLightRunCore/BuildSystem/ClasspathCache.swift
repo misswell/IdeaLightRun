@@ -98,6 +98,30 @@ public enum ClasspathCache {
         SHA256.hash(data: Data(string.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    // MARK: - §P0-7 缓存可用性校验
+
+    /// 缓存可用性：fingerprint 匹配之外，条目还必须真实存在。
+    /// `clean` 只删 `target/`、不动 pom——fingerprint 不变；只查 fingerprint 会
+    /// 命中指向已删产物的缓存，启动直接 ClassNotFoundException。
+    public enum CacheValidity: Equatable, Sendable {
+        case usable
+        /// pom / .mvn / wrapper / settings.xml / JDK 变化。
+        case stale
+        /// 部分或全部条目在磁盘上已不存在（clean、手删 target/ 等）。
+        case entriesMissing([String])
+        /// 缓存内容为空或损坏。
+        case empty
+    }
+
+    /// fingerprint 匹配 + 每个条目在磁盘上真实存在才算命中（正确性优先于缓存，
+    /// §24 约束 6）；否则视为 miss，由调用方重新解析并回写缓存（自修复）。
+    public static func validate(_ cached: CachedClasspath, fingerprint: String) -> CacheValidity {
+        guard !cached.entries.isEmpty else { return .empty }
+        guard cached.fingerprint == fingerprint else { return .stale }
+        let missing = cached.entries.filter { !FileManager.default.fileExists(atPath: $0) }
+        return missing.isEmpty ? .usable : .entriesMissing(missing)
+    }
+
     /// §57: Maven fingerprint = 所有 reactor pom 内容 + .mvn 配置 + wrapper properties
     /// + ~/.m2/settings.xml 元数据 + JDK major。
     public static func mavenFingerprint(projectRoot: URL, reactorPoms: [URL], jdkMajor: Int?) -> String {

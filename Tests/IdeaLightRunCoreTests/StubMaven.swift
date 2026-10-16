@@ -36,9 +36,18 @@ final class StubMavenProject {
     }
 
     /// 生成 mvnw 桩；`runtime` / `compile` 是两种 scope 各自要写出的 classpath 条目。
+    /// 条目里的 jar 会同步在磁盘上落地（空文件）——§P0-7 起缓存命中要求条目真实存在，
+    /// 桩项目里的假 jar 也必须是真实文件，否则热启动测试会因"条目缺失"误判为未命中。
     func installStub(runtime: [String], compile: [String]? = nil) throws {
         let stubDirectory = root.appendingPathComponent(".stub", isDirectory: true)
         try fm.createDirectory(at: stubDirectory, withIntermediateDirectories: true)
+        for entry in runtime + (compile ?? []) where entry.hasSuffix(".jar") && !fm.fileExists(atPath: entry) {
+            try fm.createDirectory(
+                at: URL(fileURLWithPath: entry).deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data().write(to: URL(fileURLWithPath: entry))
+        }
         try runtime.joined(separator: ":").write(
             to: stubDirectory.appendingPathComponent("runtime.txt"), atomically: true, encoding: .utf8
         )

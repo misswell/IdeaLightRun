@@ -112,7 +112,8 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
         guard let cached = ClasspathCache.load(projectRoot: projectRoot, variant: target.variant) else {
             return false
         }
-        return cached.fingerprint == fingerprint(reactor: collectReactor())
+        // §P0-7: fingerprint 匹配之外还要每个条目真实存在（clean 后 target/ 没了但 pom 没变）
+        return ClasspathCache.validate(cached, fingerprint: fingerprint(reactor: collectReactor())) == .usable
     }
 
     /// §3.1: 解析本身不产生编译；`withBuild` 为真时把 compile 合进同一次调用
@@ -127,15 +128,26 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
     ) throws -> [String] {
         let reactor = collectReactor()
         let current = fingerprint(reactor: reactor)
-        if let cached = ClasspathCache.load(projectRoot: projectRoot, variant: target.variant),
-           cached.fingerprint == current {
-            if withBuild {
-                // 启动前判断需要解析、真要解析时缓存却仍然新鲜（Before Launch 把 pom 改了又改回去）：
-                // 推迟掉的 Build 不能就此消失。
-                try buildModule(target, handle: handle, log: log)
+        if let cached = ClasspathCache.load(projectRoot: projectRoot, variant: target.variant) {
+            switch ClasspathCache.validate(cached, fingerprint: current) {
+            case .usable:
+                if withBuild {
+                    // 启动前判断需要解析、真要解析时缓存却仍然新鲜（Before Launch 把 pom 改了又改回去）：
+                    // 推迟掉的 Build 不能就此消失。
+                    try buildModule(target, handle: handle, log: log)
+                }
+                log(LogLine(stream: .system, text: "[IdeaLightRun] classpath 命中缓存（\(cached.entries.count) 项）"))
+                return cached.entries
+            case .entriesMissing(let missing):
+                // §P0-7 自修复：缓存指向的产物已被删除（clean / 手删 target/）。
+                // 重新解析并回写，绝不把死路径塞给 java。
+                log(LogLine(
+                    stream: .system,
+                    text: "[IdeaLightRun] 缓存的 classpath 有 \(missing.count) 项已不存在（如 clean 之后），重新解析…"
+                ))
+            case .stale, .empty:
+                break
             }
-            log(LogLine(stream: .system, text: "[IdeaLightRun] classpath 命中缓存（\(cached.entries.count) 项）"))
-            return cached.entries
         }
 
         log(LogLine(stream: .system, text: "[IdeaLightRun] 解析 runtime classpath（pom/JDK 变化或首次运行）…"))
