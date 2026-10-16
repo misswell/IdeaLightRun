@@ -1159,6 +1159,14 @@ struct LogConsoleView: View {
                         .monospacedDigit()
                 }
                 Spacer(minLength: 0)
+                Button {
+                    model.clearLogs()
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .keyboardShortcut("k", modifiers: .command)
+                .help("清空当前控制台日志（⌘K）")
             }
         }
         .controlSize(.small)
