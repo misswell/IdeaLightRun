@@ -32,7 +32,14 @@ struct ConsoleFilter: Equatable {
     var isActive: Bool { !filterText.isEmpty || stream != .all }
 
     func matches(_ line: LogLine) -> Bool {
-        if let source = stream.source, line.stream != source { return false }
+        if let source = stream.source {
+            // 「错误」档位按 IDEA 语义：stderr，或内容识别出的异常行
+            // （Spring Boot 把堆栈连同日志一起写进 stdout，只按流筛会漏掉全部报错）。
+            let inSource = source == .stderr
+                ? (line.stream == .stderr || line.kind == .error)
+                : line.stream == source
+            if !inSource { return false }
+        }
         if !filterText.isEmpty,
            line.text.range(of: filterText, options: [.caseInsensitive, .diacriticInsensitive]) == nil {
             return false

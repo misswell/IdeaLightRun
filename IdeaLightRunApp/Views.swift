@@ -1441,21 +1441,52 @@ private struct LogTextView: NSViewRepresentable {
 
     private static let timeStyle = Date.FormatStyle(date: .omitted, time: .standard)
 
+    /// 堆栈帧的链接蓝，与 IDEA 一致（新 UI 暗色 #548AF7 / 亮色 #2470B8）。
+    private static let frameColor = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0x54/255, green: 0x8A/255, blue: 0xF7/255, alpha: 1)
+            : NSColor(srgbRed: 0x24/255, green: 0x70/255, blue: 0xB8/255, alpha: 1)
+    }
+
+    /// 正文按 `LogLine.kind` 着色（IDEA 语义）：异常红、堆栈帧蓝、stderr 红；
+    /// 时间戳淡化成次要色，避免把堆栈缩进视觉上顶平。
     private static func attributed(_ line: LogLine) -> NSAttributedString {
-        let color: NSColor
-        switch line.stream {
-        case .stdout: color = .textColor
-        case .stderr: color = .systemRed
-        case .system: color = .secondaryLabelColor
-        }
         let timeText = line.timestamp.formatted(Self.timeStyle)
-        return NSAttributedString(
-            string: "\(timeText) \(line.text)\n",
+        let result = NSMutableAttributedString(
+            string: "\(timeText) ",
+            attributes: [
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .paragraphStyle: Self.paragraphStyle,
+            ]
+        )
+        let color: NSColor
+        switch line.kind {
+        case .error: color = .systemRed
+        case .frame: color = Self.frameColor
+        case .normal:
+            color = line.stream == .system ? .secondaryLabelColor : .textColor
+        }
+        result.append(NSAttributedString(
+            string: Self.displayText(line.text) + "\n",
             attributes: [
                 .foregroundColor: color,
                 .paragraphStyle: Self.paragraphStyle,
             ]
-        )
+        ))
+        return result
+    }
+
+    /// Java 堆栈帧的缩进是制表符，跟在时间戳后面视觉上只是一个空格；
+    /// 渲染时把行首制表符换成 4 空格，帧的层级一眼可见（文本内容不变，搜索不受影响）。
+    private static func displayText(_ text: String) -> String {
+        guard text.hasPrefix("\t") else { return text }
+        var index = text.startIndex
+        var indent = ""
+        while index < text.endIndex, text[index] == "\t" {
+            indent += "    "
+            index = text.index(after: index)
+        }
+        return indent + String(text[index...])
     }
 
     // MARK: 搜索匹配

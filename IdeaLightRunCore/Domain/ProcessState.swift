@@ -54,11 +54,15 @@ public struct LogLine: Sendable {
     public var timestamp: Date
     public var stream: LogStream
     public var text: String
+    /// 内容分类在行创建时算一次（§P0-11 控制台对齐 IDEA：异常红、堆栈帧蓝）。
+    /// 筛选与渲染是热路径，不能每遍历一遍就重跑一次正则（§103）。
+    public var kind: LogLineKind
 
     public init(timestamp: Date = Date(), stream: LogStream, text: String) {
         self.timestamp = timestamp
         self.stream = stream
         self.text = text
+        self.kind = LogLineClassifier.kind(stream: stream, text: text)
     }
 }
 
