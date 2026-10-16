@@ -617,24 +617,42 @@ struct ConfigurationDetailView: View {
 
     // MARK: 顶栏：操作按钮（§52）
 
+    /// 顶栏分两行：标题独占一行，操作按钮与标签页在第二行。
+    /// 挤成一行时窄窗口会把标题压成竖排（`TgTenantApplication (1)` 每字一行）。
     private func header(project: ProjectEntry) -> some View {
-        HStack(spacing: 10) {
-            if let config = store.selectedConfiguration {
-                configActions(config: config)
-            } else {
-                Text(project.name)
-                    .font(.title3.weight(.semibold))
-            }
-
-            Spacer()
-
-            Picker("", selection: $detailTab) {
-                ForEach(DetailTab.allCases, id: \.self) { tab in
-                    Text(tab.rawValue).tag(tab)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                if let config = store.selectedConfiguration {
+                    Text(config.name)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(config.name)
+                    Text(config.type.displayName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    Text(project.name)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
                 }
+                Spacer(minLength: 0)
             }
-            .pickerStyle(.segmented)
-            .frame(width: 210)
+
+            HStack(spacing: 10) {
+                if let config = store.selectedConfiguration {
+                    configActions(config: config)
+                }
+                Spacer(minLength: 8)
+                Picker("", selection: $detailTab) {
+                    ForEach(DetailTab.allCases, id: \.self) { tab in
+                        Text(tab.rawValue).tag(tab)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -650,13 +668,6 @@ struct ConfigurationDetailView: View {
         let stopEnabled = model?.state.isActive == true && model?.state != .stopping
 
         HStack(spacing: 10) {
-            Text(config.name)
-                .font(.title3.weight(.semibold))
-            Text(config.type.displayName)
-                .foregroundStyle(.secondary)
-
-            Spacer()
-
             Button {
                 store.run(configKey: config.uniqueKey)
                 detailTab = .console
@@ -696,8 +707,8 @@ struct ConfigurationDetailView: View {
             .disabled(model == nil || model?.isBuilding == true)
             .disabled(model?.state == .stopping)
         }
-        // 撑满顶栏剩余宽度，让内部 Spacer 把按钮推到右侧（标签页选择器在其右）
-        .frame(maxWidth: .infinity)
+        // 不撑满宽度：按钮组左对齐，右侧留给标签页选择器（见 `header`）。
+        .fixedSize()
     }
 
     // MARK: 信息页
@@ -962,22 +973,29 @@ struct LogConsoleView: View {
         }
     }
 
+    /// 工具条分两行：第一行搜索与跳转，第二行筛选与显示选项。
+    /// 挤成一行时窄窗口会把两个输入框都截成「筛选：过滤…」。
     private var filterBar: some View {
-        HStack(spacing: 10) {
-            searchField
-            navigationControls
-            filterField
-            streamPicker
-            Toggle("换行", isOn: $wrapText)
-                .toggleStyle(.checkbox)
-                .help("开启后长行自动折行；默认关闭，长行横向滚动查看")
-            if model.displayFilter.isActive {
-                Text("\(model.visibleLineCount) / \(model.lines.count) 行")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+        VStack(spacing: 6) {
+            HStack(spacing: 10) {
+                searchField
+                navigationControls
+                Spacer(minLength: 0)
             }
-            Spacer()
+            HStack(spacing: 10) {
+                filterField
+                streamPicker
+                Toggle("换行", isOn: $wrapText)
+                    .toggleStyle(.checkbox)
+                    .help("开启后长行自动折行；默认关闭，长行横向滚动查看")
+                if model.displayFilter.isActive {
+                    Text("\(model.visibleLineCount) / \(model.lines.count) 行")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                Spacer(minLength: 0)
+            }
         }
         .controlSize(.small)
     }
@@ -1009,7 +1027,7 @@ struct LogConsoleView: View {
         .padding(.vertical, 3)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor)))
         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
-        .frame(minWidth: 100, maxWidth: 170)
+        .frame(minWidth: 120, maxWidth: 260)
         .help("高亮匹配内容，不改变显示的行")
     }
 
@@ -1074,7 +1092,7 @@ struct LogConsoleView: View {
         .padding(.vertical, 3)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .controlBackgroundColor)))
         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
-        .frame(minWidth: 90, maxWidth: 160)
+        .frame(minWidth: 120, maxWidth: 260)
         .help("只显示包含关键词的行（可与来源筛选叠加）")
     }
 
