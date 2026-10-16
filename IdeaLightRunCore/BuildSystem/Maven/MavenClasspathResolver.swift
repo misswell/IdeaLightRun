@@ -42,16 +42,21 @@ public enum MavenClasspathResolver {
 
     private static func reactorModule(forJarBasename basename: String, in reactor: [MavenModuleInfo]) -> MavenModuleInfo? {
         guard basename.hasSuffix(".jar") else { return nil }
-        for info in reactor {
-            // 版本已知 → 精确匹配；未知 → 前缀匹配（保守）
-            if let version = info.version {
-                if basename == "\(info.artifactId)-\(version).jar" {
-                    return info
-                }
-            } else if basename.hasPrefix("\(info.artifactId)-") {
+        // 先精确版本匹配（两轮都不受 reactor 顺序影响）。
+        for info in reactor where info.version != nil {
+            if basename == "\(info.artifactId)-\(info.version!).jar" {
                 return info
             }
         }
-        return nil
+        // 版本未知才前缀匹配，且取最长的 artifactId：否则父名会吃掉长名兄弟
+        // （reactor 同时有 app 与 app-api 时，"app-api-1.0.jar" 不能配给 app）。
+        var best: MavenModuleInfo?
+        for info in reactor where info.version == nil {
+            guard basename.hasPrefix("\(info.artifactId)-") else { continue }
+            if best.map({ info.artifactId.count > $0.artifactId.count }) ?? true {
+                best = info
+            }
+        }
+        return best
     }
 }

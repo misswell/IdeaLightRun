@@ -103,6 +103,69 @@ final class ClasspathCacheTests: XCTestCase {
         XCTAssertTrue(normalized.contains(MavenClasspathResolver.canonicalPath(entries[0])), "外部依赖 jar 保留")
     }
 
+    /// 父模块名是长名兄弟的前缀（tg-tenant / tg-tenant-server）：版本已知的
+    /// 精确匹配必须赢，长名兄弟的 jar 不能被父名前缀抢走换成父模块的 classes。
+    func testNormalizePrefersExactVersionOverShorterPrefix() throws {
+        let root = URL(fileURLWithPath: tempProject.path, isDirectory: true)
+        let parentDir = root.appendingPathComponent("tg-tenant", isDirectory: true)
+        let serverDir = root.appendingPathComponent("tg-tenant-server", isDirectory: true)
+        // 父模块也带 target/classes（packaging 不是 pom 的极端情况），误匹配才会真正改写
+        try FileManager.default.createDirectory(at: parentDir.appendingPathComponent("target/classes", isDirectory: true), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: serverDir.appendingPathComponent("target/classes", isDirectory: true), withIntermediateDirectories: true)
+
+        let reactor = [
+            MavenModuleInfo(
+                groupId: "com.example", artifactId: "tg-tenant", version: "3.0.7-SNAPSHOT",
+                packaging: "pom", directory: parentDir, pomURL: parentDir.appendingPathComponent("pom.xml")
+            ),
+            MavenModuleInfo(
+                groupId: "com.example", artifactId: "tg-tenant-server", version: "3.0.7-SNAPSHOT",
+                packaging: "jar", directory: serverDir, pomURL: serverDir.appendingPathComponent("pom.xml")
+            ),
+        ]
+        let entries = [
+            "/Users/me/.m2/repository/com/example/tg-tenant-server/3.0.7-SNAPSHOT/tg-tenant-server-3.0.7-SNAPSHOT.jar",
+        ]
+
+        let normalized = MavenClasspathResolver.normalize(entries: entries, reactor: reactor, targetModuleDirectory: serverDir)
+
+        XCTAssertTrue(
+            normalized.contains(MavenClasspathResolver.canonicalPath(serverDir.appendingPathComponent("target/classes").path)),
+            "server 的 jar 应替换为 server 自己的 target/classes"
+        )
+        XCTAssertFalse(
+            normalized.contains(MavenClasspathResolver.canonicalPath(parentDir.appendingPathComponent("target/classes").path)),
+            "父模块的 classes 不应混进来"
+        )
+    }
+
+    /// 版本都未知时的前缀匹配取最长 artifactId：app-api 的 jar 配给 app-api，不配给 app。
+    /// 目标模块用第三个 server（否则 app 作为目标模块自身必然进 classpath，无法区分）。
+    func testNormalizePrefixMatchPicksLongestArtifactId() throws {
+        let root = URL(fileURLWithPath: tempProject.path, isDirectory: true)
+        let appDir = root.appendingPathComponent("app", isDirectory: true)
+        let apiDir = root.appendingPathComponent("app-api", isDirectory: true)
+        let serverDir = root.appendingPathComponent("server", isDirectory: true)
+        try FileManager.default.createDirectory(at: appDir.appendingPathComponent("target/classes", isDirectory: true), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: apiDir.appendingPathComponent("target/classes", isDirectory: true), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: serverDir.appendingPathComponent("target/classes", isDirectory: true), withIntermediateDirectories: true)
+
+        let reactor = [
+            MavenModuleInfo(groupId: "com.example", artifactId: "app", version: nil, packaging: "jar", directory: appDir, pomURL: appDir.appendingPathComponent("pom.xml")),
+            MavenModuleInfo(groupId: "com.example", artifactId: "app-api", version: nil, packaging: "jar", directory: apiDir, pomURL: apiDir.appendingPathComponent("pom.xml")),
+            MavenModuleInfo(groupId: "com.example", artifactId: "server", version: nil, packaging: "jar", directory: serverDir, pomURL: serverDir.appendingPathComponent("pom.xml")),
+        ]
+        let entries = [
+            "/Users/me/.m2/repository/com/example/app-api/1.0-SNAPSHOT/app-api-1.0-SNAPSHOT.jar",
+        ]
+
+        let normalized = MavenClasspathResolver.normalize(entries: entries, reactor: reactor, targetModuleDirectory: serverDir)
+
+        XCTAssertTrue(normalized.contains(MavenClasspathResolver.canonicalPath(apiDir.appendingPathComponent("target/classes").path)), "应替换为 app-api 的 classes")
+        XCTAssertFalse(normalized.contains(MavenClasspathResolver.canonicalPath(appDir.appendingPathComponent("target/classes").path)), "不能误配给 app 模块")
+        XCTAssertFalse(normalized.contains { $0.hasSuffix("app-api-1.0-SNAPSHOT.jar") }, "不应保留 reactor SNAPSHOT jar")
+    }
+
     // MARK: - §P0-7 缓存可用性（条目存在性）
 
     private func makeClassesDir() throws -> URL {
