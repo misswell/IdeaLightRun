@@ -37,13 +37,10 @@ final class ExecutionCoordinatorTests: XCTestCase {
         XCTAssertNoThrow(try ExecutionCoordinator.ensureRunnable(jar))
     }
 
-    /// 其余类型一律明确拒绝，且说清是哪个配置的哪种类型（§24 约束 8：不许静默跳过）。
+    /// 尚未接入的类型一律明确拒绝，且说清是哪个配置的哪种类型（§24 约束 8：不许静默跳过）。
     func testOtherTypesAreRejectedWithReason() {
         let rejected: [(RunConfigurationType, String)] = [
-            (.maven, "Maven"),
             (.gradle, "Gradle"),
-            (.compound, "Compound"),
-            (.junit, "JUnit"),
             (.unknown("TestNG"), "TestNG"),
         ]
         for (type, displayName) in rejected {
@@ -53,8 +50,33 @@ final class ExecutionCoordinatorTests: XCTestCase {
                 }
                 XCTAssertTrue(detail.contains("Cfg-\(displayName)"), detail)
                 XCTAssertTrue(detail.contains(displayName), detail)
-                XCTAssertTrue(detail.contains("Application"), detail)
+                XCTAssertTrue(detail.contains("Maven"), detail)
             }
+        }
+    }
+
+    func testMavenAndJUnitConfigsWithOptionsPassTheGate() throws {
+        var maven = config(.maven, name: "Package")
+        maven.mainClass = nil
+        maven.mavenOptions = MavenRunOptions(goals: ["clean", "package"])
+        XCTAssertNoThrow(try ExecutionCoordinator.ensureRunnable(maven))
+
+        var junit = config(.junit, name: "UnitTests")
+        junit.moduleName = "app"
+        junit.junitOptions = JUnitRunOptions(target: .className("com.example.AppTest"))
+        XCTAssertNoThrow(try ExecutionCoordinator.ensureRunnable(junit))
+    }
+
+    func testMavenConfigWithoutGoalsIsRejected() {
+        var maven = config(.maven, name: "EmptyGoals")
+        maven.mainClass = nil
+        maven.mavenOptions = MavenRunOptions(goals: [])
+        XCTAssertThrowsError(try ExecutionCoordinator.ensureRunnable(maven)) { error in
+            guard case IdeaLightRunError.unsupportedConfiguration(let detail) = error else {
+                return XCTFail("期望 unsupportedConfiguration，实际 \(error)")
+            }
+            XCTAssertTrue(detail.contains("EmptyGoals"), detail)
+            XCTAssertTrue(detail.contains("goal"), detail)
         }
     }
 

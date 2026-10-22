@@ -28,6 +28,8 @@ public enum IdeaLightRunError: Error, Equatable, Sendable {
     case beforeLaunchCycle(chain: [String])
     /// §3.7: Before Launch 引用的运行配置在项目里不存在。
     case referencedConfigurationNotFound(detail: String)
+    /// JUnit 目标在模块的测试源码里没有匹配项；不能假装成功。
+    case noMatchingTests(detail: String)
 }
 
 extension IdeaLightRunError {
@@ -52,6 +54,7 @@ extension IdeaLightRunError {
         case .unresolvedIdeaContextMacro: return "配置依赖 IDEA 当前上下文"
         case .beforeLaunchCycle: return "Before Launch 循环引用"
         case .referencedConfigurationNotFound: return "找不到被引用的运行配置"
+        case .noMatchingTests: return "没有找到匹配的测试"
         }
     }
 
@@ -74,7 +77,8 @@ extension IdeaLightRunError {
              .unsupportedConfiguration(let detail),
              .unsupportedBeforeLaunch(let detail),
              .unresolvedIdeaContextMacro(let detail),
-             .referencedConfigurationNotFound(let detail):
+             .referencedConfigurationNotFound(let detail),
+             .noMatchingTests(let detail):
             return detail
         case .jarNotFound(let path):
             return "JAR 文件不存在或不是普通文件：\(path)"
@@ -125,6 +129,8 @@ extension IdeaLightRunError {
             return "请打破 Before Launch 的相互引用后再运行。"
         case .referencedConfigurationNotFound:
             return "请确认被引用的运行配置名拼写正确，且存在于同一项目。"
+        case .noMatchingTests:
+            return "请检查测试类/包/目录是否位于该模块的测试源码目录（src/test/...），或先在 IDEA 中确认测试能被发现。"
         }
     }
 

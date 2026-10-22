@@ -248,4 +248,142 @@ final class ExecutionRuntimeTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - 测试结果终态（M5）
+
+    private func makeTestRuntime(
+        _ script: String,
+        buildSystem: BuildSystemKind = .maven,
+        name: String = "Test"
+    ) throws -> ExecutionRuntime {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lr-runtime-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let executable = directory.appendingPathComponent("run")
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        let plan = TestExecutionPlan(
+            process: ExecutableLaunchPlan(
+                executable: executable,
+                arguments: [],
+                environment: ProcessInfo.processInfo.environment,
+                workingDirectory: directory
+            ),
+            buildSystem: buildSystem,
+            moduleName: "app",
+            targetDescription: "com.example.AppTest",
+            filters: ["com.example.AppTest"]
+        )
+        return try ExecutionRuntime(
+            configKey: "test::\(name)",
+            configName: name,
+            execution: .test(plan)
+        )
+    }
+
+    private func runToCompletion(
+        _ runtime: ExecutionRuntime,
+        timeout: TimeInterval = 10
+    ) -> (states: [ProcessState], logs: [String]) {
+        var states: [ProcessState] = []
+        var logs: [String] = []
+        let lock = NSLock()
+        runtime.setHandlers(
+            onState: { state in lock.lock(); states.append(state); lock.unlock() },
+            onLogLines: { batch in lock.lock(); logs += batch.map(\.text); lock.unlock() }
+        )
+        runtime.start()
+        XCTAssertTrue(runtime.waitUntilExit(timeout: timeout))
+        Thread.sleep(forTimeInterval: 0.3)
+        lock.lock()
+        defer { lock.unlock() }
+        return (states, logs)
+    }
+
+    func testPassingMavenTestsExitZero() throws {
+        let runtime = try makeTestRuntime("""
+        #!/bin/sh
+        echo "Running com.example.AppTest"
+        echo "Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.01 s"
+        echo "Results:"
+        echo "Tests run: 2, Failures: 0, Errors: 0, Skipped: 0"
+        exit 0
+        """)
+        let result = runToCompletion(runtime)
+        XCTAssertTrue(result.states.contains(.exited(0)), "\(result.states)")
+        XCTAssertFalse(result.states.contains { if case .failed = $0 { return true }; return false })
+        XCTAssertTrue(result.logs.contains { $0.contains("测试完成：共 2 个") }, "\(result.logs)")
+    }
+
+    func testPassingGradleTestsUseSummaryMarker() throws {
+        let runtime = try makeTestRuntime("""
+        #!/bin/sh
+        echo "[IdeaLightRun-Test] SUMMARY total=3 failed=0 skipped=1"
+        exit 0
+        """, buildSystem: .gradle)
+        let result = runToCompletion(runtime)
+        XCTAssertTrue(result.states.contains(.exited(0)), "\(result.states)")
+        XCTAssertTrue(result.logs.contains { $0.contains("测试完成：共 3 个") }, "\(result.logs)")
+    }
+
+    func testFailedTestsOverrideZeroExitCode() throws {
+        let runtime = try makeTestRuntime("""
+        #!/bin/sh
+        echo "Results:"
+        echo "Tests run: 2, Failures: 1, Errors: 0, Skipped: 0"
+        exit 0
+        """)
+        let result = runToCompletion(runtime)
+        XCTAssertFalse(result.states.contains(.exited(0)), "测试失败不能被退出码 0 掩盖：\(result.states)")
+        XCTAssertTrue(result.states.contains { if case .failed = $0 { return true }; return false }, "\(result.states)")
+        XCTAssertTrue(result.logs.contains { $0.contains("测试失败") }, "\(result.logs)")
+    }
+
+    func testNoMatchingTestsIsNotReportedAsSuccess() throws {
+        let runtime = try makeTestRuntime("""
+        #!/bin/sh
+        echo "[ERROR] No tests were executed!"
+        exit 1
+        """)
+        let result = runToCompletion(runtime)
+        XCTAssertTrue(result.states.contains { if case .failed = $0 { return true }; return false }, "\(result.states)")
+        XCTAssertTrue(result.logs.contains { $0.contains("没有找到匹配的测试") }, "\(result.logs)")
+    }
+
+    func testMissingSummaryFailsClosed() throws {
+        let runtime = try makeTestRuntime("""
+        #!/bin/sh
+        echo "BUILD SUCCESSFUL"
+        exit 0
+        """)
+        let result = runToCompletion(runtime)
+        XCTAssertTrue(result.states.contains { if case .failed = $0 { return true }; return false }, "\(result.states)")
+        XCTAssertTrue(result.logs.contains { $0.contains("没有取得测试结果") }, "\(result.logs)")
+    }
+
+    func testStoppingTestRunIsCancelledNotFailed() throws {
+        let runtime = try makeTestRuntime("""
+        #!/bin/sh
+        sleep 30
+        exit 0
+        """)
+        var states: [ProcessState] = []
+        let lock = NSLock()
+        runtime.setHandlers(
+            onState: { state in lock.lock(); states.append(state); lock.unlock() },
+            onLogLines: { _ in }
+        )
+        runtime.start()
+        Thread.sleep(forTimeInterval: 0.5)
+        runtime.stop()
+        XCTAssertTrue(runtime.waitUntilExit(timeout: 5))
+        Thread.sleep(forTimeInterval: 0.3)
+
+        lock.lock()
+        let observed = states
+        lock.unlock()
+        XCTAssertTrue(observed.contains(.cancelled), "\(observed)")
+        XCTAssertFalse(observed.contains { if case .failed = $0 { return true }; return false }, "用户停止不能报成测试失败：\(observed)")
+    }
 }

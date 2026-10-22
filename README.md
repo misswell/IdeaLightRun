@@ -1,8 +1,8 @@
 # IdeaLightRun
 
-独立 macOS Java 项目启动器：读取 IntelliJ IDEA 的 Run Configuration，不打开 IDEA 就能编译并启动 Java / Spring Boot 项目，也能直接启动已构建的 JAR。
+独立 macOS Java 项目启动器：读取 IntelliJ IDEA 的 Run Configuration，不打开 IDEA 就能编译并启动 Java / Spring Boot 项目，直接运行 Maven 配置与 JUnit 测试，也能直接启动已构建的 JAR。
 
-- **环境**：macOS 13 及以上（Apple Silicon / Intel 通用二进制）；本机 JDK；Application / Spring Boot 项目需是 Maven（`pom.xml` / `mvnw`）或 Gradle（`settings.gradle(.kts)` / `build.gradle(.kts)` / `gradlew`），JAR Application 只要求 JAR 已构建
+- **环境**：macOS 13 及以上（Apple Silicon / Intel 通用二进制）；本机 JDK；Application / Spring Boot / Maven / JUnit 配置需项目是 Maven（`pom.xml` / `mvnw`）或 Gradle（`settings.gradle(.kts)` / `build.gradle(.kts)` / `gradlew`），JAR Application 只要求 JAR 已构建
 - **隐私**：除用户主动点「检查更新…」外，全程 100% 本地——不联网、无后台常驻、不上传任何项目或本机信息（§64）
 
 > 原暂定名 LightRun，已正式更名为 IdeaLightRun。文中 § 编号均指向项目需求文档。
@@ -43,14 +43,14 @@
 
 ## 什么配置能直接启动
 
-**Maven 或 Gradle 项目**里的 **Application**、**Spring Boot**，**JAR Application**（不要求项目是 Maven / Gradle），以及引用这些配置的 **Compound**。其余按情况标记：
+**Maven 或 Gradle 项目**里的 **Application**、**Spring Boot**、**Maven**、**JUnit**，**JAR Application**（不要求项目是 Maven / Gradle），以及引用这些配置的 **Compound**。
 
 | 标记 | 覆盖范围 |
 | --- | --- |
-| `PLANNED` | Maven 运行配置（直接执行 goal，Milestone 5 接入）与 Gradle 运行配置（直接执行 task）——认得出来，本版不接管启动 |
-| `UNSUPPORTED` | JUnit 与未知类型（未知字段保留在 `rawOptions` 里，不丢信息）；Compound 引用了缺失、类型不匹配或不支持启动的成员时也归到这里，信息页写明具体是哪个成员 |
+| `PLANNED` | Gradle 运行配置（类型为 Gradle、直接执行 task 的配置）——认得出来，本版不接管启动 |
+| `UNSUPPORTED` | 未知类型（未知字段保留在 `rawOptions` 里，不丢信息）；JUnit 的标签 / Unique ID 目标；Compound 引用了缺失、类型不匹配或不支持启动的成员时也归到这里，信息页写明具体是哪个成员 |
 
-`READY` / `WARNING` 由 Core 按项目实际情况计算：缺 Main Class / JAR Path、启用了暂不支持的 Before Launch 任务、引用了不存在的配置都会阻止启动；模块缺失、宏无法解析等只产生警告。项目同时存在 `pom.xml` 与 Gradle 构建文件时，先看配置所属模块目录里的构建脚本；仍无法判断时固定使用 Maven 并显示 `WARNING`，不依赖偶然的判断顺序。Before Launch 里的 Maven Goal 只能用于 Maven 项目、Gradle Task 只能用于 Gradle 项目，错配会阻止启动而不是静默改跑另一套命令。
+`READY` / `WARNING` 由 Core 按项目实际情况计算：缺 Main Class / JAR Path / Maven goals、启用了暂不支持的字段（如 Maven 自定义 `mavenHome`、`userSettingsFile`、`multimoduleDir`，或 Maven 配置指定了 Project JDK / JAVA_HOME 之外的 JRE）、启用了暂不支持的 Before Launch 任务、引用了不存在的配置都会阻止启动；模块缺失、宏无法解析等只产生警告。项目同时存在 `pom.xml` 与 Gradle 构建文件时，先看配置所属模块目录里的构建脚本；仍无法判断时固定使用 Maven 并显示 `WARNING`，不依赖偶然的判断顺序。Before Launch 里的 Maven Goal 只能用于 Maven 项目、Gradle Task 只能用于 Gradle 项目，错配会阻止启动而不是静默改跑另一套命令。
 
 JAR Application 按 IDEA 的语义启动：`java [VM Options] -jar <JAR Path> [Program Arguments]`。`JAR_PATH` 支持 `$PROJECT_DIR$` / `$MODULE_DIR$` 等宏，未填 Working Directory 时默认项目根；`ALTERNATIVE_JRE_PATH` 启用时优先使用该 JDK。JAR 尚不存在只显示 `WARNING`（Before Launch 可能生成它），真正启动前会再次校验，届时仍缺失则失败。Before Launch 里有 Build / Build Project / Maven goal / Gradle task 时，才要求可用的 Maven 或 Gradle 与 Module。
 
@@ -60,7 +60,21 @@ Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准�
 
 - Maven 只看项目根有没有 `pom.xml`。根目录只有 `.idea`、或所有 pom 都在子目录的项目，会被判成非 Maven 项目而拒绝启动。Gradle 项目根只要有 `settings.gradle(.kts)` 或 `build.gradle(.kts)` 即可；只有 `settings.gradle` 的聚合工程也能启动
 - JAR Application 只有在 Before Launch 需要构建时才依赖 Maven / Gradle；单纯运行已有 JAR 不需要
-- Gradle 运行配置（类型为 Gradle、在 IDEA 里直接执行 task 的配置）目前是 `PLANNED`；Application / Spring Boot / JAR 配置在 Gradle 项目里已经可以直接 Run
+- Gradle 运行配置（类型为 Gradle、在 IDEA 里直接执行 task 的配置）目前是 `PLANNED`；Application / Spring Boot / JAR / Maven / JUnit 配置在 Gradle 或 Maven 项目里已经可以直接 Run
+
+## Maven 配置与 JUnit 测试
+
+**Maven 配置**按 IDEA 保存的参数直接启动：goals、Command line、Profiles、Runner properties、`-pl` 工程列表，以及离线 / 更新快照 / 线程 / 输出级别等 General Settings 都会翻译成对应参数；VM Options 进 `MAVEN_OPTS`，环境变量与 Working Directory 沿用配置。使用项目 `mvnw` 时不加 `-B`；直接运行不追加 `-nsu`，保留与 IDEA 点 Run 相同的 SNAPSHOT 更新语义。Working Directory 默认项目根，`$PROJECT_DIR$` / `$MODULE_DIR$` 等宏按模块解析；`$Prompt$` 这类依赖 IDEA 上下文的宏会阻止启动，不会带着原文执行。自定义 `mavenHome`、`userSettingsFile`、`localRepository`、`multimoduleDir` 等无法等价映射的设置会被标记为不支持并阻止启动。
+
+**JUnit 配置**交给项目自己的构建系统执行：Maven 项目走 Surefire（`mvn ... test -Dtest=...`），Gradle 项目走 `:module:test`（`--tests`）。支持整个模块、类、方法、包、测试目录与通配模式；包 / 目录 / 整模块会在运行前扫描 `src/test` 与 `src/testFixtures` 展开成具体类名，避免 Maven `-pl -am` 把上游模块的测试一起跑起来。测试 VM Options 在 Maven 侧通过 `argLine`、Gradle 侧通过 init script 的 `jvmArgs` 生效。
+
+限制会明确拒绝而不是静默降级：
+
+- JUnit 的标签（Tags）与 Unique ID 目标暂不支持
+- JUnit 的 Program Arguments 在 Surefire / Gradle Test 中没有等价入口
+- Maven JUnit 的 Working Directory 必须是模块目录（Surefire fork 无法从命令行可靠改写）；Gradle 不受此限，init script 会设置 `workingDir`
+
+测试进程退出后按日志汇总判定结果：控制台照常显示构建与测试输出，末尾给出「测试完成 / 测试失败：共 N 个，失败 …」；测试失败但构建退出码为 0 也会判失败，一个测试都没跑或没有取得汇总同样判失败，用户手动停止则记为「已停止」，不会误报成测试失败。
 
 ## 构建 / 重新构建 / 清理
 
@@ -107,7 +121,7 @@ Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准�
 
 **启动后立刻退出（状态 `已退出 (N)`）。** 看控制台第一条 stderr 输出，通常是 Main Class、Working Directory 或端口冲突。本应用不猜失败原因，也绝不伪造退出码。
 
-**SNAPSHOT 依赖不是最新的。** Maven 固定带 `-nsu`：跳过逐仓库的 SNAPSHOT metadata 检查，优先用 `~/.m2` 已有依赖（与 IDEA 点 Run 的行为一致）。想强制拉最新快照，在 IDEA 或命令行执行一次 `mvn -U` 即可，应用本身不提供刷新开关。本地缺失的依赖仍会正常首次下载。
+**SNAPSHOT 依赖不是最新的。** 启动 Application / Spring Boot 前解析 classpath 时，Maven 固定带 `-nsu`：跳过逐仓库的 SNAPSHOT metadata 检查，优先用 `~/.m2` 已有依赖（与 IDEA 点 Run 的行为一致）。直接 Run Maven 配置时按配置自身参数执行，不额外追加 `-nsu`。想强制拉最新快照，在 IDEA 或命令行执行一次 `mvn -U` 即可，应用本身不提供刷新开关。本地缺失的依赖仍会正常首次下载。
 
 **classpath 看着不对。** 解析结果有缓存，按 fingerprint（pom / `.mvn` / wrapper / `settings.xml` / JDK）自动失效（§19/§57）。界面没有「清除缓存」按钮，需要时手工删除 `~/Library/Caches/IdeaLightRun/projects/<项目hash>/maven/<模块hash>/` 下的 `classpath.json` 与 `classpath-maven-<scope>.txt`，下次启动重新解析。
 
@@ -163,11 +177,11 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 
 ## 当前进度
 
-已完成：Core 解析与宏、Maven / Gradle 编译与 classpath、启动流水线、统一 `PreparedExecution` / `ExecutionRuntime` 执行器、JAR Application 启动、Compound 多配置编排（独立进程 / 日志 / 端口、分组控制、嵌套展开与部分失败清理）、进程与日志、GUI 三栏、Build/Rebuild/Clean（Maven 与 Gradle）、运行端口检测、扫描诊断与统一配置能力计算、在线更新。
+已完成：Core 解析与宏、Maven / Gradle 编译与 classpath、启动流水线、统一 `PreparedExecution` / `ExecutionRuntime` 执行器、JAR Application 启动、Compound 多配置编排（独立进程 / 日志 / 端口、分组控制、嵌套展开与部分失败清理）、Maven 配置直接运行、JUnit 测试运行（Maven Surefire / Gradle Test、目标展开、测试结果判定与日志展示）、进程与日志、GUI 三栏、Build/Rebuild/Clean（Maven 与 Gradle）、运行端口检测、扫描诊断与统一配置能力计算、在线更新。
 
 待做：
 
-- Maven 运行配置（直接执行 goal）与 Gradle 运行配置（直接执行 task）、JUnit 测试运行
+- Gradle 运行配置（直接执行 task）
 - Before Launch 扩展（Build, no error check / Build Artifacts / Run External Tool / Launch Web Browser）与 Restart to Apply 提示
 
 ## 在线更新实现要点
@@ -199,14 +213,14 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 ## 测试
 
 ```bash
-swift test                                        # 本地全量：396 用例
-swift test --skip MavenClasspathIntegrationTests  # CI 集合：393 用例（跳过那 3 个要真实下载依赖的）
+swift test                                        # 本地全量：450 用例
+swift test --skip MavenClasspathIntegrationTests  # CI 集合：447 用例（跳过那 3 个要真实下载依赖的）
 ```
 
 覆盖范围：
 
 - **解析层** — RunConfigurationParser（alias / rawOptions / Before Launch / JAR 字段）、WorkspaceParser（流式、只取 RunManager、跳过模板）、ProjectScanner（§7 来源优先级去重、§6 深度上限 4、忽略目录）、MacroResolver（§11 全部宏与 IDEA 上下文变量，运行配置与 IML 路径共用）、ModuleResolver（§13 五种方式）、JDKResolver（§23–25 优先级与 major version 模糊匹配）
-- **构建与启动** — JavaRunPlanner（§26–§29）、JarRunPlanner（`java -jar` 参数顺序、默认工作目录、缺失/不可读 JAR）、ExecutionRuntime（日志/PID/终态转发、Stop、Before Launch 同步执行与取消）、Compound（成员按引用顺序准备、嵌套展开、缺失/类型不匹配/成环拦截、独立 PID 与日志、分组 Stop/Force Kill、部分失败清理）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator / GradleLocator（Dock 启动无 PATH 时的绝对路径枚举与 wrapper 发行版兜底）、GradleBuildService（project path 任务、合并编译与 classpath 解析、provided 变体、缓存失效、失败与取消）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
+- **构建与启动** — JavaRunPlanner（§26–§29）、JarRunPlanner（`java -jar` 参数顺序、默认工作目录、缺失/不可读 JAR）、ExecutionRuntime（日志/PID/终态转发、Stop、Before Launch 同步执行与取消、测试终态：失败/无测试/无汇总/用户停止）、MavenRunExecution（直接运行参数顺序与 `-nsu` 缺失、Project JDK / `MAVEN_OPTS`、pom 与不支持选项的 fail-closed、宏与 `$Prompt$`、Surefire 模块范围/筛选/工作目录限制）、TestTargetResolver（类/方法/包/目录/模式展开与无匹配拒绝）、TestOutcomeMonitor（Surefire `Results:` 汇总与逐类行、旧版 `Results :`、Gradle SUMMARY、无测试检测）、Compound（成员按引用顺序准备、嵌套展开、缺失/类型不匹配/成环拦截、独立 PID 与日志、分组 Stop/Force Kill、部分失败清理）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator / GradleLocator（Dock 启动无 PATH 时的绝对路径枚举与 wrapper 发行版兜底）、GradleBuildService（project path 任务、合并编译与 classpath 解析、provided 变体、缓存失效、失败与取消、JUnit `:test` 与 `--tests`/init script）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
 - **诊断与能力** — ScanDiagnostic（读失败 / XML 损坏 / 配置目录不可读 / 重复配置 / 缺 Main Class / 不支持的 Before Launch 任务都带严重程度与建议，不静默丢配置）、ConfigurationCapabilityResolver（类型 + 构建系统 + 字段 + Module 解析 + Before Launch 统一裁决）、BuildSystemSelector（Maven/Gradle 共存时的确定性选择）、Gradle settings/projectDir 解析、Maven `$MODULE_DIR$` POM 路径、ProcessHandle 启动前取消与 SIGTERM→SIGKILL 升级
 - **进程与日志** — ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、LogRingBuffer（§37 上限）
 - **在线更新** — 版本比较与 fail-closed、发布元数据解析（JSON 与 expanded_assets 两条路径）、镜像链顺序与回退/取消/坏文件删除、更新助手参数契约与重启路径、designated requirement 解析与语义判定，以及把产物名 / bundle id / Team / 助手落点钉到 `scripts/` 与 `release.yml` **原文**的防漂移断言

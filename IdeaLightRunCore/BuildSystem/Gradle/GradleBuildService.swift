@@ -225,6 +225,88 @@ public struct GradleBuildService: BuildSystemAdapter, Sendable {
         }
     }
 
+    // MARK: - JUnit（M5）
+
+    /// JUnit → `:module:test`。`--tests` 是 Gradle 的测试筛选入口；
+    /// VM 参数与测试工作目录通过 init script 配置到 Test 任务上。
+    public func testExecution(
+        _ config: RunConfiguration,
+        module: ProjectModule,
+        context: BuildInvocationContext,
+        log: @escaping LogCallback
+    ) throws -> TestExecutionPlan {
+        guard let options = config.junitOptions else {
+            throw IdeaLightRunError.invalidConfiguration(
+                detail: "配置 “\(config.name)” 没有 JUnit 测试目标。"
+            )
+        }
+        if !options.programArguments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw IdeaLightRunError.unsupportedConfiguration(
+                detail: "JUnit 配置 “\(config.name)” 设置了 Program Arguments；"
+                    + "Gradle Test 任务没有等价的程序参数入口，当前版本不能运行。请在 IDEA 中去掉该字段。"
+            )
+        }
+
+        let filters = try TestTargetResolver.resolve(
+            options.target,
+            moduleDirectory: module.directory,
+            projectRoot: projectRoot,
+            environment: context.environment
+        )
+
+        var warnings: [ConfigurationWarning] = []
+        let macros = MacroResolver(
+            projectDir: projectRoot,
+            moduleDir: module.directory,
+            environment: context.environment
+        )
+        let vmArguments = CommandLineTokenizer.tokenize(config.vmOptions ?? "").map { token -> String in
+            let resolution = macros.resolve(token)
+            for warning in resolution.warnings {
+                MacroResolver.appendWarning(warning, into: &warnings)
+            }
+            return resolution.value
+        }
+        try RunConfigurationResolver.rejectUnresolvedMacros(warnings: warnings, configName: config.name)
+
+        let variant = classpathVariant(for: module, includeProvided: config.includeProvidedDependencies)
+        let initScript = ClasspathCache.gradleTestInitScriptURL(projectRoot: projectRoot, variant: variant)
+        try FileManager.default.createDirectory(
+            at: initScript.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Self.testInitScript(
+            vmArguments: vmArguments,
+            workingDirectory: context.workingDirectory
+        ).write(to: initScript, atomically: true, encoding: .utf8)
+
+        let path = gradlePath(for: module)
+        let task = Self.taskPath(path, "test")
+        let gradleFilters = filters.map { $0.replacingOccurrences(of: "#", with: ".") }
+        let arguments = Self.commandArguments(
+            tasks: [task],
+            initScript: initScript,
+            postTaskArguments: gradleFilters.flatMap { ["--tests", $0] }
+        )
+        log(LogLine(
+            stream: .system,
+            text: "[IdeaLightRun] JUnit（Gradle）：\(options.target.displayText)"
+                + (gradleFilters.isEmpty ? "" : " → \(gradleFilters.joined(separator: ", "))")
+        ))
+        return TestExecutionPlan(
+            process: ExecutableLaunchPlan(
+                executable: gradleExecutable,
+                arguments: arguments,
+                environment: context.environment,
+                workingDirectory: projectRoot
+            ),
+            buildSystem: .gradle,
+            moduleName: module.name,
+            targetDescription: options.target.displayText,
+            filters: gradleFilters
+        )
+    }
+
     public func hasFreshClasspathCache(for target: BuildTarget) -> Bool {
         guard let cached = ClasspathCache.load(projectRoot: projectRoot, variant: target.variant) else {
             return false
@@ -335,7 +417,8 @@ public struct GradleBuildService: BuildSystemAdapter, Sendable {
     static func commandArguments(
         tasks: [String],
         systemProperties: [String: String] = [:],
-        initScript: URL? = nil
+        initScript: URL? = nil,
+        postTaskArguments: [String] = []
     ) -> [String] {
         var arguments: [String] = []
         for key in systemProperties.keys.sorted() {
@@ -348,6 +431,8 @@ public struct GradleBuildService: BuildSystemAdapter, Sendable {
             arguments.append(initScript.path)
         }
         arguments.append(contentsOf: tasks)
+        // `gradle test --tests Foo` 是 Gradle 的标准写法：筛选跟在任务后面。
+        arguments.append(contentsOf: postTaskArguments)
         return arguments
     }
 
@@ -389,6 +474,37 @@ public struct GradleBuildService: BuildSystemAdapter, Sendable {
     }
 
     """
+
+    // MARK: - 测试 init script
+
+    /// 通过 init script 把 JUnit 配置的 VM 参数与工作目录落到 Test 任务上，
+    /// 并打印一行稳定的汇总标记供 Core 解析（Gradle 默认不输出测试计数）。
+    static func testInitScript(vmArguments: [String], workingDirectory: URL) -> String {
+        let args = vmArguments.map(groovySingleQuoted).joined(separator: ", ")
+        return """
+        allprojects { project ->
+            project.tasks.withType(org.gradle.api.tasks.testing.Test).configureEach { testTask ->
+                testTask.jvmArgs([\(args)])
+                testTask.workingDir = new File(\(groovySingleQuoted(workingDirectory.path)))
+                testTask.afterSuite { descriptor, result ->
+                    if (descriptor.parent == null) {
+                        println "[IdeaLightRun-Test] SUMMARY total=${result.testCount} failed=${result.failedTestCount} skipped=${result.skippedTestCount}"
+                    }
+                }
+            }
+        }
+
+        """
+    }
+
+    static func groovySingleQuoted(_ value: String) -> String {
+        let escaped = value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+        return "'\(escaped)'"
+    }
 
     // MARK: - 内部
 

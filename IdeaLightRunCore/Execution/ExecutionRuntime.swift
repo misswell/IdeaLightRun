@@ -39,6 +39,11 @@ public final class ExecutionRuntime: @unchecked Sendable {
     public private(set) var members: [ExecutionRuntime] = []
 
     private let session: ManagedProcessSession?
+    /// 测试配置的终态要按测试汇总修正（失败/没有匹配测试），
+    /// 不能直接透传底层进程的退出码。
+    private let testMonitor: TestOutcomeMonitor?
+    private let testStateLock = NSLock()
+    private var testStateOverride: ProcessState?
     private let handlerLock = NSLock()
     private var stateHandler: ((ProcessState) -> Void)?
     private var logHandler: (([LogLine]) -> Void)?
@@ -65,21 +70,29 @@ public final class ExecutionRuntime: @unchecked Sendable {
 
         switch execution {
         case .process(let plan):
+            self.testMonitor = nil
             self.session = try ManagedProcessSession(
                 configKey: configKey,
                 configName: configName,
                 plan: plan,
                 logBuffer: logBuffer
             )
-            session?.onState = { [weak self] state in self?.deliverState(state) }
-            session?.onLogLines = { [weak self] lines in self?.deliverLogs(lines) }
-            session?.onStarted = { [weak self] pid in self?.deliverStarted(pid) }
+        case .test(let plan):
+            let monitor = TestOutcomeMonitor()
+            self.testMonitor = monitor
+            self.session = try ManagedProcessSession(
+                configKey: configKey,
+                configName: configName,
+                plan: plan.process,
+                logBuffer: logBuffer
+            )
         case .compound(let plan):
             guard !plan.members.isEmpty else {
                 throw IdeaLightRunError.invalidConfiguration(
                     detail: "Compound 配置 “\(plan.name)” 没有可启动的成员。"
                 )
             }
+            self.testMonitor = nil
             self.session = nil
             var runtimes: [ExecutionRuntime] = []
             runtimes.reserveCapacity(plan.members.count)
@@ -100,6 +113,15 @@ public final class ExecutionRuntime: @unchecked Sendable {
                 )
             }
         }
+
+        if let session {
+            session.onState = { [weak self] state in self?.handleSessionState(state) }
+            session.onLogLines = { [weak self] lines in
+                self?.testMonitor?.consume(lines)
+                self?.deliverLogs(lines)
+            }
+            session.onStarted = { [weak self] pid in self?.deliverStarted(pid) }
+        }
     }
 
     /// 句柄必须在 `start()` 之前设置；回调可能来自后台线程，调用方负责线程切换。
@@ -118,6 +140,10 @@ public final class ExecutionRuntime: @unchecked Sendable {
     }
 
     public var state: ProcessState {
+        testStateLock.lock()
+        let override = testStateOverride
+        testStateLock.unlock()
+        if let override { return override }
         if let session { return session.state }
         compoundLock.lock()
         defer { compoundLock.unlock() }
@@ -154,26 +180,27 @@ public final class ExecutionRuntime: @unchecked Sendable {
     }
 
     public func stop() {
+        // 先登记再终止：测试终态分类要区分“用户停止”和“测试失败”。
+        compoundLock.lock()
+        stopRequested = true
+        compoundLock.unlock()
         if let session {
             session.stop()
             return
         }
-        compoundLock.lock()
-        stopRequested = true
-        compoundLock.unlock()
         for member in members where !member.state.isTerminal {
             member.stop()
         }
     }
 
     public func forceKill() {
+        compoundLock.lock()
+        stopRequested = true
+        compoundLock.unlock()
         if let session {
             session.forceKill()
             return
         }
-        compoundLock.lock()
-        stopRequested = true
-        compoundLock.unlock()
         for member in members where !member.state.isTerminal {
             member.forceKill()
         }
@@ -371,6 +398,65 @@ public final class ExecutionRuntime: @unchecked Sendable {
         default:
             return nil
         }
+    }
+
+    // MARK: - 测试终态
+
+    /// 测试进程退出后，用日志里的测试汇总修正状态：
+    /// - 有测试且失败 → 保留退出码（非 0）或显式 failed（退出码 0 但报告失败）
+    /// - 一个测试都没跑 → failed，不能把“没找到测试”当成成功
+    /// - 用户停止 → cancelled，不能报成测试失败
+    private func handleSessionState(_ state: ProcessState) {
+        guard let testMonitor, case .test(let plan) = execution else {
+            deliverState(state)
+            return
+        }
+        guard case .exited(let code) = state else {
+            deliverState(state)
+            return
+        }
+
+        compoundLock.lock()
+        let cancelled = stopRequested
+        compoundLock.unlock()
+        if cancelled {
+            emitSystemLog("测试已停止。")
+            publishTestState(.cancelled)
+            return
+        }
+
+        let summary = testMonitor.snapshot()
+        if summary.didRunAnyTest {
+            if summary.failedCount > 0 {
+                emitSystemLog("测试失败：\(summary.detailText)（目标：\(plan.targetDescription)）。")
+                publishTestState(code == 0 ? .failed("测试失败：\(summary.detailText)") : .exited(code))
+            } else {
+                emitSystemLog("测试完成：\(summary.detailText)（目标：\(plan.targetDescription)）。")
+                publishTestState(.exited(code))
+            }
+            return
+        }
+
+        if summary.noTestsDetected || summary.hasReport {
+            emitSystemLog("没有找到匹配的测试（目标：\(plan.targetDescription)）。")
+            publishTestState(.failed("没有找到匹配的测试（目标：\(plan.targetDescription)）。"))
+            return
+        }
+
+        if code != 0 {
+            emitSystemLog("测试执行失败（退出码 \(code)），未取得测试汇总。")
+            publishTestState(.failed("测试执行失败（退出码 \(code)），未取得测试汇总；请查看控制台输出。"))
+        } else {
+            emitSystemLog("测试进程已退出，但没有取得测试结果，无法确认测试是否运行。")
+            publishTestState(.failed("没有取得测试结果，无法确认测试是否运行；请检查构建输出。"))
+        }
+    }
+
+    private func publishTestState(_ state: ProcessState) {
+        testStateLock.lock()
+        testStateOverride = state
+        testStateLock.unlock()
+        deliverState(state)
     }
 
     // MARK: - 回调转发

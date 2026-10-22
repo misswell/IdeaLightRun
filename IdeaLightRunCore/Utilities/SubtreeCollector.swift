@@ -25,6 +25,24 @@ public struct XMLElementNode {
     public func childrenNamed(_ name: String) -> [XMLElementNode] {
         children.filter { $0.name == name }
     }
+
+    /// 深度优先查找第一个同名后代（不含自身）。
+    public func firstDescendant(named name: String) -> XMLElementNode? {
+        for child in children {
+            if child.name == name { return child }
+            if let found = child.firstDescendant(named: name) { return found }
+        }
+        return nil
+    }
+
+    /// 所有同名后代，按文档顺序。
+    public func descendants(named name: String) -> [XMLElementNode] {
+        children.flatMap { child -> [XMLElementNode] in
+            var result = child.name == name ? [child] : []
+            result.append(contentsOf: child.descendants(named: name))
+            return result
+        }
+    }
 }
 
 /// 按元素名捕获 XML 子树，宽松：解析错误时保留已捕获内容。

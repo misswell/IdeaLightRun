@@ -273,6 +273,133 @@ final class GradleBuildServiceTests: XCTestCase {
         }
     }
 
+    // MARK: - JUnit
+
+    private func junitConfig(
+        _ options: JUnitRunOptions,
+        vmOptions: String? = nil
+    ) -> RunConfiguration {
+        var config = RunConfiguration(
+            name: "AppTest",
+            type: .junit,
+            source: ConfigurationSource(
+                kind: .dotRun,
+                file: project.root.appendingPathComponent(".run/AppTest.run.xml"),
+                modifiedAt: nil
+            )
+        )
+        config.junitOptions = options
+        config.vmOptions = vmOptions
+        return config
+    }
+
+    private func invocationContext() -> BuildInvocationContext {
+        BuildInvocationContext(
+            environment: ["PATH": "/usr/bin:/bin"],
+            workingDirectory: project.root.appendingPathComponent("app")
+        )
+    }
+
+    private func writeTestSource(_ relativePath: String, content: String) throws {
+        let url = project.root.appendingPathComponent("app/src/test/java/\(relativePath)")
+        try project.fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    func testJUnitMethodTargetUsesGradleTestTaskAndFilterSyntax() throws {
+        let plan = try project.service().testExecution(
+            junitConfig(
+                JUnitRunOptions(target: .method(className: "com.example.AppTest", methodName: "works")),
+                vmOptions: "-Xmx1g -Dfoo=\"bar baz\""
+            ),
+            module: project.appModule(),
+            context: invocationContext(),
+            log: { _ in }
+        )
+
+        XCTAssertEqual(plan.buildSystem, .gradle)
+        XCTAssertEqual(plan.moduleName, "app")
+        XCTAssertEqual(plan.filters, ["com.example.AppTest.works"], "Gradle 用 . 分隔方法，不是 #")
+        XCTAssertEqual(plan.process.executable, project.gradlew)
+        XCTAssertEqual(plan.process.workingDirectory, project.root)
+
+        let initScript = ClasspathCache.gradleTestInitScriptURL(
+            projectRoot: project.root,
+            variant: .gradle(module: ":app", includeProvided: false)
+        )
+        XCTAssertEqual(plan.process.arguments, [
+            "--console=plain", "--no-daemon",
+            "--init-script", initScript.path,
+            ":app:test",
+            "--tests", "com.example.AppTest.works",
+        ])
+
+        let script = try String(contentsOf: initScript, encoding: .utf8)
+        XCTAssertTrue(script.contains("testTask.jvmArgs(['-Xmx1g', '-Dfoo=bar baz'])"), script)
+        XCTAssertTrue(script.contains("testTask.workingDir = new File('\(project.root.appendingPathComponent("app").path)')"), script)
+        XCTAssertTrue(script.contains("[IdeaLightRun-Test] SUMMARY"), "测试汇总必须由 init script 输出，ExecutionRuntime 依赖它判定结果")
+    }
+
+    func testJUnitWholeModuleExpandsDiscoveredTestClasses() throws {
+        try writeTestSource("com/example/AppTest.java", content: """
+        package com.example;
+        import org.junit.jupiter.api.Test;
+        class AppTest { @Test void works() {} }
+        """)
+        try writeTestSource("com/example/sub/OtherTest.kt", content: """
+        package com.example.sub
+        class OtherTest {
+            @Test
+            fun works() {}
+        }
+        """)
+
+        let plan = try project.service().testExecution(
+            junitConfig(JUnitRunOptions(target: .all)),
+            module: project.appModule(),
+            context: invocationContext(),
+            log: { _ in }
+        )
+
+        XCTAssertEqual(plan.filters, ["com.example.AppTest", "com.example.sub.OtherTest"])
+        let arguments = plan.process.arguments
+        XCTAssertTrue(arguments.contains(":app:test"), "\(arguments)")
+        XCTAssertEqual(arguments.filter { $0 == "--tests" }.count, 2, "每个类一个 --tests：\(arguments)")
+    }
+
+    func testJUnitWholeModuleWithoutTestsFailsClosed() {
+        do {
+            _ = try project.service().testExecution(
+                junitConfig(JUnitRunOptions(target: .all)),
+                module: project.appModule(),
+                context: invocationContext(),
+                log: { _ in }
+            )
+            XCTFail("没有测试类时不能启动 Gradle")
+        } catch let error as IdeaLightRunError {
+            guard case .noMatchingTests = error else { return XCTFail("实际：\(error)") }
+        } catch {
+            XCTFail("实际：\(error)")
+        }
+    }
+
+    func testJUnitProgramArgumentsAreRejectedInsteadOfDropped() {
+        do {
+            _ = try project.service().testExecution(
+                junitConfig(JUnitRunOptions(target: .className("com.example.AppTest"), programArguments: "--flag")),
+                module: project.appModule(),
+                context: invocationContext(),
+                log: { _ in }
+            )
+            XCTFail("Gradle Test 没有程序参数入口，必须拒绝而不是丢弃")
+        } catch let error as IdeaLightRunError {
+            guard case .unsupportedConfiguration(let detail) = error else { return XCTFail("实际：\(error)") }
+            XCTAssertTrue(detail.contains("Program Arguments"), detail)
+        } catch {
+            XCTFail("实际：\(error)")
+        }
+    }
+
     // MARK: - classpath
 
     private func target(includeProvided: Bool = false) -> BuildTarget {

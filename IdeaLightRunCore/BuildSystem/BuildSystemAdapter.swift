@@ -15,6 +15,18 @@ public struct BuildTarget: Sendable {
     }
 }
 
+/// 执行一次运行配置时的有效环境与工作目录。环境已经合并父进程 / .env /
+/// Run Configuration 变量；适配器不再自己重读环境。
+public struct BuildInvocationContext: Sendable {
+    public var environment: [String: String]
+    public var workingDirectory: URL
+
+    public init(environment: [String: String], workingDirectory: URL) {
+        self.environment = environment
+        self.workingDirectory = workingDirectory
+    }
+}
+
 /// §9: 构建系统对启动流水线提供的能力。`ExecutionCoordinator` 只通过这个协议工作，
 /// 因此接入 Gradle 不需要在启动流水线里加 `if Gradle`。
 public protocol BuildSystemAdapter: Sendable {
@@ -64,4 +76,35 @@ public protocol BuildSystemAdapter: Sendable {
         handle: ProcessHandle?,
         log: @escaping LogCallback
     ) throws -> [String]
+
+    /// 直接运行 Maven 配置（MavenRunConfigurationType）：按配置保存的 goals /
+    /// profiles / properties 构造 Maven 进程。只有 Maven 适配器实现。
+    func mavenExecution(
+        _ config: RunConfiguration,
+        module: ProjectModule?,
+        context: BuildInvocationContext,
+        log: @escaping LogCallback
+    ) throws -> ExecutableLaunchPlan
+
+    /// JUnit 测试：Maven 走 Surefire，Gradle 走 `:module:test`。
+    /// 测试筛选、模块范围与命令构造都留在适配器内，调用方不拼构建命令。
+    func testExecution(
+        _ config: RunConfiguration,
+        module: ProjectModule,
+        context: BuildInvocationContext,
+        log: @escaping LogCallback
+    ) throws -> TestExecutionPlan
+}
+
+public extension BuildSystemAdapter {
+    func mavenExecution(
+        _ config: RunConfiguration,
+        module: ProjectModule?,
+        context: BuildInvocationContext,
+        log: @escaping LogCallback
+    ) throws -> ExecutableLaunchPlan {
+        throw IdeaLightRunError.unsupportedConfiguration(
+            detail: "“\(config.name)” 是 Maven 运行配置，但当前项目使用 Gradle，无法执行 Maven goal。"
+        )
+    }
 }

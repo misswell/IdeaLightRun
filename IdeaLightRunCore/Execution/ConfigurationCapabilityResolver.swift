@@ -92,16 +92,12 @@ public enum ConfigurationCapabilityResolver {
         switch config.type {
         case .compound:
             return resolveCompound(config, scan: scan, visiting: visiting)
-        case .maven:
-            return terminal(.planned, "Maven 运行配置已识别；直接运行 Maven goal 将在 Milestone 5 接入，当前不能启动。")
         case .gradle:
             return terminal(.planned, "Gradle 运行配置（直接执行 Gradle 任务）已识别；该类型尚未接入，当前不能启动。")
-        case .junit:
-            return terminal(.unsupported, "JUnit 测试运行尚未接入，当前不能启动。")
         case .unknown(let raw):
             let name = raw.isEmpty ? "（空类型）" : raw
             return terminal(.unsupported, "配置类型 “\(name)” 不在当前支持范围内。")
-        case .application, .springBoot, .jar:
+        case .maven, .junit, .application, .springBoot, .jar:
             break
         }
 
@@ -131,6 +127,49 @@ public enum ConfigurationCapabilityResolver {
                 } else if !FileManager.default.isReadableFile(atPath: resolved.path) {
                     block("JAR 文件不可读取：\(resolved.path)")
                 }
+            }
+        } else if config.type == .maven {
+            if let options = config.mavenOptions {
+                let goals = options.goals.flatMap { CommandLineTokenizer.tokenize($0) }
+                if goals.isEmpty {
+                    missingFields.append("Maven goals")
+                    block("Maven 配置没有保存任何 goal，无法确定要执行什么。")
+                }
+                if !options.unsupportedOptions.isEmpty {
+                    block("Maven 配置使用了暂不支持的选项："
+                        + options.unsupportedOptions.joined(separator: "、")
+                        + "。请在 IDEA 中改回默认设置，或用 Maven goal 表达同样的语义。")
+                }
+                if !options.jreName.isEmpty,
+                   options.jreName != "#USE_PROJECT_JDK",
+                   options.jreName != "#JAVA_HOME" {
+                    block("Maven 配置指定的 JRE “\(options.jreName)” 暂不支持；请改用 Project JDK 或 JAVA_HOME。")
+                }
+            } else {
+                block("Maven 配置缺少运行参数。")
+            }
+        } else if config.type == .junit {
+            if let options = config.junitOptions {
+                switch options.target {
+                case .unsupported(let reason):
+                    block("JUnit 测试目标不可用：\(reason)")
+                case .tags:
+                    block("JUnit Tag 筛选暂不支持；请在 IDEA 中改用类、方法、包或目录作为测试目标。")
+                case .uniqueId:
+                    block("JUnit Unique ID 定位暂不支持；请在 IDEA 中改用类、方法、包或目录作为测试目标。")
+                default:
+                    break
+                }
+                if !options.programArguments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    block("JUnit 配置设置了 Program Arguments；Surefire / Gradle Test 没有等价的程序参数入口，当前不能运行。")
+                }
+            } else {
+                block("JUnit 配置缺少测试目标。")
+            }
+            let moduleName = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if moduleName.isEmpty {
+                missingFields.append("Module")
+                block("JUnit 配置必须选择 Module，测试类与工作目录都相对模块定位。")
             }
         } else {
             let mainClass = config.mainClass?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -242,9 +281,29 @@ public enum ConfigurationCapabilityResolver {
                     if hasMavenTask, selection.kind == .gradle {
                         block("Before Launch 的 Maven 任务需要 Maven，但当前项目使用 Gradle。请改用 Gradle 任务，或在 IDEA 中停用该任务。")
                     }
-                    if let moduleName = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !moduleName.isEmpty,
-                       !scan.modules.isEmpty {
+                    if config.type == .junit {
+                        let resolution = ModuleResolver.resolveModule(
+                            named: config.moduleName,
+                            mainClass: nil,
+                            projectRoot: scan.projectRoot,
+                            knownModules: scan.modules
+                        )
+                        if let module = resolution.module {
+                            if selection.kind == .maven,
+                               let mismatch = junitWorkingDirectoryMismatch(
+                                   config: config,
+                                   module: module,
+                                   projectRoot: scan.projectRoot
+                               ) {
+                                block(mismatch)
+                            }
+                        } else {
+                            let moduleName = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                            block("找不到 JUnit 配置的 Module “\(moduleName)”，测试类与工作目录无法定位。")
+                        }
+                    } else if let moduleName = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                              !moduleName.isEmpty,
+                              !scan.modules.isEmpty {
                         let resolution = ModuleResolver.resolveModule(
                             named: moduleName,
                             mainClass: config.mainClass,
@@ -434,6 +493,23 @@ public enum ConfigurationCapabilityResolver {
         let value = resolution.value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }
         return RunConfigurationResolver.fileURL(for: value, projectRoot: scan.projectRoot)
+    }
+
+    /// Surefire 的 fork 工作目录固定为模块 basedir，命令行没有可靠入口覆盖；
+    /// 只对可静态判定的字面量路径提前阻断，含宏的路径留给适配器在启动前判定。
+    private static func junitWorkingDirectoryMismatch(
+        config: RunConfiguration,
+        module: ProjectModule,
+        projectRoot: URL
+    ) -> String? {
+        let raw = config.workingDirectory?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !raw.isEmpty, !raw.contains("$"), !raw.contains("%") else { return nil }
+        let requested = RunConfigurationResolver.fileURL(for: raw, projectRoot: projectRoot)
+            .standardizedFileURL.path
+        let expected = module.directory.standardizedFileURL.path
+        guard requested != expected else { return nil }
+        return "JUnit 配置的 Working Directory 是 \(requested)，但 Maven Surefire 只能使用模块目录 \(expected)。"
+            + "请在 IDEA 中把 Working Directory 改为模块目录后再运行。"
     }
 
     private static func referenceExists(

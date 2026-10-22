@@ -49,6 +49,12 @@ public struct MacroResolver: Sendable {
             ("$MODULE_WORKING_DIR$", moduleDir?.path),
             ("$MODULE_DIR$", moduleDir?.path),
             ("$PROJECT_DIR$", projectDir?.path),
+            // IDEA 的 JUnit / Maven 配置在 PATH 类字段里使用 %...% 变体。
+            ("%MODULE_WORKING_DIR%", moduleDir?.path),
+            ("%MODULE_DIR%", moduleDir?.path),
+            ("%PROJECT_DIR%", projectDir?.path),
+            // JUnit 的目录选择器保存 file URL 时仍可能带 IDEA 的路径宏。
+            ("$ProjectFileDir$", projectDir?.path),
             ("$PROJECT_NAME$", projectDir?.lastPathComponent),
             ("$WORKSPACE_DIR$", (workspaceDir ?? projectDir)?.path),
             ("$USER_HOME$", userHome.path),

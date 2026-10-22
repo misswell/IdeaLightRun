@@ -88,7 +88,29 @@ public struct ExecutionCoordinator: Sendable {
                 gateOwner: gateOwner,
                 visiting: visiting
             )
-        case .maven, .gradle, .junit, .unknown:
+        case .maven:
+            return try await prepareMaven(
+                config: config,
+                projectRoot: projectRoot,
+                scan: scan,
+                log: log,
+                progress: progress,
+                processHandle: processHandle,
+                gateOwner: gateOwner,
+                visiting: visiting
+            )
+        case .junit:
+            return try await prepareJUnit(
+                config: config,
+                projectRoot: projectRoot,
+                scan: scan,
+                log: log,
+                progress: progress,
+                processHandle: processHandle,
+                gateOwner: gateOwner,
+                visiting: visiting
+            )
+        case .gradle, .unknown:
             // ensureRunnable 已经拦下，这里只是保持 switch 穷尽。
             throw IdeaLightRunError.unsupportedConfiguration(
                 detail: "“\(config.name)”（\(config.type.displayName)）当前不能直接启动。"
@@ -480,6 +502,248 @@ public struct ExecutionCoordinator: Sendable {
         }
     }
 
+    // MARK: - Maven 运行配置
+
+    /// MavenRunConfigurationType：直接执行配置保存的 goals。
+    /// Maven 配置不要求选中 Module（`-pl` 由配置自己表达），Module 只在
+    /// Before Launch 的 Build 与 `$MODULE_DIR$` 解析时才需要。
+    private func prepareMaven(
+        config: RunConfiguration,
+        projectRoot: URL,
+        scan: ScanResult,
+        log: @escaping LogCallback,
+        progress: @escaping (ProcessState) -> Void,
+        processHandle: ProcessHandle?,
+        gateOwner: BuildGate.Owner?,
+        visiting: [String]
+    ) async throws -> PreparedExecution {
+        let module = try Self.resolveModuleIfSpecified(
+            config: config,
+            projectRoot: projectRoot,
+            knownModules: scan.modules
+        )
+        let toolchain = try ProjectToolchain.resolve(
+            projectRoot: projectRoot,
+            result: scan,
+            config: config,
+            configJDKName: config.jreReference,
+            context: "启动",
+            log: log
+        )
+        guard toolchain.kind == .maven else {
+            throw IdeaLightRunError.buildToolNotFound(
+                detail: "Maven 运行配置要求项目根存在 pom.xml，当前项目使用 \(toolchain.kind.displayName) 构建。"
+            )
+        }
+
+        let owner = gateOwner ?? BuildGate.Owner()
+        return try await BuildGate.shared.run(projectKey: projectRoot.standardizedFileURL.path, owner: owner) {
+            let target = module.map {
+                toolchain.target(for: $0, includeProvided: config.includeProvidedDependencies)
+            }
+            try await self.runBeforeLaunch(
+                config: config,
+                projectRoot: projectRoot,
+                scan: scan,
+                toolchain: toolchain,
+                module: module,
+                target: target,
+                progress: progress,
+                processHandle: processHandle,
+                owner: owner,
+                visiting: visiting,
+                log: log
+            )
+
+            progress(.starting)
+            let resolved = try RunConfigurationResolver().resolve(
+                config: config,
+                projectRoot: projectRoot,
+                module: module,
+                jdk: toolchain.jdk
+            )
+            Self.logResolvedConfiguration(resolved, log: log)
+            let context = BuildInvocationContext(
+                environment: resolved.environment,
+                workingDirectory: resolved.workingDirectory
+            )
+            let plan = try toolchain.adapter.mavenExecution(
+                config,
+                module: module,
+                context: context,
+                log: log
+            )
+            return .process(plan)
+        }
+    }
+
+    // MARK: - JUnit
+
+    /// JUnit 配置必须在某个 Module 内运行；构建系统由项目本身决定
+    /// （Maven → Surefire，Gradle → `:module:test`），命令由适配器生成。
+    private func prepareJUnit(
+        config: RunConfiguration,
+        projectRoot: URL,
+        scan: ScanResult,
+        log: @escaping LogCallback,
+        progress: @escaping (ProcessState) -> Void,
+        processHandle: ProcessHandle?,
+        gateOwner: BuildGate.Owner?,
+        visiting: [String]
+    ) async throws -> PreparedExecution {
+        let moduleResolution = ModuleResolver.resolveModule(
+            named: config.moduleName,
+            mainClass: nil,
+            projectRoot: projectRoot,
+            knownModules: scan.modules
+        )
+        guard let module = moduleResolution.module else {
+            let detail = moduleResolution.warnings.map(\.detail).joined(separator: "；")
+            throw IdeaLightRunError.moduleNotFound(
+                detail: detail.isEmpty ? "JUnit 配置没有可选择 Module。" : detail
+            )
+        }
+
+        let toolchain = try ProjectToolchain.resolve(
+            projectRoot: projectRoot,
+            result: scan,
+            config: config,
+            configJDKName: config.jreReference,
+            context: "运行测试",
+            log: log
+        )
+        let owner = gateOwner ?? BuildGate.Owner()
+        return try await BuildGate.shared.run(projectKey: projectRoot.standardizedFileURL.path, owner: owner) {
+            let target = toolchain.target(
+                for: module,
+                includeProvided: config.includeProvidedDependencies
+            )
+            try await self.runBeforeLaunch(
+                config: config,
+                projectRoot: projectRoot,
+                scan: scan,
+                toolchain: toolchain,
+                module: module,
+                target: target,
+                progress: progress,
+                processHandle: processHandle,
+                owner: owner,
+                visiting: visiting,
+                log: log
+            )
+
+            progress(.starting)
+            let resolved = try RunConfigurationResolver().resolve(
+                config: config,
+                projectRoot: projectRoot,
+                module: module,
+                jdk: toolchain.jdk
+            )
+            Self.logResolvedConfiguration(resolved, log: log)
+            let context = BuildInvocationContext(
+                environment: resolved.environment,
+                workingDirectory: resolved.workingDirectory
+            )
+            let plan = try toolchain.adapter.testExecution(
+                config,
+                module: module,
+                context: context,
+                log: log
+            )
+            return .test(plan)
+        }
+    }
+
+    /// Maven / JUnit 共用的 Before Launch 执行：动作语义与 Java 启动一致，
+    /// 但两者都不做 classpath 解析，因此 Build 就是一次真实编译。
+    private func runBeforeLaunch(
+        config: RunConfiguration,
+        projectRoot: URL,
+        scan: ScanResult,
+        toolchain: ProjectToolchain,
+        module: ProjectModule?,
+        target: BuildTarget?,
+        progress: @escaping (ProcessState) -> Void,
+        processHandle: ProcessHandle?,
+        owner: BuildGate.Owner,
+        visiting: [String],
+        log: @escaping LogCallback
+    ) async throws {
+        try await BeforeLaunchExecutor().run(
+            for: config,
+            configurations: scan.configurations,
+            actions: BeforeLaunchExecutor.Actions(
+                build: {
+                    guard let target else {
+                        throw IdeaLightRunError.unsupportedBeforeLaunch(
+                            detail: "配置 “\(config.name)” 的 Before Launch 需要 Build，"
+                                + "但没有可解析的 Module。请在 IDEA 中为该配置选择 Module。"
+                        )
+                    }
+                    progress(.building)
+                    try toolchain.adapter.buildModule(target, handle: processHandle, log: log)
+                },
+                buildProject: {
+                    progress(.building)
+                    try toolchain.adapter.buildProject(kind: .build, handle: processHandle, log: log)
+                },
+                runMavenGoals: { goals, pomFile in
+                    guard toolchain.kind == .maven else {
+                        throw IdeaLightRunError.unsupportedBeforeLaunch(
+                            detail: "配置 “\(config.name)” 的 Before Launch 包含 Maven 任务，"
+                                + "但当前项目使用 \(toolchain.kind.displayName) 构建。"
+                        )
+                    }
+                    progress(.building)
+                    try toolchain.adapter.runTasks(
+                        goals,
+                        pomFile: pomFile,
+                        moduleDirectory: module?.directory ?? projectRoot,
+                        handle: processHandle,
+                        log: log
+                    )
+                },
+                runGradleTasks: { tasks in
+                    guard toolchain.kind == .gradle else {
+                        throw IdeaLightRunError.unsupportedBeforeLaunch(
+                            detail: "配置 “\(config.name)” 的 Before Launch 包含 Gradle 任务，"
+                                + "但当前项目使用 \(toolchain.kind.displayName) 构建。"
+                        )
+                    }
+                    progress(.building)
+                    try toolchain.adapter.runTasks(
+                        tasks,
+                        pomFile: nil,
+                        moduleDirectory: module?.directory ?? projectRoot,
+                        handle: processHandle,
+                        log: log
+                    )
+                },
+                runReferenced: { referenced, chain in
+                    let referencedExecution = try await self.prepareResolved(
+                        config: referenced,
+                        projectRoot: projectRoot,
+                        scan: scan,
+                        log: log,
+                        progress: progress,
+                        processHandle: processHandle,
+                        gateOwner: owner,
+                        visiting: chain
+                    )
+                    try await ExecutionRuntime.runUntilExit(
+                        execution: referencedExecution,
+                        configName: referenced.name,
+                        processHandle: processHandle,
+                        log: log
+                    )
+                }
+            ),
+            visiting: visiting,
+            handle: processHandle,
+            log: log
+        )
+    }
+
     // MARK: - 能力门禁（§23/§P0-5）
 
     /// 运行类型判断留在 Core：GUI / CLI 不许自己 `if Maven`、`if SpringBoot`。
@@ -495,11 +759,15 @@ public struct ExecutionCoordinator: Sendable {
     static func ensureRunnable(_ config: RunConfiguration, scan: ScanResult) throws {
         let capability = ConfigurationCapabilityResolver.resolve(config, scan: scan)
         guard !capability.isLaunchable else { return }
-        if config.type == .application || config.type == .springBoot,
-           capability.buildSystem == nil {
-            throw IdeaLightRunError.buildToolNotFound(
-                detail: capability.primaryReason ?? "无法确定项目的构建系统。"
-            )
+        switch config.type {
+        case .application, .springBoot, .maven, .junit:
+            if capability.buildSystem == nil {
+                throw IdeaLightRunError.buildToolNotFound(
+                    detail: capability.primaryReason ?? "无法确定项目的构建系统。"
+                )
+            }
+        default:
+            break
         }
         try ensureRunnable(capability, for: config)
     }
@@ -512,11 +780,34 @@ public struct ExecutionCoordinator: Sendable {
         let reason = capability.primaryReason ?? "当前版本尚未接管该类型。"
         throw IdeaLightRunError.unsupportedConfiguration(
             detail: "“\(config.name)”（\(config.type.displayName)）当前不能直接启动：\(reason)"
-                + " 现在能替代 IDEA Run 按钮的是 Application、Spring Boot、JAR Application 与 Compound 配置。"
+                + " 现在能替代 IDEA Run 按钮的是 Application、Spring Boot、JAR Application、"
+                + "Maven、JUnit 与 Compound 配置。"
         )
     }
 
     // MARK: - 内部
+
+    /// Maven 配置的 Module 是可选的；只有显式写了 module 名却找不到时才报错，
+    /// 不能因为没选 Module 就阻止 `mvn` 本身执行。
+    private static func resolveModuleIfSpecified(
+        config: RunConfiguration,
+        projectRoot: URL,
+        knownModules: [ProjectModule]
+    ) throws -> ProjectModule? {
+        let name = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !name.isEmpty else { return nil }
+        let resolution = ModuleResolver.resolveModule(
+            named: name,
+            mainClass: nil,
+            projectRoot: projectRoot,
+            knownModules: knownModules
+        )
+        guard let module = resolution.module else {
+            let detail = resolution.warnings.map(\.detail).joined(separator: "；")
+            throw IdeaLightRunError.moduleNotFound(detail: detail.isEmpty ? "找不到 Module “\(name)”。" : detail)
+        }
+        return module
+    }
 
     private static func resolveJDK(
         config: RunConfiguration,

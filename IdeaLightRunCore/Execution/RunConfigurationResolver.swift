@@ -78,9 +78,10 @@ public struct RunConfigurationResolver: Sendable {
         let workingDirectoryPath: String
         if let raw = config.workingDirectory, !raw.isEmpty {
             workingDirectoryPath = resolveField(raw)
-        } else if config.type == .jar {
+        } else if config.type == .jar || config.type == .maven {
             // IDEA 的 JarApplicationConfiguration.onNewConfigurationCreated 默认用项目根，
             // 不是 module 目录；带 module 的搜索范围配置也不改变这一点。
+            // Maven 配置的默认工作目录同样是项目根（pom / -pl 都相对于它）。
             workingDirectoryPath = projectRoot.path
         } else {
             workingDirectoryPath = (moduleDirectory ?? projectRoot).path
@@ -148,7 +149,13 @@ public struct RunConfigurationResolver: Sendable {
     /// IDEA 的 JAR Path 是绝对路径；宏展开后若仍是相对路径，按项目根解释，
     /// 与 Working Directory 的默认值保持一致。
     static func fileURL(for path: String, projectRoot: URL) -> URL {
-        let expanded = (path as NSString).expandingTildeInPath
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        // JUnit 的目录选择器可能保存 file:// URL；先按 URL 还原路径，
+        // 否则会被当成项目根下的相对路径。
+        if trimmed.hasPrefix("file://"), let url = URL(string: trimmed) {
+            return url.standardizedFileURL
+        }
+        let expanded = (trimmed as NSString).expandingTildeInPath
         if expanded.hasPrefix("/") {
             return URL(fileURLWithPath: expanded)
         }

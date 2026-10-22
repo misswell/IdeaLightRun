@@ -681,6 +681,10 @@ struct ConfigurationRow: View {
         var parts: [String] = [config.type.displayName]
         if config.type == .jar, let jarPath = config.jarPath {
             parts.append(jarPath)
+        } else if let mavenOptions = config.mavenOptions, !mavenOptions.goals.isEmpty {
+            parts.append(mavenOptions.goals.joined(separator: " "))
+        } else if let junitOptions = config.junitOptions {
+            parts.append(junitOptions.target.displayText)
         } else if let mainClass = config.mainClass {
             parts.append(mainClass)
         } else if !config.compoundMembers.isEmpty {
@@ -1068,6 +1072,35 @@ struct ConfigurationDetailView: View {
                     } else {
                         if config.type == .jar {
                             keyRow("JAR Path", config.jarPath, monospaced: true)
+                        } else if config.type == .maven {
+                            if let options = config.mavenOptions {
+                                keyRow("Maven Goals", options.goals.joined(separator: " "), monospaced: true)
+                                keyRow("Command Line", options.commandLineOptions, monospaced: true)
+                                if !options.profiles.isEmpty {
+                                    keyRow("Profiles", options.profiles.joined(separator: ", "))
+                                }
+                                if !options.selectedProjects.isEmpty {
+                                    keyRow("Projects", options.selectedProjects.joined(separator: ", "), monospaced: true)
+                                }
+                                if !options.properties.isEmpty {
+                                    keyRow(
+                                        "Properties",
+                                        options.properties.keys.sorted().map { "\($0)=\(options.properties[$0] ?? "")" }
+                                            .joined(separator: "  "),
+                                        monospaced: true
+                                    )
+                                }
+                                keyRow("Maven JRE", options.jreName)
+                                if !options.unsupportedOptions.isEmpty {
+                                    keyRow("不支持的选项", options.unsupportedOptions.joined(separator: "、"))
+                                }
+                            }
+                            keyRow("Module", config.moduleName)
+                        } else if config.type == .junit {
+                            if let options = config.junitOptions {
+                                keyRow("测试目标", options.target.displayText, monospaced: true)
+                            }
+                            keyRow("Module", config.moduleName)
                         } else {
                             keyRow("Main Class", config.mainClass, monospaced: true)
                             keyRow("Module", config.moduleName)
@@ -1076,8 +1109,12 @@ struct ConfigurationDetailView: View {
                             keyRow("Module 目录", directory.path, monospaced: true)
                         }
                         keyRow("JDK", jdkText)
-                        keyRow("VM Options", config.vmOptions, monospaced: true)
-                        keyRow("Program Arguments", config.programArguments, monospaced: true)
+                        if config.type == .maven {
+                            keyRow("Maven VM Options", config.mavenOptions?.vmOptions, monospaced: true)
+                        } else {
+                            keyRow("VM Options", config.vmOptions, monospaced: true)
+                            keyRow("Program Arguments", config.programArguments, monospaced: true)
+                        }
                         if !config.springProfiles.isEmpty {
                             keyRow("Spring Profiles", config.springProfiles.joined(separator: ", "))
                         }
@@ -1250,11 +1287,12 @@ struct ConfigurationDetailView: View {
         let configJDKName = config.jreReference
         let projectJDKName = result.projectJDKName
         let moduleName = config.moduleName
-        let mainClass = config.mainClass
+        // JUnit 的 MAIN_CLASS_NAME 是测试类，不是应用入口，不能拿来定位模块。
+        let mainClass = config.type == .junit ? nil : config.mainClass
         let projectRoot = result.projectRoot
         let knownModules = result.modules
         let rawWorkDir = config.workingDirectory
-        let isJar = config.type == .jar
+        let defaultsToProjectRoot = config.type == .jar || config.type == .maven
 
         let (jdk, moduleDir, workDir) = await Task.detached(priority: .userInitiated) { () -> (JDKResolution, URL?, String?) in
             let resolution = ModuleResolver.resolveModule(
@@ -1266,7 +1304,7 @@ struct ConfigurationDetailView: View {
             let jdk = JDKResolver().resolve(configJDKName: configJDKName, projectJDKName: projectJDKName)
             let workDir = rawWorkDir.map {
                 MacroResolver(projectDir: projectRoot, moduleDir: resolution.module?.directory).resolve($0).value
-            } ?? (isJar ? projectRoot.path : nil)
+            } ?? (defaultsToProjectRoot ? projectRoot.path : nil)
             return (jdk, resolution.module?.directory, workDir)
         }.value
 

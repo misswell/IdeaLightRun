@@ -181,6 +181,119 @@ public enum ConfigurationWarning: Equatable, Hashable, Codable, Sendable {
     }
 }
 
+/// IDEA Maven 运行配置（MavenRunConfigurationType）的执行参数。
+///
+/// 这里只保留会改变 Maven 进程语义的字段。IDEA 的 General Settings 里
+/// 无法等价映射的选项（自定义 mavenHome、userSettingsFile 等）进入
+/// `unsupportedOptions`，由能力判定显式拒绝——不能悄悄按默认 Maven 跑。
+public struct MavenRunOptions: Equatable, Codable, Sendable {
+    /// IDEA 的 goals 列表，原文保存（如 `clean`、`spring-boot:run`）。
+    public var goals: [String]
+    /// IDEA 的 "Command line"（cmdOptions），执行前再分词。
+    public var commandLineOptions: String
+    /// IDEA 的 pomFileName；空表示工作目录下的 pom.xml。
+    public var pomFileName: String
+    public var profiles: [String]
+    /// Maven Runner 的 properties，映射为 `-Dkey=value`。
+    public var properties: [String: String]
+    /// Maven Runner 的 environmentProperties，只作用于 Maven 进程。
+    public var environmentVariables: [String: String]
+    /// Maven Runner 的 vmOptions，映射为 `MAVEN_OPTS`。
+    public var vmOptions: String
+    /// `#USE_PROJECT_JDK`（IDEA 默认）或 `#JAVA_HOME`；其余值暂不支持。
+    public var jreName: String
+    public var skipTests: Bool
+    /// General Settings 中可等价映射的选项（`-o` / `-T 1C` / `-X` 等）。
+    public var generalArguments: [String]
+    /// `alwaysUpdateSnapshots` 的原始值。实际参数已由 General Settings 映射进
+    /// `generalArguments`（`-U`）；直接运行不追加 `-nsu`，保留该字段供展示与诊断。
+    public var updateSnapshots: Bool
+    /// `projectsCmdOptionValues`：Maven `-pl` 的工程列表。
+    public var selectedProjects: [String]
+    /// 无法等价映射的 IDEA 选项名（原始字段名），非空时不允许 READY。
+    public var unsupportedOptions: [String]
+
+    public init(
+        goals: [String] = [],
+        commandLineOptions: String = "",
+        pomFileName: String = "",
+        profiles: [String] = [],
+        properties: [String: String] = [:],
+        environmentVariables: [String: String] = [:],
+        vmOptions: String = "",
+        jreName: String = "#USE_PROJECT_JDK",
+        skipTests: Bool = false,
+        generalArguments: [String] = [],
+        updateSnapshots: Bool = false,
+        selectedProjects: [String] = [],
+        unsupportedOptions: [String] = []
+    ) {
+        self.goals = goals
+        self.commandLineOptions = commandLineOptions
+        self.pomFileName = pomFileName
+        self.profiles = profiles
+        self.properties = properties
+        self.environmentVariables = environmentVariables
+        self.vmOptions = vmOptions
+        self.jreName = jreName
+        self.skipTests = skipTests
+        self.generalArguments = generalArguments
+        self.updateSnapshots = updateSnapshots
+        self.selectedProjects = selectedProjects
+        self.unsupportedOptions = unsupportedOptions
+    }
+}
+
+/// IDEA JUnit 运行配置（type="JUnit"）的测试目标。
+/// IDEA 的 `TEST_OBJECT` 决定解释方式；空 PACKAGE_NAME + package 表示整个模块。
+public struct JUnitRunOptions: Equatable, Codable, Sendable {
+    public enum Target: Equatable, Hashable, Codable, Sendable {
+        case all
+        case className(String)
+        case method(className: String, methodName: String)
+        case package(String)
+        case directory(String)
+        /// 规范化成 `Class` 或 `Class#method`，构建系统再转成各自的过滤语法。
+        case patterns([String])
+        case tags([String])
+        case uniqueId(String)
+        case unsupported(String)
+
+        public var displayText: String {
+            switch self {
+            case .all:
+                return "整个模块"
+            case .className(let name):
+                return name
+            case .method(let className, let methodName):
+                return "\(className)#\(methodName)"
+            case .package(let name):
+                return "包 \(name)"
+            case .directory(let path):
+                return "目录 \(path)"
+            case .patterns(let patterns):
+                return patterns.joined(separator: ", ")
+            case .tags(let tags):
+                return "标签 \(tags.joined(separator: ", "))"
+            case .uniqueId(let id):
+                return "Unique ID \(id)"
+            case .unsupported(let raw):
+                return raw
+            }
+        }
+    }
+
+    public var target: Target
+    /// IDEA 的 `PARAMETERS` 会传给测试运行器；Surefire / Gradle 的测试 fork
+    /// 没有等价入口，非空时能力判定会拒绝，而不是丢弃。
+    public var programArguments: String
+
+    public init(target: Target, programArguments: String = "") {
+        self.target = target
+        self.programArguments = programArguments
+    }
+}
+
 /// §7: 配置来源优先级，rawValue 越小优先级越高。
 public struct ConfigurationSource: Equatable, Codable, Sendable {
     public enum Kind: Int, Equatable, Codable, Sendable, Comparable {
@@ -239,6 +352,10 @@ public struct RunConfiguration: Identifiable, Equatable, Codable, Sendable {
     public var allowParallelRun: Bool
     public var compoundMembers: [CompoundMember]
     public var beforeLaunchTasks: [BeforeLaunchTask]
+    /// Maven 直接运行参数；仅 `.maven` 配置有值。
+    public var mavenOptions: MavenRunOptions?
+    /// JUnit 测试目标；仅 `.junit` 配置有值。
+    public var junitOptions: JUnitRunOptions?
     public var source: ConfigurationSource
     /// §10: 未知字段进入 rawOptions，保证 IDEA 新字段不至于让解析整体失败。
     public var rawOptions: [String: String]
@@ -262,6 +379,8 @@ public struct RunConfiguration: Identifiable, Equatable, Codable, Sendable {
         allowParallelRun: Bool = false,
         compoundMembers: [CompoundMember] = [],
         beforeLaunchTasks: [BeforeLaunchTask] = [],
+        mavenOptions: MavenRunOptions? = nil,
+        junitOptions: JUnitRunOptions? = nil,
         source: ConfigurationSource,
         rawOptions: [String: String] = [:],
         warnings: [ConfigurationWarning] = []
@@ -283,6 +402,8 @@ public struct RunConfiguration: Identifiable, Equatable, Codable, Sendable {
         self.allowParallelRun = allowParallelRun
         self.compoundMembers = compoundMembers
         self.beforeLaunchTasks = beforeLaunchTasks
+        self.mavenOptions = mavenOptions
+        self.junitOptions = junitOptions
         self.source = source
         self.rawOptions = rawOptions
         self.warnings = warnings

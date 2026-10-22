@@ -154,6 +154,241 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
         return resolution
     }
 
+    // MARK: - Maven 运行配置（M5）
+
+    /// MavenRunConfigurationType：按 IDEA 保存的 goals / profiles / properties 构造
+    /// 一次 Maven 进程。直接运行不追加 `-nsu`（那是本工具的 classpath 优化，
+    /// 会改变 IDEA 用户期望的 SNAPSHOT 更新语义）。
+    public func mavenExecution(
+        _ config: RunConfiguration,
+        module: ProjectModule?,
+        context: BuildInvocationContext,
+        log: @escaping LogCallback
+    ) throws -> ExecutableLaunchPlan {
+        guard let options = config.mavenOptions else {
+            throw IdeaLightRunError.invalidConfiguration(
+                detail: "配置 “\(config.name)” 没有 Maven 运行参数。"
+            )
+        }
+        guard options.unsupportedOptions.isEmpty else {
+            throw IdeaLightRunError.unsupportedConfiguration(
+                detail: "配置 “\(config.name)” 使用了暂不支持的 Maven 选项："
+                    + options.unsupportedOptions.joined(separator: "、")
+                    + "。请在 IDEA 中改回默认设置，或用 Maven goal 表达同样的语义。"
+            )
+        }
+
+        var warnings: [ConfigurationWarning] = []
+        let macros = MacroResolver(
+            projectDir: projectRoot,
+            moduleDir: module?.directory,
+            environment: context.environment
+        )
+        func resolve(_ raw: String) -> String {
+            let resolution = macros.resolve(raw)
+            for warning in resolution.warnings {
+                MacroResolver.appendWarning(warning, into: &warnings)
+            }
+            return resolution.value
+        }
+
+        // 先把所有用户字段解析完再判定致命宏：这样 $Prompt$ 不会被
+        // “pom 不存在”之类的次要错误盖掉（见 RunConfigurationResolver 的注释）。
+        let resolvedPomFileName = resolve(options.pomFileName)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedCommandLineOptions = resolve(options.commandLineOptions)
+        let resolvedProfiles = options.profiles.map(resolve)
+        let resolvedSelectedProjects = options.selectedProjects.map(resolve)
+        let resolvedProperties = options.properties.keys.sorted().compactMap { key -> (String, String)? in
+            guard let value = options.properties[key] else { return nil }
+            return (resolve(key), resolve(value))
+        }
+        let resolvedGoals = options.goals.map(resolve)
+        let resolvedVMOptions = resolve(options.vmOptions)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try RunConfigurationResolver.rejectUnresolvedMacros(warnings: warnings, configName: config.name)
+
+        let workingDirectory = context.workingDirectory
+        var arguments: [String] = []
+
+        let pomFileName = resolvedPomFileName
+        let pomURL: URL
+        if pomFileName.isEmpty {
+            pomURL = workingDirectory.appendingPathComponent("pom.xml")
+        } else {
+            pomURL = RunConfigurationResolver.fileURL(for: pomFileName, projectRoot: workingDirectory)
+        }
+        guard FileManager.default.fileExists(atPath: pomURL.path) else {
+            throw IdeaLightRunError.invalidConfiguration(
+                detail: "Maven 配置 “\(config.name)” 指向的 pom 不存在：\(pomURL.path)"
+                    + (pomFileName.isEmpty ? "（Working Directory 下没有 pom.xml）" : "（原始值：\(options.pomFileName)）")
+            )
+        }
+        if !pomFileName.isEmpty {
+            arguments += ["-f", pomURL.path]
+        }
+
+        arguments += options.generalArguments
+        arguments += CommandLineTokenizer.tokenize(resolvedCommandLineOptions)
+
+        if !resolvedProfiles.isEmpty {
+            arguments.append("-P" + resolvedProfiles.joined(separator: ","))
+        }
+        for (key, value) in resolvedProperties {
+            arguments.append("-D\(key)=\(value)")
+        }
+        if !resolvedSelectedProjects.isEmpty {
+            arguments += ["-pl", resolvedSelectedProjects.joined(separator: ",")]
+        }
+        if options.skipTests {
+            arguments.append("-DskipTests")
+        }
+
+        var goalTokens: [String] = []
+        for goal in resolvedGoals {
+            goalTokens += CommandLineTokenizer.tokenize(goal)
+        }
+        guard !goalTokens.isEmpty else {
+            throw IdeaLightRunError.invalidConfiguration(
+                detail: "Maven 配置 “\(config.name)” 没有保存任何 goal，无法运行。"
+            )
+        }
+        arguments += goalTokens
+
+        var environment = context.environment
+        let vmOptions = resolvedVMOptions
+        if !vmOptions.isEmpty {
+            environment["MAVEN_OPTS"] = vmOptions
+        }
+        switch options.jreName {
+        case "", "#USE_PROJECT_JDK":
+            if let javaHome = self.environment["JAVA_HOME"] {
+                environment["JAVA_HOME"] = javaHome
+            }
+        case "#JAVA_HOME":
+            // IDEA 的 "JAVA_HOME" 选项使用启动器的 JAVA_HOME，而不是项目 SDK。
+            guard let javaHome = ProcessInfo.processInfo.environment["JAVA_HOME"], !javaHome.isEmpty else {
+                throw IdeaLightRunError.jdkNotFound(
+                    detail: "Maven 配置 “\(config.name)” 选择了 JAVA_HOME，但当前环境没有设置 JAVA_HOME。"
+                )
+            }
+            environment["JAVA_HOME"] = javaHome
+        default:
+            throw IdeaLightRunError.unsupportedConfiguration(
+                detail: "Maven 配置 “\(config.name)” 指定的 JRE “\(options.jreName)” 暂不支持；"
+                    + "请改用 IDEA 默认的 Project JDK。"
+            )
+        }
+
+        if mavenExecutable.lastPathComponent != "mvnw" {
+            arguments.insert("-B", at: 0)
+        }
+        log(LogLine(
+            stream: .system,
+            text: "[IdeaLightRun] Maven goal：\(goalTokens.joined(separator: " "))（工作目录 \(workingDirectory.path)）"
+        ))
+        return ExecutableLaunchPlan(
+            executable: mavenExecutable,
+            arguments: arguments,
+            environment: environment,
+            workingDirectory: workingDirectory
+        )
+    }
+
+    /// JUnit → Surefire。测试筛选在目标模块内展开成具体类名，
+    /// 避免 `-pl module -am` 把上游模块的同名测试一起跑起来。
+    public func testExecution(
+        _ config: RunConfiguration,
+        module: ProjectModule,
+        context: BuildInvocationContext,
+        log: @escaping LogCallback
+    ) throws -> TestExecutionPlan {
+        guard let options = config.junitOptions else {
+            throw IdeaLightRunError.invalidConfiguration(
+                detail: "配置 “\(config.name)” 没有 JUnit 测试目标。"
+            )
+        }
+        if !options.programArguments.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw IdeaLightRunError.unsupportedConfiguration(
+                detail: "JUnit 配置 “\(config.name)” 设置了 Program Arguments；"
+                    + "Surefire 无法从命令行传给测试进程，当前版本不能运行。请在 IDEA 中去掉该字段。"
+            )
+        }
+
+        // Surefire 的 fork 工作目录固定为模块 basedir，命令行没有可靠入口覆盖。
+        let moduleWorkingDirectory = module.directory.standardizedFileURL.path
+        let requestedWorkingDirectory = context.workingDirectory.standardizedFileURL.path
+        guard moduleWorkingDirectory == requestedWorkingDirectory else {
+            throw IdeaLightRunError.unsupportedConfiguration(
+                detail: "JUnit 配置 “\(config.name)” 的 Working Directory 是 \(requestedWorkingDirectory)，"
+                    + "但 Maven Surefire 只能使用模块目录 \(moduleWorkingDirectory)。"
+                    + "请在 IDEA 中把 Working Directory 改为模块目录后再运行。"
+            )
+        }
+
+        let filters = try TestTargetResolver.resolve(
+            options.target,
+            moduleDirectory: module.directory,
+            projectRoot: projectRoot,
+            environment: context.environment
+        )
+
+        var warnings: [ConfigurationWarning] = []
+        let macros = MacroResolver(
+            projectDir: projectRoot,
+            moduleDir: module.directory,
+            environment: context.environment
+        )
+        let vmOptions = (config.vmOptions ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedVMOptions: String
+        if vmOptions.isEmpty {
+            resolvedVMOptions = ""
+        } else {
+            let resolution = macros.resolve(vmOptions)
+            for warning in resolution.warnings {
+                MacroResolver.appendWarning(warning, into: &warnings)
+            }
+            resolvedVMOptions = resolution.value
+        }
+        try RunConfigurationResolver.rejectUnresolvedMacros(warnings: warnings, configName: config.name)
+
+        var base: [String] = []
+        if let scope = moduleScope(for: module) {
+            base += ["-pl", scope, "-am"]
+        }
+        base.append("test")
+        if !filters.isEmpty {
+            base.append("-Dtest=" + filters.joined(separator: ","))
+            // 上游模块（-am）不会包含目标模块的测试类；没有匹配不是失败。
+            base.append("-Dsurefire.failIfNoSpecifiedTests=false")
+        }
+        if !resolvedVMOptions.isEmpty {
+            base.append("-DargLine=\(resolvedVMOptions)")
+        }
+
+        var environment = context.environment
+        if let javaHome = self.environment["JAVA_HOME"] {
+            environment["JAVA_HOME"] = javaHome
+        }
+        log(LogLine(
+            stream: .system,
+            text: "[IdeaLightRun] JUnit（Maven Surefire）：\(options.target.displayText)"
+                + (filters.isEmpty ? "" : " → \(filters.joined(separator: ", "))")
+        ))
+        return TestExecutionPlan(
+            process: ExecutableLaunchPlan(
+                executable: mavenExecutable,
+                arguments: mavenArguments(base: base),
+                environment: environment,
+                workingDirectory: projectRoot
+            ),
+            buildSystem: .maven,
+            moduleName: module.name,
+            targetDescription: options.target.displayText,
+            filters: filters
+        )
+    }
+
     public func hasFreshClasspathCache(for target: BuildTarget) -> Bool {
         guard let cached = ClasspathCache.load(projectRoot: projectRoot, variant: target.variant) else {
             return false

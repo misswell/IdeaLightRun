@@ -82,6 +82,13 @@ public enum ClasspathCache {
             .appendingPathComponent("idealauncher-init.gradle")
     }
 
+    /// JUnit 测试的 init script：与 classpath 的 init script 分开，
+    /// 避免测试 JVM 参数 / 工作目录混进构建解析路径。
+    public static func gradleTestInitScriptURL(projectRoot: URL, variant: ClasspathVariant) -> URL {
+        cacheDirectory(projectRoot: projectRoot, variant: variant)
+            .appendingPathComponent("idealauncher-test-init.gradle")
+    }
+
     public static func load(projectRoot: URL, variant: ClasspathVariant) -> CachedClasspath? {
         guard let data = try? Data(contentsOf: cachedClasspathURL(projectRoot: projectRoot, variant: variant)),
               let cached = try? JSONDecoder().decode(CachedClasspath.self, from: data) else {

@@ -154,7 +154,7 @@ struct IdeaLightRunCLI {
             if let reason = capability.primaryReason {
                 print("      Reason:   \(reason)")
             }
-            if let mainClass = config.mainClass {
+            if let mainClass = config.mainClass, config.type != .junit {
                 print("      Main:     \(mainClass)")
             }
             if let moduleName = config.moduleName {
@@ -162,6 +162,23 @@ struct IdeaLightRunCLI {
             }
             if config.type == .compound {
                 print("      Members:  \(config.compoundMembers.map(\.name).joined(separator: ", "))")
+            }
+            if let mavenOptions = config.mavenOptions {
+                if !mavenOptions.goals.isEmpty {
+                    print("      Goals:    \(mavenOptions.goals.joined(separator: " "))")
+                }
+                if !mavenOptions.profiles.isEmpty {
+                    print("      Profiles: \(mavenOptions.profiles.joined(separator: ","))")
+                }
+                if !mavenOptions.selectedProjects.isEmpty {
+                    print("      Projects: \(mavenOptions.selectedProjects.joined(separator: ","))")
+                }
+                if !mavenOptions.commandLineOptions.isEmpty {
+                    print("      Command:  \(mavenOptions.commandLineOptions)")
+                }
+            }
+            if let junitOptions = config.junitOptions {
+                print("      Test:     \(junitOptions.target.displayText)")
             }
             if let vmOptions = config.vmOptions {
                 print("      VM:       \(vmOptions)")
@@ -232,7 +249,8 @@ struct IdeaLightRunCLI {
     static func resolvedModuleDirectory(for config: RunConfiguration, result: ScanResult) -> URL? {
         let resolution = ModuleResolver.resolveModule(
             named: config.moduleName,
-            mainClass: config.mainClass,
+            // JUnit 的 MAIN_CLASS_NAME 是测试类，不是应用入口，不能拿来定位模块。
+            mainClass: config.type == .junit ? nil : config.mainClass,
             projectRoot: result.projectRoot,
             knownModules: result.modules
         )

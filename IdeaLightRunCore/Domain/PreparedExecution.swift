@@ -5,11 +5,44 @@ import Foundation
 public indirect enum PreparedExecution: Sendable {
     case process(ExecutableLaunchPlan)
     case compound(CompoundExecutionPlan)
+    /// 测试执行：底层仍是一个进程，但终态还要解释测试结果并输出汇总。
+    case test(TestExecutionPlan)
 
     /// 单个进程执行计划。Compound 由组合执行器展开，调用方不应把它硬转成单进程。
     public var processPlan: ExecutableLaunchPlan? {
-        if case .process(let plan) = self { return plan }
-        return nil
+        switch self {
+        case .process(let plan):
+            return plan
+        case .test(let plan):
+            return plan.process
+        case .compound:
+            return nil
+        }
+    }
+}
+
+/// JUnit 测试执行计划。命令由构建系统适配器生成，
+/// `filters` 是已按构建系统语法转换的精确筛选（空表示模块内全部测试）。
+public struct TestExecutionPlan: Sendable {
+    public var process: ExecutableLaunchPlan
+    public var buildSystem: BuildSystemKind
+    public var moduleName: String
+    /// 界面与汇总用的目标描述（类名 / 方法 / 包 / 目录 / 整个模块）。
+    public var targetDescription: String
+    public var filters: [String]
+
+    public init(
+        process: ExecutableLaunchPlan,
+        buildSystem: BuildSystemKind,
+        moduleName: String,
+        targetDescription: String,
+        filters: [String]
+    ) {
+        self.process = process
+        self.buildSystem = buildSystem
+        self.moduleName = moduleName
+        self.targetDescription = targetDescription
+        self.filters = filters
     }
 }
 

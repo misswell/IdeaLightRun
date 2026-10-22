@@ -46,6 +46,18 @@ public enum RunConfigurationMapper {
         var rawOptions: [String: String] = [:]
         var warnings: [ConfigurationWarning] = []
 
+        // Maven 的 MavenSettings 是嵌套结构；JUnit 的目标字段也是独立的
+        // TEST_OBJECT 家族。二者在这里聚合，循环结束后统一转成选项模型。
+        var mavenSettingsNode: XMLElementNode?
+        var junitTargetKind: String?
+        var junitPackageName = ""
+        var junitMethodName = ""
+        var junitUniqueId = ""
+        var junitProgramArguments = ""
+        var junitDirectory: String?
+        var junitPatterns: [String] = []
+        var junitTags: [String] = []
+
         for child in node.children {
             switch child.name {
             case "option":
@@ -79,6 +91,20 @@ public enum RunConfigurationMapper {
                     }
                 } else if passParentEnvAliases.contains(optionName) {
                     passParentEnvironment = value != "false"
+                } else if type == .junit, optionName == "TEST_OBJECT" {
+                    junitTargetKind = value
+                } else if type == .junit, optionName == "METHOD_NAME" {
+                    junitMethodName = value
+                } else if type == .junit, optionName == "PACKAGE_NAME" {
+                    junitPackageName = value
+                } else if type == .junit, optionName == "UNIQUE_ID" {
+                    junitUniqueId = value
+                } else if type == .junit, optionName == "PARAMETERS" {
+                    junitProgramArguments = value
+                } else if type == .junit, optionName == "DIR" {
+                    if junitDirectory == nil, !value.isEmpty { junitDirectory = value }
+                } else if type == .junit, optionName == "TEST_SEARCH_SCOPE" {
+                    // IDEA 界面里的搜索范围，不改变要执行的测试集合。
                 } else {
                     rawOptions[optionName] = value
                 }
@@ -98,8 +124,69 @@ public enum RunConfigurationMapper {
                 if let memberName = child.attribute("name"), !memberName.isEmpty {
                     compoundMembers.append(CompoundMember(name: memberName, type: child.attribute("type") ?? ""))
                 }
+            case "MavenSettings" where type == .maven:
+                mavenSettingsNode = child
+            case "patterns" where type == .junit:
+                for pattern in child.children where pattern.name == "pattern" {
+                    guard let testClass = pattern.attribute("testClass"), !testClass.isEmpty else { continue }
+                    let methodName = pattern.attribute("methodName") ?? ""
+                    let normalized = methodName.isEmpty ? testClass : "\(testClass)#\(methodName)"
+                    if !junitPatterns.contains(normalized) { junitPatterns.append(normalized) }
+                }
+            case "dir" where type == .junit:
+                if junitDirectory == nil {
+                    let value = child.attribute("value") ?? child.attribute("path") ?? ""
+                    if !value.isEmpty { junitDirectory = value }
+                }
+            case "tag" where type == .junit:
+                if let value = child.attribute("value"), !value.isEmpty, !junitTags.contains(value) {
+                    junitTags.append(value)
+                }
+            case "tags" where type == .junit:
+                for tag in child.children where tag.name == "tag" {
+                    if let value = tag.attribute("value"), !value.isEmpty, !junitTags.contains(value) {
+                        junitTags.append(value)
+                    }
+                }
             default:
                 break
+            }
+        }
+
+        var mavenOptions: MavenRunOptions?
+        if type == .maven {
+            let parsed = parseMavenOptions(from: mavenSettingsNode)
+            mavenOptions = parsed.options
+            if workingDirectory == nil, let parsedWorkingDirectory = parsed.workingDirectory, !parsedWorkingDirectory.isEmpty {
+                workingDirectory = parsedWorkingDirectory
+            }
+            if let parsedPassParent = parsed.passParentEnvironment {
+                passParentEnvironment = parsedPassParent
+            }
+            // 顶层 <envs> 与 Maven Runner 的 environmentProperties 都是 Maven 进程环境；
+            // 顶层显式值优先。
+            for (key, value) in parsed.options.environmentVariables where environmentVariables[key] == nil {
+                environmentVariables[key] = value
+            }
+        }
+
+        var junitOptions: JUnitRunOptions?
+        if type == .junit {
+            junitOptions = JUnitRunOptions(
+                target: deriveJUnitTarget(
+                    kind: junitTargetKind,
+                    className: mainClass,
+                    methodName: junitMethodName,
+                    packageName: junitPackageName,
+                    directory: junitDirectory,
+                    patterns: junitPatterns,
+                    tags: junitTags,
+                    uniqueId: junitUniqueId
+                ),
+                programArguments: junitProgramArguments
+            )
+            if moduleName == nil {
+                warnings.append(.missingModule)
             }
         }
 
@@ -136,10 +223,231 @@ public enum RunConfigurationMapper {
             allowParallelRun: allowParallel,
             compoundMembers: compoundMembers,
             beforeLaunchTasks: beforeLaunchTasks,
+            mavenOptions: mavenOptions,
+            junitOptions: junitOptions,
             source: source,
             rawOptions: rawOptions,
             warnings: warnings
         )
+    }
+
+    // MARK: - Maven
+
+    private struct ParsedMavenSettings {
+        var options = MavenRunOptions()
+        var passParentEnvironment: Bool?
+        var workingDirectory: String?
+    }
+
+    private static func parseMavenOptions(from settingsNode: XMLElementNode?) -> ParsedMavenSettings {
+        var parsed = ParsedMavenSettings()
+        guard let settingsNode else { return parsed }
+        var unsupported: [String] = []
+
+        if let parameters = settingsNode.firstDescendant(named: "MavenRunnerParameters") {
+            parsed.options.goals = optionValues(in: parameters, name: "goals")
+            parsed.options.commandLineOptions = optionValue(in: parameters, name: "cmdOptions") ?? ""
+            parsed.options.pomFileName = optionValue(in: parameters, name: "pomFileName") ?? ""
+            parsed.options.profiles = optionValues(in: parameters, name: "profiles")
+            for (profile, active) in optionMap(in: parameters, name: "profilesMap") where active == "true" {
+                if !parsed.options.profiles.contains(profile) { parsed.options.profiles.append(profile) }
+            }
+            parsed.options.selectedProjects = optionValues(in: parameters, name: "projectsCmdOptionValues")
+            if let workingDirectory = nonEmpty(optionValue(in: parameters, name: "workingDirPath")) {
+                parsed.workingDirectory = workingDirectory
+            }
+            // IDEA 用它定位多模块 -pl 的根；没有等价命令行参数时不能假装支持。
+            if nonEmpty(optionValue(in: parameters, name: "multimoduleDir")) != nil {
+                unsupported.append("multimoduleDir")
+            }
+            unsupported += unknownOptions(in: parameters, handled: [
+                "cmdOptions", "goals", "multimoduleDir", "pomFileName", "profiles",
+                "profilesMap", "projectsCmdOptionValues", "resolveToWorkspace", "workingDirPath",
+            ])
+        }
+
+        var generalArguments: [String] = []
+        if let general = settingsNode.firstDescendant(named: "MavenGeneralSettings") {
+            if boolOption(in: general, name: "workOffline") {
+                generalArguments.append("-o")
+            }
+            if boolOption(in: general, name: "alwaysUpdateSnapshots") {
+                parsed.options.updateSnapshots = true
+                generalArguments.append("-U")
+            }
+            if let threads = nonEmpty(optionValue(in: general, name: "threads")) {
+                generalArguments += ["-T", threads]
+            }
+            if let level = nonEmpty(optionValue(in: general, name: "outputLevel")) {
+                switch level {
+                case "INFO": break
+                case "DEBUG": generalArguments.append("-X")
+                case "QUIET": generalArguments.append("-q")
+                default: unsupported.append("outputLevel=\(level)")
+                }
+            }
+            if let checksum = nonEmpty(optionValue(in: general, name: "checksumPolicy")) {
+                switch checksum {
+                case "FAIL": generalArguments.append("-C")
+                case "WARN": generalArguments.append("-c")
+                case "IGNORE": break
+                default: unsupported.append("checksumPolicy=\(checksum)")
+                }
+            }
+            if let behavior = nonEmpty(optionValue(in: general, name: "failureBehavior")) {
+                switch behavior {
+                case "ERROR": break
+                case "FAIL_FAST": generalArguments.append("-ff")
+                case "FAIL_AT_END": generalArguments.append("-fae")
+                case "FAIL_NEVER": generalArguments.append("-fn")
+                default: unsupported.append("failureBehavior=\(behavior)")
+                }
+            }
+            if boolOption(in: general, name: "printErrorStackTraces") {
+                generalArguments.append("-e")
+            }
+            if boolOption(in: general, name: "usePluginRegistry") {
+                unsupported.append("usePluginRegistry")
+            }
+            if let mavenHome = nonEmpty(optionValue(in: general, name: "mavenHome")),
+               mavenHome != "Use Maven wrapper",
+               !mavenHome.hasPrefix("Bundled") {
+                unsupported.append("mavenHome")
+            }
+            if nonEmpty(optionValue(in: general, name: "userSettingsFile")) != nil {
+                unsupported.append("userSettingsFile")
+            }
+            if nonEmpty(optionValue(in: general, name: "localRepository")) != nil {
+                unsupported.append("localRepository")
+            }
+            unsupported += unknownOptions(in: general, handled: [
+                "alwaysUpdateSnapshots", "checksumPolicy", "failureBehavior", "localRepository",
+                "mavenHome", "outputLevel", "printErrorStackTraces", "threads",
+                "usePluginRegistry", "userSettingsFile", "workOffline",
+            ])
+        }
+        parsed.options.generalArguments = generalArguments
+
+        if let runner = settingsNode.firstDescendant(named: "MavenRunnerSettings") {
+            parsed.options.skipTests = boolOption(in: runner, name: "skipTests")
+            parsed.options.vmOptions = optionValue(in: runner, name: "vmOptions") ?? ""
+            parsed.options.jreName = nonEmpty(optionValue(in: runner, name: "jreName")) ?? "#USE_PROJECT_JDK"
+            if let passParent = optionValue(in: runner, name: "passParentEnv") {
+                parsed.passParentEnvironment = passParent != "false"
+            }
+            parsed.options.environmentVariables = optionMap(in: runner, name: "environmentProperties")
+            parsed.options.properties = optionMap(in: runner, name: "mavenProperties")
+            unsupported += unknownOptions(in: runner, handled: [
+                "delegateBuildToMaven", "environmentProperties", "jreName", "mavenProperties",
+                "passParentEnv", "runMavenInBackground", "skipTests", "vmOptions",
+            ])
+        }
+
+        parsed.options.unsupportedOptions = deduplicated(unsupported)
+        return parsed
+    }
+
+    private static func optionValue(in node: XMLElementNode, name: String) -> String? {
+        node.children.first { $0.name == "option" && $0.attribute("name") == name }?.attribute("value")
+    }
+
+    private static func optionValues(in node: XMLElementNode, name: String) -> [String] {
+        guard let container = node.children.first(where: { $0.name == "option" && $0.attribute("name") == name }),
+              let list = container.firstChild("list") ?? container.firstChild("set") else {
+            return []
+        }
+        return list.children
+            .filter { $0.name == "option" }
+            .compactMap { $0.attribute("value") }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func optionMap(in node: XMLElementNode, name: String) -> [String: String] {
+        guard let container = node.children.first(where: { $0.name == "option" && $0.attribute("name") == name }),
+              let map = container.firstChild("map") else {
+            return [:]
+        }
+        var result: [String: String] = [:]
+        for entry in map.children where entry.name == "entry" {
+            guard let key = entry.attribute("key"), !key.isEmpty else { continue }
+            result[key] = entry.attribute("value") ?? ""
+        }
+        return result
+    }
+
+    private static func boolOption(in node: XMLElementNode, name: String) -> Bool {
+        optionValue(in: node, name: name) == "true"
+    }
+
+    /// IDEA 的默认值与 "null" 占位不算“不支持字段”，其余未知 option 必须显式带出。
+    private static func unknownOptions(in node: XMLElementNode, handled: Set<String>) -> [String] {
+        node.children.compactMap { child -> String? in
+            guard child.name == "option",
+                  let name = child.attribute("name"),
+                  !handled.contains(name) else { return nil }
+            let value = child.attribute("value") ?? ""
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed != "null", trimmed != "false" else { return nil }
+            return name
+        }
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func deduplicated(_ values: [String]) -> [String] {
+        var result: [String] = []
+        for value in values where !result.contains(value) {
+            result.append(value)
+        }
+        return result
+    }
+
+    // MARK: - JUnit
+
+    private static func deriveJUnitTarget(
+        kind: String?,
+        className: String?,
+        methodName: String,
+        packageName: String,
+        directory: String?,
+        patterns: [String],
+        tags: [String],
+        uniqueId: String
+    ) -> JUnitRunOptions.Target {
+        let className = nonEmpty(className)
+        switch kind {
+        case "class":
+            guard let className else { return .unsupported("缺少测试类（MAIN_CLASS_NAME）") }
+            return .className(className)
+        case "method":
+            guard let className else { return .unsupported("缺少测试类（MAIN_CLASS_NAME）") }
+            let method = methodName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !method.isEmpty else { return .unsupported("缺少测试方法（METHOD_NAME）") }
+            return .method(className: className, methodName: method)
+        case "package":
+            let package = packageName.trimmingCharacters(in: .whitespacesAndNewlines)
+            // IDEA 2020+ 用空 PACKAGE_NAME + package 表示整个模块。
+            return package.isEmpty ? .all : .package(package)
+        case "directory":
+            guard let directory = nonEmpty(directory) else { return .unsupported("缺少测试目录") }
+            return .directory(directory)
+        case "pattern":
+            return patterns.isEmpty ? .unsupported("测试模式为空") : .patterns(patterns)
+        case "tags":
+            return tags.isEmpty ? .unsupported("测试标签为空") : .tags(tags)
+        case "uniqueId":
+            return .uniqueId(uniqueId.isEmpty ? "（空）" : uniqueId)
+        case nil:
+            // IDEA 的默认 TEST_OBJECT 是 class。
+            if let className { return .className(className) }
+            return .unsupported("缺少测试目标")
+        case .some(let raw):
+            return .unsupported("TEST_OBJECT=\(raw)")
+        }
     }
 
     /// §30: Before Launch 识别 Build / Build Project / Run Another Configuration /

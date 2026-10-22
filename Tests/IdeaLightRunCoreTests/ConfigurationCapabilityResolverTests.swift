@@ -127,19 +127,85 @@ final class ConfigurationCapabilityResolverTests: XCTestCase {
     }
 
     func testPlannedAndUnsupportedTypes() {
-        let planned: [RunConfigurationType] = [.maven, .gradle]
-        for type in planned {
-            let capability = ConfigurationCapabilityResolver.resolve(config(type), scan: scan())
-            XCTAssertEqual(capability.readiness, .planned, "\(type)")
-            XCTAssertFalse(capability.isLaunchable, "\(type)")
-        }
+        let capability = ConfigurationCapabilityResolver.resolve(config(.gradle), scan: scan())
+        XCTAssertEqual(capability.readiness, .planned)
+        XCTAssertFalse(capability.isLaunchable)
 
-        let unsupported: [RunConfigurationType] = [.junit, .unknown("TestNG")]
-        for type in unsupported {
-            let capability = ConfigurationCapabilityResolver.resolve(config(type), scan: scan())
-            XCTAssertEqual(capability.readiness, .unsupported, "\(type)")
-            XCTAssertFalse(capability.isLaunchable, "\(type)")
-        }
+        let unknown = ConfigurationCapabilityResolver.resolve(config(.unknown("TestNG")), scan: scan())
+        XCTAssertEqual(unknown.readiness, .unsupported)
+        XCTAssertFalse(unknown.isLaunchable)
+    }
+
+    func testMavenConfigWithGoalsIsReadyOnMavenProject() {
+        var maven = config(.maven, mainClass: nil, moduleName: nil)
+        maven.mavenOptions = MavenRunOptions(goals: ["clean", "package"])
+
+        let capability = ConfigurationCapabilityResolver.resolve(maven, scan: scan())
+        XCTAssertEqual(capability.readiness, .ready)
+        XCTAssertTrue(capability.isLaunchable)
+        XCTAssertEqual(capability.buildSystem, .maven)
+    }
+
+    func testMavenConfigWithoutGoalsBlocksLaunch() {
+        var maven = config(.maven, mainClass: nil, moduleName: nil)
+        maven.mavenOptions = MavenRunOptions(goals: [])
+
+        let capability = ConfigurationCapabilityResolver.resolve(maven, scan: scan())
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.missingFields.contains("Maven goals"))
+    }
+
+    func testMavenConfigWithUnsupportedOptionBlocksLaunch() {
+        var maven = config(.maven, mainClass: nil, moduleName: nil)
+        maven.mavenOptions = MavenRunOptions(goals: ["package"], unsupportedOptions: ["userSettingsFile"])
+
+        let capability = ConfigurationCapabilityResolver.resolve(maven, scan: scan())
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("userSettingsFile") })
+    }
+
+    func testMavenConfigRequiresPom() {
+        var maven = config(.maven, mainClass: nil, moduleName: nil)
+        maven.mavenOptions = MavenRunOptions(goals: ["package"])
+
+        let capability = ConfigurationCapabilityResolver.resolve(maven, scan: scan(maven: false))
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertNil(capability.buildSystem)
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("pom.xml") })
+    }
+
+    func testJUnitClassTargetIsReadyOnMavenProject() {
+        var junit = config(.junit, mainClass: "com.example.AppTest", moduleName: "app")
+        junit.junitOptions = JUnitRunOptions(target: .className("com.example.AppTest"))
+
+        let capability = ConfigurationCapabilityResolver.resolve(
+            junit,
+            scan: scan(modules: [ProjectModule(name: "app", directory: projectRoot, artifactId: "app")])
+        )
+        XCTAssertEqual(capability.readiness, .ready)
+        XCTAssertTrue(capability.isLaunchable)
+        XCTAssertEqual(capability.buildSystem, .maven)
+    }
+
+    func testJUnitWithoutModuleBlocksLaunch() {
+        var junit = config(.junit, mainClass: "com.example.AppTest", moduleName: nil)
+        junit.junitOptions = JUnitRunOptions(target: .className("com.example.AppTest"))
+
+        let capability = ConfigurationCapabilityResolver.resolve(junit, scan: scan())
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.missingFields.contains("Module"))
+    }
+
+    func testJUnitUnsupportedTargetBlocksLaunch() {
+        var junit = config(.junit, mainClass: nil, moduleName: "app")
+        junit.junitOptions = JUnitRunOptions(target: .tags(["slow"]))
+
+        let capability = ConfigurationCapabilityResolver.resolve(
+            junit,
+            scan: scan(modules: [ProjectModule(name: "app", directory: projectRoot, artifactId: "app")])
+        )
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("Tag") })
     }
 
     // MARK: - Compound
