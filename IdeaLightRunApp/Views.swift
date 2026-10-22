@@ -1584,6 +1584,16 @@ private struct LogTextView: NSViewRepresentable {
             coordinator.wrap = wrapText
             Self.configureWrap(wrapText, textView: textView, scrollView: scrollView)
         }
+        // 新日志到达时只有原本停在底部才继续跟随；向上回看历史时不打断阅读。
+        // 在写入新内容之前判断，避免追加导致的文档变高把自己误判成“已离开底部”。
+        // 页签不可见时视图可能还没有有效高度，此时保留上一次的跟随状态。
+        if scrollView.contentView.bounds.height > 0 {
+            coordinator.follow = LogScrollFollow.isAtBottom(
+                originY: Double(scrollView.contentView.bounds.origin.y),
+                visibleHeight: Double(scrollView.contentView.bounds.height),
+                documentHeight: Double(textView.frame.height)
+            )
+        }
         let filter = model.displayFilter
         let searchChanged = coordinator.appliedSearchText != model.searchText
 
