@@ -4,6 +4,8 @@ import Foundation
 /// 不假设某个字段永远只有一种写法。
 public enum RunConfigurationMapper {
     static let mainClassAliases = ["MAIN_CLASS_NAME", "MAIN_CLASS", "SPRING_BOOT_MAIN_CLASS"]
+    /// JetBrains `JarApplicationConfigurationBean.JAR_PATH`，不是 `PATH`。
+    static let jarPathAliases = ["JAR_PATH"]
     static let vmAliases = ["VM_PARAMETERS", "VM_OPTIONS"]
     static let programArgumentsAliases = ["PROGRAM_PARAMETERS", "PROGRAM_ARGUMENTS"]
     static let workingDirectoryAliases = ["WORKING_DIRECTORY"]
@@ -26,6 +28,7 @@ public enum RunConfigurationMapper {
         let type = RunConfigurationType.from(ideaType: node.attribute("type") ?? "")
 
         var mainClass: String?
+        var jarPath: String?
         var moduleName: String?
         var vmOptions: String?
         var programArguments: String?
@@ -50,6 +53,8 @@ public enum RunConfigurationMapper {
                 let value = child.attribute("value") ?? ""
                 if mainClassAliases.contains(optionName) {
                     if mainClass == nil, !value.isEmpty { mainClass = value }
+                } else if jarPathAliases.contains(optionName) {
+                    if jarPath == nil, !value.isEmpty { jarPath = value }
                 } else if vmAliases.contains(optionName) {
                     if vmOptions == nil, !value.isEmpty { vmOptions = value }
                 } else if programArgumentsAliases.contains(optionName) {
@@ -106,6 +111,9 @@ public enum RunConfigurationMapper {
             if mainClass == nil { warnings.append(.missingMainClass) }
             if moduleName == nil { warnings.append(.missingModule) }
         }
+        if type == .jar, jarPath == nil {
+            warnings.append(.missingJarPath)
+        }
         if type == .compound && compoundMembers.isEmpty {
             warnings.append(.custom(title: "Compound 配置为空", detail: "“\(name)” 未引用任何子配置。"))
         }
@@ -114,6 +122,7 @@ public enum RunConfigurationMapper {
             name: name,
             type: type,
             mainClass: mainClass,
+            jarPath: jarPath,
             moduleName: moduleName,
             jreReference: jreReference,
             vmOptions: vmOptions,

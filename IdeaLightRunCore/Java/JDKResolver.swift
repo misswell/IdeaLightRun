@@ -116,6 +116,19 @@ public struct JDKResolver: Sendable {
             if let jdk = Self.match(name: name, in: installed) {
                 return JDKResolution(installation: jdk, origin: .runConfigurationSpecified, requiredName: name, warnings: [])
             }
+            // 旧版 IDEA / 部分配置把 ALTERNATIVE_JRE_PATH 存成绝对路径。
+            if name.hasPrefix("/") {
+                let home = URL(fileURLWithPath: (name as NSString).expandingTildeInPath)
+                if FileManager.default.isExecutableFile(atPath: home.appendingPathComponent("bin/java").path) {
+                    let jdk = JDKInstallation(
+                        home: home,
+                        majorVersion: SystemJDCLocator.majorVersion(fromDirectory: home),
+                        displayName: home.lastPathComponent
+                    )
+                    return JDKResolution(installation: jdk, origin: .runConfigurationSpecified, requiredName: name, warnings: [])
+                }
+                return Self.unresolved(requiredName: name, detail: "运行配置指定的 JDK 路径不可执行：\(name)")
+            }
             return Self.unresolved(requiredName: name, detail: "运行配置要求 JDK “\(name)”，但系统中未找到 major version 匹配的安装。")
         }
 

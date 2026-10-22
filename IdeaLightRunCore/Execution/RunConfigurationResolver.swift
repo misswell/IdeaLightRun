@@ -68,9 +68,20 @@ public struct RunConfigurationResolver: Sendable {
             mainClass = resolveField(raw)
         }
 
+        var jarPath: URL?
+        if config.type == .jar,
+           let raw = config.jarPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !raw.isEmpty {
+            jarPath = Self.fileURL(for: resolveField(raw), projectRoot: projectRoot)
+        }
+
         let workingDirectoryPath: String
         if let raw = config.workingDirectory, !raw.isEmpty {
             workingDirectoryPath = resolveField(raw)
+        } else if config.type == .jar {
+            // IDEA 的 JarApplicationConfiguration.onNewConfigurationCreated 默认用项目根，
+            // 不是 module 目录；带 module 的搜索范围配置也不改变这一点。
+            workingDirectoryPath = projectRoot.path
         } else {
             workingDirectoryPath = (moduleDirectory ?? projectRoot).path
         }
@@ -89,6 +100,7 @@ public struct RunConfigurationResolver: Sendable {
         return ResolvedRunConfiguration(
             source: config,
             mainClass: mainClass,
+            jarPath: jarPath,
             module: module,
             jdk: jdk,
             vmArguments: vmArguments,
@@ -131,6 +143,16 @@ public struct RunConfigurationResolver: Sendable {
                 detail: "配置 “\(configName)” 含无法解析的 IDEA 宏：\(macroTokens.joined(separator: "、"))。"
             )
         }
+    }
+
+    /// IDEA 的 JAR Path 是绝对路径；宏展开后若仍是相对路径，按项目根解释，
+    /// 与 Working Directory 的默认值保持一致。
+    static func fileURL(for path: String, projectRoot: URL) -> URL {
+        let expanded = (path as NSString).expandingTildeInPath
+        if expanded.hasPrefix("/") {
+            return URL(fileURLWithPath: expanded)
+        }
+        return projectRoot.appendingPathComponent(expanded)
     }
 
     private static func appendUnique(_ token: String, into list: inout [String]) {

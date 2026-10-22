@@ -169,7 +169,7 @@ final class AppStore: ObservableObject {
         let active = sessions.values.filter { !$0.state.isTerminal }
         for model in active {
             model.buildHandle?.terminate()
-            model.session?.stop()
+            model.runtime?.stop()
         }
         // 项目级构建（Build/Rebuild Project）的 Maven 子进程同样要停，否则退出后留下孤儿 mvn
         let building = builds.values.filter { $0.phase.isBusy }
@@ -177,9 +177,9 @@ final class AppStore: ObservableObject {
             model.handle?.terminate()
         }
         // 这里阻塞了主线程，model.state 由 Task { @MainActor } 写入、永远不会更新；
-        // 必须轮询后台线程直接维护的 ManagedProcessSession / Process 状态。
+        // 必须轮询后台线程直接维护的 ExecutionRuntime / Process 状态。
         func stillAlive(_ model: RunningProcessModel) -> Bool {
-            if let session = model.session { return !session.state.isTerminal }
+            if let runtime = model.runtime { return !runtime.state.isTerminal }
             return model.buildHandle?.hasLiveProcess ?? false
         }
         let deadline = Date().addingTimeInterval(2)
@@ -188,8 +188,8 @@ final class AppStore: ObservableObject {
             Thread.sleep(forTimeInterval: 0.05)
         }
         for model in active {
-            if let session = model.session {
-                if !session.state.isTerminal { session.forceKill() }
+            if let runtime = model.runtime {
+                if !runtime.state.isTerminal { runtime.forceKill() }
             } else {
                 model.buildHandle?.forceKill()
             }
@@ -202,7 +202,7 @@ final class AppStore: ObservableObject {
     /// 「强制结束并退出」：跳过 SIGTERM 的宽限期，直接 SIGKILL 所有子进程。
     func forceKillAllWork() {
         for model in sessions.values where !model.state.isTerminal {
-            model.session?.forceKill()
+            model.runtime?.forceKill()
             model.buildHandle?.forceKill()
         }
         for model in builds.values where model.phase.isBusy {
@@ -260,7 +260,7 @@ final class AppStore: ObservableObject {
         model.buildHandle = handle
         Task.detached(priority: .userInitiated) {
             do {
-                let plan = try await coordinator.prepare(
+                let execution = try await coordinator.prepare(
                     config: config,
                     projectRoot: projectRoot,
                     log: { line in
@@ -276,16 +276,16 @@ final class AppStore: ObservableObject {
                     await model.setPipelineState(.cancelled)
                     return
                 }
-                let session = try ManagedProcessSession(
+                let runtime = try ExecutionRuntime(
                     configKey: configKey,
                     configName: config.name,
-                    plan: plan,
+                    execution: execution,
                     logBuffer: model.logBuffer
                 )
-                await model.attach(session: session)
+                await model.attach(runtime: runtime)
                 // attach 与 start 之间的 Stop 由会话内部登记（stopRequested），
                 // 进程跑起来后立即终止，不会漏停（§P0-3）。
-                session.start()
+                runtime.start()
             } catch let error as IdeaLightRunError {
                 if case .launchCancelled = error {
                     await model.setPipelineState(.cancelled)
@@ -316,7 +316,7 @@ final class AppStore: ObservableObject {
             // model.state 经主线程异步投递，构建期/运行期的边界上可能仍是旧值；
             // 两个通道都发一次，避免 Stop 落空（已结束的句柄是 no-op）。
             model.buildHandle?.terminate()
-            model.session?.stop()
+            model.runtime?.stop()
         }
     }
 
@@ -324,7 +324,7 @@ final class AppStore: ObservableObject {
         let id = projectID ?? selectedProjectID
         guard let id else { return }
         for model in sessionModels(projectID: id, configKey: configKey) where !model.state.isTerminal {
-            model.session?.forceKill()
+            model.runtime?.forceKill()
             model.buildHandle?.forceKill()
         }
     }
@@ -336,7 +336,7 @@ final class AppStore: ObservableObject {
         if let model = activeSessions(projectID: id, configKey: configKey).first {
             if model.isRunning {
                 model.pendingRestart = true
-                model.session?.stop()
+                model.runtime?.stop()
             }
             // 构建期不允许重启（Stop 后可重新 Run）
             return
@@ -411,7 +411,7 @@ final class AppStore: ObservableObject {
     func addProject(url: URL) {
         let standardized = url.standardizedFileURL
         guard BuildSystemDetector.isValidProjectRoot(standardized) else {
-            alertMessage = "“\(standardized.lastPathComponent)” 不是有效的 Java 项目目录（需要包含 .idea、pom.xml 或 build.gradle(.kts) 之一）。"
+            alertMessage = "“\(standardized.lastPathComponent)” 不是有效的 Java 项目目录（需要包含 .idea、pom.xml、settings.gradle(.kts) 或 build.gradle(.kts) 之一）。"
             return
         }
         if projects.contains(where: { $0.id == standardized.path }) {
@@ -433,7 +433,7 @@ final class AppStore: ObservableObject {
         let owned = sessions.values.filter { $0.projectPath == id }
         for model in owned {
             model.buildHandle?.terminate()
-            model.session?.stop()
+            model.runtime?.stop()
         }
         builds[id]?.handle?.terminate()
 
@@ -441,7 +441,7 @@ final class AppStore: ObservableObject {
         // 与 stopActiveWork 一样轮询后台线程直接维护的会话状态。
         func allStopped() -> Bool {
             let sessionAlive = owned.contains { model in
-                if let session = model.session { return !session.state.isTerminal }
+                if let runtime = model.runtime { return !runtime.state.isTerminal }
                 return model.buildHandle?.hasLiveProcess ?? false
             }
             let buildAlive = builds[id]?.handle?.hasLiveProcess ?? false
@@ -453,8 +453,8 @@ final class AppStore: ObservableObject {
         }
         // 等不动的强杀
         for model in owned {
-            if let session = model.session {
-                if !session.state.isTerminal { session.forceKill() }
+            if let runtime = model.runtime {
+                if !runtime.state.isTerminal { runtime.forceKill() }
             } else {
                 model.buildHandle?.forceKill()
             }

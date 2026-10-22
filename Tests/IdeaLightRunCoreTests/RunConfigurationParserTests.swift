@@ -41,6 +41,75 @@ final class RunConfigurationParserTests: XCTestCase {
         XCTAssertEqual(config.workingDirectory, "$PROJECT_DIR$/gateway")
     }
 
+    /// §5: JAR Application 的真实字段名来自 JetBrains JarApplicationConfigurationBean。
+    func testJarApplicationRunXML() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lr-jar-parser-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("StandaloneJar.run.xml")
+        try """
+        <component name="ProjectRunConfigurationManager">
+          <configuration default="false" name="StandaloneJar" type="JarApplicationType" factoryName="Jar Application">
+            <option name="JAR_PATH" value="$PROJECT_DIR$/out/standalone.jar" />
+            <option name="VM_PARAMETERS" value="-Xmx128m -Dfoo=bar" />
+            <option name="PROGRAM_PARAMETERS" value="--port 9090" />
+            <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/work" />
+            <option name="ALTERNATIVE_JRE_PATH" value="/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home" />
+            <option name="ALTERNATIVE_JRE_PATH_ENABLED" value="true" />
+            <envs>
+              <env name="MODE" value="jar" />
+            </envs>
+            <method v="2">
+              <option name="BuildArtifacts" enabled="true" />
+            </method>
+          </configuration>
+        </component>
+        """.write(to: file, atomically: true, encoding: .utf8)
+
+        let configs = try ProjectRunConfigurationParser.parse(fileURL: file, kind: .dotRun)
+        let config = try XCTUnwrap(configs.first)
+
+        XCTAssertEqual(config.type, .jar)
+        XCTAssertEqual(config.jarPath, "$PROJECT_DIR$/out/standalone.jar")
+        XCTAssertNil(config.mainClass)
+        XCTAssertEqual(config.vmOptions, "-Xmx128m -Dfoo=bar")
+        XCTAssertEqual(config.programArguments, "--port 9090")
+        XCTAssertEqual(config.workingDirectory, "$PROJECT_DIR$/work")
+        XCTAssertEqual(
+            config.jreReference,
+            "/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home"
+        )
+        XCTAssertEqual(config.environmentVariables["MODE"], "jar")
+        XCTAssertTrue(config.beforeLaunchTasks.contains { $0.kind == .unknown(raw: "BuildArtifacts") })
+        XCTAssertTrue(config.warnings.contains { warning in
+            if case .unsupportedBeforeLaunch = warning { return true }
+            return false
+        })
+    }
+
+    func testJarWithoutPathProducesWarning() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lr-jar-parser-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("NoPath.run.xml")
+        try """
+        <component name="ProjectRunConfigurationManager">
+          <configuration name="NoPath" type="JarApplicationType">
+            <option name="VM_PARAMETERS" value="-Xmx64m" />
+          </configuration>
+        </component>
+        """.write(to: file, atomically: true, encoding: .utf8)
+
+        let config = try XCTUnwrap(
+            try ProjectRunConfigurationParser.parse(fileURL: file, kind: .dotRun).first
+        )
+        XCTAssertEqual(config.type, .jar)
+        XCTAssertNil(config.jarPath)
+        XCTAssertTrue(config.warnings.contains(.missingJarPath))
+    }
+
     func testCompoundConfiguration() throws {
         let file = Fixtures.url("MavenMultiProject").appendingPathComponent(".run/BackendAll.run.xml")
         let configs = try ProjectRunConfigurationParser.parse(fileURL: file, kind: .dotRun)

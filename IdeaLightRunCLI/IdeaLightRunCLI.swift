@@ -239,14 +239,14 @@ struct IdeaLightRunCLI {
         return resolution.module?.directory
     }
 
-    // MARK: - run（Milestone 3）
+    // MARK: - run
 
     final class LaunchBox: @unchecked Sendable {
         private let lock = NSLock()
-        private var _session: ManagedProcessSession?
-        var session: ManagedProcessSession? {
-            get { lock.lock(); defer { lock.unlock() }; return _session }
-            set { lock.lock(); _session = newValue; lock.unlock() }
+        private var _runtime: ExecutionRuntime?
+        var runtime: ExecutionRuntime? {
+            get { lock.lock(); defer { lock.unlock() }; return _runtime }
+            set { lock.lock(); _runtime = newValue; lock.unlock() }
         }
     }
 
@@ -292,21 +292,27 @@ struct IdeaLightRunCLI {
 
         Task.detached(priority: .userInitiated) {
             do {
-                let plan = try await coordinator.prepare(
+                let execution = try await coordinator.prepare(
                     config: config,
                     projectRoot: projectRoot,
                     log: { line in emit(line.text) },
                     progress: { state in emit("[IdeaLightRun] \(state.displayText)…") }
                 )
-                let session = try ManagedProcessSession(configKey: config.uniqueKey, configName: config.name, plan: plan)
-                session.onLogLines = { batch in
-                    for line in batch { emit(line.text) }
-                }
-                session.onState = { state in
-                    emit("[IdeaLightRun] \(state.displayText)")
-                }
-                box.session = session
-                session.start()
+                let runtime = try ExecutionRuntime(
+                    configKey: config.uniqueKey,
+                    configName: config.name,
+                    execution: execution
+                )
+                runtime.setHandlers(
+                    onState: { state in
+                        emit("[IdeaLightRun] \(state.displayText)")
+                    },
+                    onLogLines: { batch in
+                        for line in batch { emit(line.text) }
+                    }
+                )
+                box.runtime = runtime
+                runtime.start()
             } catch {
                 emit("[IdeaLightRun] 错误：\((error as? IdeaLightRunError)?.localizedDescription ?? error.localizedDescription)")
             }
@@ -314,20 +320,20 @@ struct IdeaLightRunCLI {
         }
         pipelineSemaphore.wait()
 
-        guard let session = box.session else {
+        guard let runtime = box.runtime else {
             exit(1)
         }
 
         // Ctrl-C → SIGTERM（§33）
         signal(SIGINT, SIG_IGN)
         let interruptSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        interruptSource.setEventHandler { session.stop() }
+        interruptSource.setEventHandler { runtime.stop() }
         interruptSource.resume()
 
-        while session.isRunning {
+        while runtime.isRunning {
             Thread.sleep(forTimeInterval: 0.2)
         }
-        if case .exited(let code) = session.state {
+        if case .exited(let code) = runtime.state {
             exit(code == 0 ? 0 : 1)
         }
         exit(1)

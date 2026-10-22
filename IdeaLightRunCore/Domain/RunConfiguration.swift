@@ -131,6 +131,7 @@ public enum ConfigurationWarning: Equatable, Hashable, Codable, Sendable {
     case unsupportedBeforeLaunch(description: String)
     case missingMainClass
     case missingModule
+    case missingJarPath
     case moduleNotFound(name: String)
     case custom(title: String, detail: String)
 
@@ -146,6 +147,8 @@ public enum ConfigurationWarning: Equatable, Hashable, Codable, Sendable {
             return "缺少 Main Class"
         case .missingModule:
             return "缺少 Module"
+        case .missingJarPath:
+            return "缺少 JAR 路径"
         case .moduleNotFound:
             return "找不到对应 Module"
         case .custom(let title, _):
@@ -165,6 +168,8 @@ public enum ConfigurationWarning: Equatable, Hashable, Codable, Sendable {
             return "配置中没有 Main Class 字段。"
         case .missingModule:
             return "配置中没有 Module 字段。"
+        case .missingJarPath:
+            return "配置中没有 JAR Path 字段。"
         case .moduleNotFound(let name):
             return "无法将 module “\(name)” 映射到项目目录。"
         case .custom(_, let detail):
@@ -212,6 +217,9 @@ public struct RunConfiguration: Identifiable, Equatable, Codable, Sendable {
     public var name: String
     public var type: RunConfigurationType
     public var mainClass: String?
+    /// JAR Application 的 `JAR_PATH`（IDEA 的 JarApplicationConfigurationBean）。
+    /// Application / Spring Boot 为 nil。
+    public var jarPath: String?
     public var moduleName: String?
     public var jreReference: String?
     public var vmOptions: String?
@@ -237,6 +245,7 @@ public struct RunConfiguration: Identifiable, Equatable, Codable, Sendable {
         name: String,
         type: RunConfigurationType,
         mainClass: String? = nil,
+        jarPath: String? = nil,
         moduleName: String? = nil,
         jreReference: String? = nil,
         vmOptions: String? = nil,
@@ -257,6 +266,7 @@ public struct RunConfiguration: Identifiable, Equatable, Codable, Sendable {
         self.name = name
         self.type = type
         self.mainClass = mainClass
+        self.jarPath = jarPath
         self.moduleName = moduleName
         self.jreReference = jreReference
         self.vmOptions = vmOptions

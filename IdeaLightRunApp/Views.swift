@@ -679,7 +679,9 @@ struct ConfigurationRow: View {
 
     private var subtitle: String {
         var parts: [String] = [config.type.displayName]
-        if let mainClass = config.mainClass {
+        if config.type == .jar, let jarPath = config.jarPath {
+            parts.append(jarPath)
+        } else if let mainClass = config.mainClass {
             parts.append(mainClass)
         } else if !config.compoundMembers.isEmpty {
             parts.append(config.compoundMembers.map(\.name).joined(separator: ", "))
@@ -1020,8 +1022,12 @@ struct ConfigurationDetailView: View {
                 }
 
                 section("运行信息") {
-                    keyRow("Main Class", config.mainClass, monospaced: true)
-                    keyRow("Module", config.moduleName)
+                    if config.type == .jar {
+                        keyRow("JAR Path", config.jarPath, monospaced: true)
+                    } else {
+                        keyRow("Main Class", config.mainClass, monospaced: true)
+                        keyRow("Module", config.moduleName)
+                    }
                     if let directory = resolvedModuleDirectory {
                         keyRow("Module 目录", directory.path, monospaced: true)
                     }
@@ -1170,6 +1176,7 @@ struct ConfigurationDetailView: View {
         let projectRoot = result.projectRoot
         let knownModules = result.modules
         let rawWorkDir = config.workingDirectory
+        let isJar = config.type == .jar
 
         let (jdk, moduleDir, workDir) = await Task.detached(priority: .userInitiated) { () -> (JDKResolution, URL?, String?) in
             let resolution = ModuleResolver.resolveModule(
@@ -1181,7 +1188,7 @@ struct ConfigurationDetailView: View {
             let jdk = JDKResolver().resolve(configJDKName: configJDKName, projectJDKName: projectJDKName)
             let workDir = rawWorkDir.map {
                 MacroResolver(projectDir: projectRoot, moduleDir: resolution.module?.directory).resolve($0).value
-            }
+            } ?? (isJar ? projectRoot.path : nil)
             return (jdk, resolution.module?.directory, workDir)
         }.value
 

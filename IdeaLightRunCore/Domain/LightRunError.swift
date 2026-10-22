@@ -12,6 +12,8 @@ public enum IdeaLightRunError: Error, Equatable, Sendable {
     case buildFailed(detail: String)
     case classpathResolveFailed(detail: String)
     case mainClassNotFound(detail: String)
+    /// §5.2: JAR Application 的路径必须在启动前真实存在且可读。
+    case jarNotFound(path: String)
     case launchFailed(detail: String)
     case launchCancelled(detail: String)
     /// §9: 配置类型本身不能执行时必须明说，不能退化成"启动失败"。
@@ -41,6 +43,7 @@ extension IdeaLightRunError {
         case .buildFailed: return "构建失败"
         case .classpathResolveFailed: return "Classpath 解析失败"
         case .mainClassNotFound: return "找不到 Main Class"
+        case .jarNotFound: return "找不到 JAR 文件"
         case .launchFailed: return "启动失败"
         case .launchCancelled: return "已停止"
         case .unsupportedConfiguration: return "该配置类型暂不支持运行"
@@ -73,6 +76,8 @@ extension IdeaLightRunError {
              .unresolvedIdeaContextMacro(let detail),
              .referencedConfigurationNotFound(let detail):
             return detail
+        case .jarNotFound(let path):
+            return "JAR 文件不存在或不是普通文件：\(path)"
         case .environmentFileNotFound(let path):
             return "Environment File Not Found：\(path)"
         case .beforeLaunchCycle(let chain):
@@ -102,6 +107,8 @@ extension IdeaLightRunError {
             return "清除 classpath 缓存后重新解析；多模块项目若兄弟模块未 install，需要在配置里保留 Build（或先执行一次 Build Project）。"
         case .mainClassNotFound:
             return "确认 Main Class 是否存在并已编译。"
+        case .jarNotFound:
+            return "确认 JAR Path 指向已构建的可执行 JAR；若由 Before Launch 生成，请先完成打包。"
         case .launchFailed:
             return "查看日志中的详细错误。"
         case .launchCancelled:

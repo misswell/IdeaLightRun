@@ -5,7 +5,7 @@ import Foundation
 ///
 /// 流水线：类型门禁 → Module（§13）→ BuildSystemResolver（§9）
 /// → Before Launch（§3.2）→ runtime classpath（§3.1）
-/// → RunConfigurationResolver（§4/§5）→ JavaRunPlanner → `ExecutableLaunchPlan`（§7）。
+/// → RunConfigurationResolver（§4/§5）→ Planner → `PreparedExecution`（§7）。
 ///
 /// §3.3: 编译只在配置里真的有 Make / Build Project 时发生。IDEA 勾了
 /// "Do not build before run" 的配置，这里一次编译都不会跑。
@@ -18,7 +18,7 @@ public struct ExecutionCoordinator: Sendable {
         log: @escaping LogCallback,
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle? = nil
-    ) async throws -> ExecutableLaunchPlan {
+    ) async throws -> PreparedExecution {
         try await prepare(
             config: config,
             projectRoot: projectRoot,
@@ -42,7 +42,7 @@ public struct ExecutionCoordinator: Sendable {
         processHandle: ProcessHandle?,
         gateOwner: BuildGate.Owner?,
         visiting: [String]
-    ) async throws -> ExecutableLaunchPlan {
+    ) async throws -> PreparedExecution {
         // §P0-10: 清掉上次异常遗留的启动产物（@argfile / manifest jar）
         LaunchArtifactStore.cleanupOrphans()
         // 先做类型/字段门禁，项目根不存在时也要先给出「这个配置不能跑」。
@@ -51,6 +51,43 @@ public struct ExecutionCoordinator: Sendable {
         // 再按项目实际构建系统与 Before Launch 引用做完整能力检查。
         try Self.ensureRunnable(config, scan: scan)
 
+        if config.type == .jar {
+            return try await prepareJar(
+                config: config,
+                projectRoot: projectRoot,
+                scan: scan,
+                log: log,
+                progress: progress,
+                processHandle: processHandle,
+                gateOwner: gateOwner,
+                visiting: visiting
+            )
+        }
+
+        return try await prepareJavaApplication(
+            config: config,
+            projectRoot: projectRoot,
+            scan: scan,
+            log: log,
+            progress: progress,
+            processHandle: processHandle,
+            gateOwner: gateOwner,
+            visiting: visiting
+        )
+    }
+
+    // MARK: - Application / Spring Boot
+
+    private func prepareJavaApplication(
+        config: RunConfiguration,
+        projectRoot: URL,
+        scan: ScanResult,
+        log: @escaping LogCallback,
+        progress: @escaping (ProcessState) -> Void,
+        processHandle: ProcessHandle?,
+        gateOwner: BuildGate.Owner?,
+        visiting: [String]
+    ) async throws -> PreparedExecution {
         // ① Module 解析（§13）
         let moduleResolution = ModuleResolver.resolveModule(
             named: config.moduleName,
@@ -108,7 +145,7 @@ public struct ExecutionCoordinator: Sendable {
                         )
                     },
                     runReferenced: { referenced, chain in
-                        let referencedPlan = try await self.prepare(
+                        let referencedExecution = try await self.prepare(
                             config: referenced,
                             projectRoot: projectRoot,
                             log: log,
@@ -117,8 +154,8 @@ public struct ExecutionCoordinator: Sendable {
                             gateOwner: owner,
                             visiting: chain
                         )
-                        try await Self.runUntilExit(
-                            plan: referencedPlan,
+                        try await ExecutionRuntime.runUntilExit(
+                            execution: referencedExecution,
                             configName: referenced.name,
                             processHandle: processHandle,
                             log: log
@@ -146,19 +183,141 @@ public struct ExecutionCoordinator: Sendable {
                 module: module,
                 jdk: build.jdk
             )
-            // §5: 告警必须看得见——以前 resolve(x).value 把 warnings 直接丢掉。
-            for warning in resolved.warnings {
-                log(LogLine(stream: .system, text: "[IdeaLightRun] 警告（\(warning.title)）：\(warning.detail)"))
-            }
-            if !resolved.loadedEnvironmentFiles.isEmpty {
-                // §17: 只报路径与键数，不报内容。
-                let keys = resolved.source.environmentVariables.count
-                log(LogLine(stream: .system, text: "[IdeaLightRun] 环境文件已加载 \(resolved.loadedEnvironmentFiles.count) 个，配置变量 \(keys) 个"))
-            }
+            Self.logResolvedConfiguration(resolved, log: log)
 
             // ⑦ 启动计划（§26/§7）
             progress(.starting)
-            return try JavaRunPlanner.plan(resolved: resolved, classpath: classpath, jdk: build.jdk)
+            return .process(try JavaRunPlanner.plan(resolved: resolved, classpath: classpath, jdk: build.jdk))
+        }
+    }
+
+    // MARK: - JAR Application
+
+    /// §5: JAR 不要求 Main Class、项目 classpath 或构建系统本身。
+    /// Module 仅用于 `$MODULE_DIR$` 与 Before Launch 的 Build；
+    /// 只有出现构建类任务时才解析 Maven 工具链。
+    private func prepareJar(
+        config: RunConfiguration,
+        projectRoot: URL,
+        scan: ScanResult,
+        log: @escaping LogCallback,
+        progress: @escaping (ProcessState) -> Void,
+        processHandle: ProcessHandle?,
+        gateOwner: BuildGate.Owner?,
+        visiting: [String]
+    ) async throws -> PreparedExecution {
+        let module = ModuleResolver.resolveModule(
+            named: config.moduleName,
+            mainClass: nil,
+            projectRoot: projectRoot,
+            knownModules: scan.modules
+        ).module
+
+        let tasks = config.beforeLaunchTasks.filter(\.isEnabled)
+        let needsMavenToolchain = tasks.contains { task in
+            switch task.kind {
+            case .build, .buildProject, .mavenGoal:
+                return true
+            case .runConfiguration, .gradleTask, .unknown:
+                return false
+            }
+        }
+
+        let toolchain: ProjectToolchain?
+        if needsMavenToolchain {
+            toolchain = try ProjectToolchain.resolve(
+                projectRoot: projectRoot,
+                result: scan,
+                config: config,
+                configJDKName: config.jreReference,
+                context: "启动",
+                log: log
+            )
+        } else {
+            toolchain = nil
+        }
+        let jdk = try toolchain?.jdk ?? Self.resolveJDK(config: config, scan: scan, log: log)
+
+        let owner = gateOwner ?? BuildGate.Owner()
+        return try await BuildGate.shared.run(projectKey: projectRoot.standardizedFileURL.path, owner: owner) {
+            try await BeforeLaunchExecutor().run(
+                for: config,
+                configurations: scan.configurations,
+                actions: BeforeLaunchExecutor.Actions(
+                    build: {
+                        guard let toolchain, let module else {
+                            throw IdeaLightRunError.unsupportedBeforeLaunch(
+                                detail: "配置 “\(config.name)” 是 JAR Application，Before Launch 的 Build "
+                                    + "需要可解析的 Module 与 Maven 项目。"
+                            )
+                        }
+                        progress(.building)
+                        let target = BuildTarget(
+                            module: module,
+                            variant: .maven(
+                                module: module.name,
+                                includeProvided: config.includeProvidedDependencies
+                            )
+                        )
+                        try toolchain.service.buildModule(target, handle: processHandle, log: log)
+                    },
+                    buildProject: {
+                        guard let toolchain else {
+                            throw IdeaLightRunError.unsupportedBeforeLaunch(
+                                detail: "配置 “\(config.name)” 的 Before Launch 需要 Build Project，但当前项目无法使用 Maven。"
+                            )
+                        }
+                        progress(.building)
+                        try toolchain.service.buildProject(kind: .build, handle: processHandle, log: log)
+                    },
+                    runMavenGoals: { goals, pomFile in
+                        guard let toolchain else {
+                            throw IdeaLightRunError.unsupportedBeforeLaunch(
+                                detail: "配置 “\(config.name)” 的 Before Launch 需要 Maven，但当前项目无法使用 Maven。"
+                            )
+                        }
+                        progress(.building)
+                        try toolchain.service.runTasks(
+                            goals,
+                            pomFile: pomFile,
+                            moduleDirectory: module?.directory ?? projectRoot,
+                            handle: processHandle,
+                            log: log
+                        )
+                    },
+                    runReferenced: { referenced, chain in
+                        let referencedExecution = try await self.prepare(
+                            config: referenced,
+                            projectRoot: projectRoot,
+                            log: log,
+                            progress: progress,
+                            processHandle: processHandle,
+                            gateOwner: owner,
+                            visiting: chain
+                        )
+                        try await ExecutionRuntime.runUntilExit(
+                            execution: referencedExecution,
+                            configName: referenced.name,
+                            processHandle: processHandle,
+                            log: log
+                        )
+                    }
+                ),
+                visiting: visiting,
+                handle: processHandle,
+                log: log
+            )
+
+            // Before Launch 可能刚刚产出 JAR，存在性必须在这之后校验。
+            progress(.starting)
+            let resolved = try RunConfigurationResolver().resolve(
+                config: config,
+                projectRoot: projectRoot,
+                module: module,
+                jdk: jdk
+            )
+            Self.logResolvedConfiguration(resolved, log: log)
+            return .process(try JarRunPlanner.plan(resolved: resolved, jdk: jdk))
         }
     }
 
@@ -172,10 +331,11 @@ public struct ExecutionCoordinator: Sendable {
 
     /// 项目感知门禁：构建系统缺失或落到尚未接管的 Gradle 时，
     /// 沿用 `buildToolNotFound` 的既有语义，让调用方拿到明确的工具链原因。
+    /// JAR Application 不需要构建系统本身，缺失原因（JAR Path / Before Launch）按配置错误报告。
     static func ensureRunnable(_ config: RunConfiguration, scan: ScanResult) throws {
         let capability = ConfigurationCapabilityResolver.resolve(config, scan: scan)
         guard !capability.isLaunchable else { return }
-        if capability.buildSystem != .maven {
+        if config.type != .jar, capability.buildSystem != .maven {
             throw IdeaLightRunError.buildToolNotFound(
                 detail: capability.primaryReason ?? "无法确定项目的构建系统。"
             )
@@ -191,67 +351,45 @@ public struct ExecutionCoordinator: Sendable {
         let reason = capability.primaryReason ?? "当前版本尚未接管该类型。"
         throw IdeaLightRunError.unsupportedConfiguration(
             detail: "“\(config.name)”（\(config.type.displayName)）当前不能直接启动：\(reason)"
-                + " 现在能替代 IDEA Run 按钮的是 Application 与 Spring Boot 配置。"
+                + " 现在能替代 IDEA Run 按钮的是 Application、Spring Boot 与 JAR Application 配置。"
         )
     }
 
-    // MARK: - 被引用配置的完整执行（§3.7）
+    // MARK: - 内部
 
-    /// Before Launch 引用的运行配置要像 IDEA 那样先跑完再回来：
-    /// 启动进程、把输出并进当前会话的日志、等它退出；退出码非 0 时中止本次启动。
-    private static func runUntilExit(
-        plan: ExecutableLaunchPlan,
-        configName: String,
-        processHandle: ProcessHandle?,
+    private static func resolveJDK(
+        config: RunConfiguration,
+        scan: ScanResult,
         log: @escaping LogCallback
-    ) async throws {
-        let session = try ManagedProcessSession(
-            configKey: "before-launch::\(configName)",
-            configName: configName,
-            plan: plan
+    ) throws -> JDKInstallation {
+        let resolution = JDKResolver().resolve(
+            configJDKName: config.jreReference,
+            projectJDKName: scan.projectJDKName
         )
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let sink = ResumeSink(continuation)
-            session.onState = { state in
-                if let outcome = Self.outcome(for: state, configName: configName) {
-                    sink.resume(with: outcome)
-                }
-            }
-            session.onLogLines = { lines in lines.forEach(log) }
-            session.start()
-            // Stop 落在嵌套进程上：外层只有构建句柄，这里代为转达，
-            // SIGTERM 后仍不退出就强杀，避免被引用的进程把本次启动永久挂住。
-            Task.detached(priority: .userInitiated) {
-                while !session.state.isTerminal {
-                    try? await Task.sleep(nanoseconds: 200_000_000)
-                    if processHandle?.isCancelled == true {
-                        session.stop()
-                        try? await Task.sleep(nanoseconds: 3_000_000_000)
-                        if !session.state.isTerminal { session.forceKill() }
-                        return
-                    }
-                }
-            }
+        guard let jdk = resolution.installation else {
+            let detail = resolution.warnings.map(\.detail).joined(separator: "；")
+            throw IdeaLightRunError.jdkNotFound(detail: detail.isEmpty ? "未找到可用 JDK。" : detail)
         }
+        log(LogLine(
+            stream: .system,
+            text: "[IdeaLightRun] JDK: \(jdk.displayName ?? jdk.home.lastPathComponent) "
+                + "(major \(jdk.majorVersion.map(String.init) ?? "?"))"
+        ))
+        return jdk
     }
 
-    static func outcome(for state: ProcessState, configName: String) -> Result<Void, Error>? {
-        switch state {
-        case .exited(let code):
-            guard code != 0 else { return .success(()) }
-            return .failure(IdeaLightRunError.buildFailed(
-                detail: "Before Launch 引用的配置 “\(configName)” 以退出码 \(code) 结束，本次启动已中止。"
-            ))
-        case .failed(let detail):
-            return .failure(IdeaLightRunError.launchFailed(
-                detail: "Before Launch 引用的配置 “\(configName)” 未能正常运行：\(detail)"
-            ))
-        case .cancelled:
-            return .failure(IdeaLightRunError.launchCancelled(
-                detail: "Before Launch 引用的配置 “\(configName)” 已被用户停止。"
-            ))
-        default:
-            return nil
+    private static func logResolvedConfiguration(
+        _ resolved: ResolvedRunConfiguration,
+        log: @escaping LogCallback
+    ) {
+        // §5: 告警必须看得见——以前 resolve(x).value 把 warnings 直接丢掉。
+        for warning in resolved.warnings {
+            log(LogLine(stream: .system, text: "[IdeaLightRun] 警告（\(warning.title)）：\(warning.detail)"))
+        }
+        if !resolved.loadedEnvironmentFiles.isEmpty {
+            // §17: 只报路径与键数，不报内容。
+            let keys = resolved.source.environmentVariables.count
+            log(LogLine(stream: .system, text: "[IdeaLightRun] 环境文件已加载 \(resolved.loadedEnvironmentFiles.count) 个，配置变量 \(keys) 个"))
         }
     }
 }
@@ -273,24 +411,5 @@ private final class DeferredBuild: @unchecked Sendable {
             _pending = newValue
             lock.unlock()
         }
-    }
-}
-
-/// continuation 只能 resume 一次：终态路径（退出码 / 失败 / 取消）交错时
-/// 重复 resume 会直接崩溃，这里显式去重。
-private final class ResumeSink: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<Void, Error>?
-
-    init(_ continuation: CheckedContinuation<Void, Error>) {
-        self.continuation = continuation
-    }
-
-    func resume(with result: Result<Void, Error>) {
-        lock.lock()
-        let pending = continuation
-        continuation = nil
-        lock.unlock()
-        pending?.resume(with: result)
     }
 }

@@ -21,15 +21,25 @@ final class ExecutionCoordinatorTests: XCTestCase {
 
     // MARK: - 门禁范围
 
-    func testApplicationAndSpringBootPassTheGate() throws {
+    func testApplicationSpringBootAndJarPassTheGate() throws {
         XCTAssertNoThrow(try ExecutionCoordinator.ensureRunnable(config(.application)))
         XCTAssertNoThrow(try ExecutionCoordinator.ensureRunnable(config(.springBoot)))
+        let jar = RunConfiguration(
+            name: "StandaloneJar",
+            type: .jar,
+            jarPath: "/tmp/app.jar",
+            source: ConfigurationSource(
+                kind: .dotRun,
+                file: URL(fileURLWithPath: "/tmp/StandaloneJar.run.xml"),
+                modifiedAt: nil
+            )
+        )
+        XCTAssertNoThrow(try ExecutionCoordinator.ensureRunnable(jar))
     }
 
     /// 其余类型一律明确拒绝，且说清是哪个配置的哪种类型（§24 约束 8：不许静默跳过）。
     func testOtherTypesAreRejectedWithReason() {
         let rejected: [(RunConfigurationType, String)] = [
-            (.jar, "JAR"),
             (.maven, "Maven"),
             (.gradle, "Gradle"),
             (.compound, "Compound"),

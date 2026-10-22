@@ -39,12 +39,13 @@ final class ColdStartCompileTests: XCTestCase {
     private func prepare(_ name: String) async throws -> [ProcessState] {
         let config = try project.configuration(named: name)
         var states: [ProcessState] = []
-        let plan = try await ExecutionCoordinator().prepare(
+        let execution = try await ExecutionCoordinator().prepare(
             config: config,
             projectRoot: project.root,
             log: { _ in },
             progress: { states.append($0) }
         )
+        let plan = try XCTUnwrap(execution.processPlan, "Java Application 应生成单进程计划")
         XCTAssertFalse(plan.classpath.isEmpty, "classpath 为空说明解析没落地")
         return states
     }

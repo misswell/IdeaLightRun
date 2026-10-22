@@ -204,6 +204,13 @@ public struct IntelliJProjectScanner: Sendable {
                         message: "配置“\(config.name)”缺少 Main Class，无法启动。",
                         remediation: "在 IDEA 的运行配置中填写 Main class，或改用 Application / Spring Boot 配置。"
                     ))
+                case .missingJarPath:
+                    diagnostics.append(ScanDiagnostic(
+                        file: config.source.file,
+                        severity: .warning,
+                        message: "配置“\(config.name)”缺少 JAR Path，无法启动。",
+                        remediation: "在 IDEA 的 JAR Application 配置中选择可执行 JAR 文件。"
+                    ))
                 case .unsupportedBeforeLaunch(let description):
                     diagnostics.append(ScanDiagnostic(
                         file: config.source.file,

@@ -84,8 +84,6 @@ public enum ConfigurationCapabilityResolver {
         switch config.type {
         case .compound:
             return terminal(.planned, "Compound 配置已识别；多配置启动将在 Milestone 3 接入，当前不能启动。")
-        case .jar:
-            return terminal(.planned, "JAR Application 已识别；JAR 启动将在 Milestone 2 接入，当前不能启动。")
         case .maven:
             return terminal(.planned, "Maven 运行配置已识别；直接运行 Maven goal 将在 Milestone 5 接入，当前不能启动。")
         case .gradle:
@@ -95,7 +93,7 @@ public enum ConfigurationCapabilityResolver {
         case .unknown(let raw):
             let name = raw.isEmpty ? "（空类型）" : raw
             return terminal(.unsupported, "配置类型 “\(name)” 不在当前支持范围内。")
-        case .application, .springBoot:
+        case .application, .springBoot, .jar:
             break
         }
 
@@ -111,10 +109,27 @@ public enum ConfigurationCapabilityResolver {
             issues.append(ConfigurationCapability.Issue(kind: .warning, message: message))
         }
 
-        let mainClass = config.mainClass?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if mainClass.isEmpty {
-            missingFields.append("Main Class")
-            block("配置缺少 Main Class，无法构造 java 启动命令。")
+        if config.type == .jar {
+            let jarPath = config.jarPath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if jarPath.isEmpty {
+                missingFields.append("JAR Path")
+                block("配置缺少 JAR Path，无法构造 java -jar 启动命令。")
+            } else if let scan,
+                      let resolved = Self.resolvedJarURL(jarPath, config: config, scan: scan) {
+                // IDEA 的 checkConfiguration 对不存在的 JAR 只给 warning：
+                // Before Launch 可能先生成产物。存在性最终由 JarRunPlanner 在构建后校验。
+                if !FileManager.default.fileExists(atPath: resolved.path) {
+                    warn("JAR 文件当前不存在：\(resolved.path)。如果它由 Before Launch 生成，可忽略此提示。")
+                } else if !FileManager.default.isReadableFile(atPath: resolved.path) {
+                    block("JAR 文件不可读取：\(resolved.path)")
+                }
+            }
+        } else {
+            let mainClass = config.mainClass?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if mainClass.isEmpty {
+                missingFields.append("Main Class")
+                block("配置缺少 Main Class，无法构造 java 启动命令。")
+            }
         }
 
         for task in config.beforeLaunchTasks where task.isEnabled {
@@ -142,7 +157,7 @@ public enum ConfigurationCapabilityResolver {
 
         for warning in config.warnings {
             switch warning {
-            case .missingMainClass, .unsupportedBeforeLaunch:
+            case .missingMainClass, .missingJarPath, .unsupportedBeforeLaunch:
                 // 已由上面的阻断项覆盖，避免同一条问题出现两次。
                 continue
             default:
@@ -157,36 +172,70 @@ public enum ConfigurationCapabilityResolver {
                 modules: scan.modules
             )
             buildSystem = selection.kind
-            switch selection.kind {
-            case .maven:
+            if config.type == .jar {
                 if selection.isAmbiguous {
                     warn(selection.reason)
                 }
-                if let moduleName = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines),
-                   !moduleName.isEmpty,
-                   !scan.modules.isEmpty {
-                    let resolution = ModuleResolver.resolveModule(
-                        named: moduleName,
-                        mainClass: config.mainClass,
-                        projectRoot: scan.projectRoot,
-                        knownModules: scan.modules
-                    )
-                    if let module = resolution.module {
-                        if resolution.method == .byMainClassFallback {
-                            warn("找不到 Module “\(moduleName)”，已按 Main Class 定位到 \(module.directory.path)。")
-                        }
-                    } else {
-                        block("找不到 Module “\(moduleName)”，启动时无法定位编译产物与 classpath。")
+                let enabledTasks = config.beforeLaunchTasks.filter(\.isEnabled)
+                let needsMaven = enabledTasks.contains { task in
+                    switch task.kind {
+                    case .build, .buildProject, .mavenGoal:
+                        return true
+                    case .runConfiguration, .gradleTask, .unknown:
+                        return false
                     }
                 }
-            case .gradle:
-                return terminal(
-                    .planned,
-                    "检测到 Gradle 项目；Gradle 构建与 classpath 解析将在 Milestone 4 接入，当前不能启动。",
-                    buildSystem: .gradle
-                )
-            case nil:
-                block(selection.reason)
+                if needsMaven {
+                    if selection.kind != .maven {
+                        block("JAR 配置的 Before Launch 包含 Maven 构建任务，但当前项目无法使用 Maven：\(selection.reason)")
+                    } else if enabledTasks.contains(where: { task in
+                        if case .build = task.kind { return true }
+                        return false
+                    }) {
+                        let moduleName = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                        let resolution = ModuleResolver.resolveModule(
+                            named: moduleName.isEmpty ? nil : moduleName,
+                            mainClass: nil,
+                            projectRoot: scan.projectRoot,
+                            knownModules: scan.modules
+                        )
+                        if resolution.module == nil {
+                            block("JAR 配置的 Before Launch Build 需要可解析的 Module；请在 IDEA 的运行配置里选择 Module。")
+                        }
+                    }
+                }
+            } else {
+                switch selection.kind {
+                case .maven:
+                    if selection.isAmbiguous {
+                        warn(selection.reason)
+                    }
+                    if let moduleName = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines),
+                       !moduleName.isEmpty,
+                       !scan.modules.isEmpty {
+                        let resolution = ModuleResolver.resolveModule(
+                            named: moduleName,
+                            mainClass: config.mainClass,
+                            projectRoot: scan.projectRoot,
+                            knownModules: scan.modules
+                        )
+                        if let module = resolution.module {
+                            if resolution.method == .byMainClassFallback {
+                                warn("找不到 Module “\(moduleName)”，已按 Main Class 定位到 \(module.directory.path)。")
+                            }
+                        } else {
+                            block("找不到 Module “\(moduleName)”，启动时无法定位编译产物与 classpath。")
+                        }
+                    }
+                case .gradle:
+                    return terminal(
+                        .planned,
+                        "检测到 Gradle 项目；Gradle 构建与 classpath 解析将在 Milestone 4 接入，当前不能启动。",
+                        buildSystem: .gradle
+                    )
+                case nil:
+                    block(selection.reason)
+                }
             }
         }
 
@@ -218,6 +267,29 @@ public enum ConfigurationCapabilityResolver {
             issues: [ConfigurationCapability.Issue(kind: .blocking, message: message)],
             buildSystem: buildSystem
         )
+    }
+
+    /// 只做“无需环境文件即可确定”的路径检查：出现未解析变量时返回 nil，
+    /// 把最终判断留给启动前的 `JarRunPlanner`，避免误报。
+    private static func resolvedJarURL(
+        _ raw: String,
+        config: RunConfiguration,
+        scan: ScanResult
+    ) -> URL? {
+        let module = ModuleResolver.resolveModule(
+            named: config.moduleName,
+            mainClass: nil,
+            projectRoot: scan.projectRoot,
+            knownModules: scan.modules
+        ).module
+        let resolution = MacroResolver(
+            projectDir: scan.projectRoot,
+            moduleDir: module?.directory
+        ).resolve(raw)
+        guard resolution.warnings.isEmpty else { return nil }
+        let value = resolution.value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        return RunConfigurationResolver.fileURL(for: value, projectRoot: scan.projectRoot)
     }
 
     private static func referenceExists(

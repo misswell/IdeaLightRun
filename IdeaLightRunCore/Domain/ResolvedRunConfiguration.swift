@@ -5,6 +5,9 @@ import Foundation
 public struct ResolvedRunConfiguration: Sendable {
     public var source: RunConfiguration
     public var mainClass: String?
+    /// JAR Application 的路径；宏已展开，相对路径已按项目根定位。
+    /// 这里只做路径解析，文件存在性由 `JarRunPlanner` 在 Before Launch 之后校验。
+    public var jarPath: URL?
     public var module: ProjectModule?
     public var jdk: JDKInstallation?
 
@@ -21,6 +24,7 @@ public struct ResolvedRunConfiguration: Sendable {
     public init(
         source: RunConfiguration,
         mainClass: String? = nil,
+        jarPath: URL? = nil,
         module: ProjectModule? = nil,
         jdk: JDKInstallation? = nil,
         vmArguments: [String] = [],
@@ -32,6 +36,7 @@ public struct ResolvedRunConfiguration: Sendable {
     ) {
         self.source = source
         self.mainClass = mainClass
+        self.jarPath = jarPath
         self.module = module
         self.jdk = jdk
         self.vmArguments = vmArguments

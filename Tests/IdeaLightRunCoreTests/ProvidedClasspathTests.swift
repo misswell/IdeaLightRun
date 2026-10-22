@@ -37,12 +37,13 @@ final class ProvidedClasspathTests: XCTestCase {
     @discardableResult
     private func prepare(_ name: String) async throws -> ExecutableLaunchPlan {
         let config = try project.configuration(named: name)
-        return try await ExecutionCoordinator().prepare(
+        let execution = try await ExecutionCoordinator().prepare(
             config: config,
             projectRoot: project.root,
             log: { _ in },
             progress: { _ in }
         )
+        return try XCTUnwrap(execution.processPlan, "Java Application 应生成单进程计划")
     }
 
     private var withoutProvidedVariant: ClasspathVariant { .maven(module: "app", includeProvided: false) }
