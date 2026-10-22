@@ -91,6 +91,9 @@ public struct CompoundMember: Equatable, Hashable, Codable, Sendable {
         self.name = name
         self.type = type
     }
+
+    /// 与 `RunConfiguration.uniqueKey` 同构：IDEA 的 toRun 保存的就是 type id。
+    public var uniqueKey: String { "\(type)::\(name)" }
 }
 
 public struct BeforeLaunchTask: Equatable, Hashable, Codable, Sendable {

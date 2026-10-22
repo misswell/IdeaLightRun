@@ -96,7 +96,11 @@ final class ProjectScannerTests: XCTestCase {
         let result = try IntelliJProjectScanner().scan(projectRoot: Fixtures.url("MavenMultiProject"))
         let compound = try XCTUnwrap(result.configurations.first { $0.name == "Backend All" })
         XCTAssertEqual(compound.type, .compound)
-        XCTAssertEqual(compound.readiness, .planned)
+        XCTAssertEqual(
+            ConfigurationCapabilityResolver.resolve(compound, scan: result).readiness,
+            .ready,
+            "Backend All 的两个成员都可启动"
+        )
     }
 
     /// §10: XML 中途损坏时保留已完整捕获的配置，同时留下可见诊断。

@@ -94,6 +94,168 @@ final class ExecutionCoordinatorTests: XCTestCase {
         }
     }
 
+    // MARK: - Compound 准备
+
+    private func makeProject() throws -> (root: URL, jdk: URL) {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("lr-compound-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root.appendingPathComponent(".run"), withIntermediateDirectories: true)
+        let jdk = fm.temporaryDirectory
+            .appendingPathComponent("lr-compound-jdk-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: jdk.appendingPathComponent("bin"), withIntermediateDirectories: true)
+        let java = jdk.appendingPathComponent("bin/java")
+        try Data("#!/bin/sh\nexit 0\n".utf8).write(to: java)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: java.path)
+        addTeardownBlock {
+            try? fm.removeItem(at: root)
+            try? fm.removeItem(at: jdk)
+        }
+        return (root, jdk)
+    }
+
+    @discardableResult
+    private func writeJar(_ name: String, root: URL) throws -> URL {
+        let url = root.appendingPathComponent("\(name).jar")
+        try Data("PK".utf8).write(to: url)
+        return url
+    }
+
+    private func writeJarConfig(_ name: String, jar: URL, jdk: URL, root: URL) throws {
+        let xml = """
+        <component name="ProjectRunConfigurationManager">
+          <configuration default="false" name="\(name)" type="JarApplicationType" factoryName="Jar Application">
+            <option name="JAR_PATH" value="\(jar.path)" />
+            <option name="ALTERNATIVE_JRE_PATH" value="\(jdk.path)" />
+            <option name="ALTERNATIVE_JRE_PATH_ENABLED" value="true" />
+          </configuration>
+        </component>
+        """
+        try Data(xml.utf8).write(to: root.appendingPathComponent(".run/\(name).run.xml"))
+    }
+
+    private func writeCompoundConfig(
+        _ name: String,
+        members: [(name: String, type: String)],
+        root: URL
+    ) throws {
+        let references = members
+            .map { #"  <toRun name="\#($0.name)" type="\#($0.type)" />"# }
+            .joined(separator: "\n")
+        let xml = """
+        <component name="ProjectRunConfigurationManager">
+          <configuration default="false" name="\(name)" type="CompoundRunConfigurationType" factoryName="Compound">
+        \(references)
+          </configuration>
+        </component>
+        """
+        try Data(xml.utf8).write(to: root.appendingPathComponent(".run/\(name).run.xml"))
+    }
+
+    private func compound(named name: String, in root: URL) async throws
+        -> (configuration: RunConfiguration, execution: PreparedExecution) {
+        let scan = try IntelliJProjectScanner().scan(projectRoot: root)
+        let config = try XCTUnwrap(scan.configurations.first { $0.name == name })
+        let execution = try await ExecutionCoordinator().prepare(
+            config: config,
+            projectRoot: root,
+            log: { _ in },
+            progress: { _ in }
+        )
+        return (config, execution)
+    }
+
+    /// 成员按 IDEA 里保存的顺序准备，全部成功后一次性交出多进程计划；
+    /// 每个成员仍是完整的 JAR 启动计划（走同一条 Planner）。
+    func testCompoundPreparesJarMembersInReferenceOrder() async throws {
+        let (root, jdk) = try makeProject()
+        let one = try writeJar("one", root: root)
+        let two = try writeJar("two", root: root)
+        try writeJarConfig("One", jar: one, jdk: jdk, root: root)
+        try writeJarConfig("Two", jar: two, jdk: jdk, root: root)
+        try writeCompoundConfig("All", members: [
+            ("Two", "JarApplicationType"),
+            ("One", "JarApplicationType"),
+        ], root: root)
+
+        let scan = try IntelliJProjectScanner().scan(projectRoot: root)
+        let all = try XCTUnwrap(scan.configurations.first { $0.name == "All" })
+        XCTAssertEqual(
+            ConfigurationCapabilityResolver.resolve(all, scan: scan).readiness,
+            .ready,
+            "两个 JAR 成员都可启动时 Compound 不应被标成 planned"
+        )
+
+        let execution = try await compound(named: "All", in: root)
+        guard case .compound(let plan) = execution.execution else {
+            return XCTFail("Compound 应产出多进程计划")
+        }
+        XCTAssertEqual(plan.members.map(\.name), ["Two", "One"])
+        XCTAssertEqual(plan.members.map(\.configurationKey), [
+            "JarApplicationType::Two",
+            "JarApplicationType::One",
+        ])
+        XCTAssertEqual(plan.members[0].execution.processPlan?.arguments.last, two.path)
+        XCTAssertEqual(plan.members[1].execution.processPlan?.arguments.last, one.path)
+    }
+
+    /// 嵌套 Compound 在准备阶段展开成叶子成员：运行时只面对真实进程，
+    /// 分组停止/日志归属也因此不会多出一层没有进程的“成员”。
+    func testNestedCompoundFlattensLeafMembers() async throws {
+        let (root, jdk) = try makeProject()
+        let leaf = try writeJar("leaf", root: root)
+        try writeJarConfig("Leaf", jar: leaf, jdk: jdk, root: root)
+        try writeCompoundConfig("Inner", members: [("Leaf", "JarApplicationType")], root: root)
+        try writeCompoundConfig("Outer", members: [("Inner", "CompoundRunConfigurationType")], root: root)
+
+        let execution = try await compound(named: "Outer", in: root)
+        guard case .compound(let plan) = execution.execution else {
+            return XCTFail("Outer 应产出多进程计划")
+        }
+        XCTAssertEqual(plan.name, "Outer")
+        XCTAssertEqual(plan.members.map(\.name), ["Leaf"])
+    }
+
+    /// 缺失成员在准备阶段就失败，不会先启动任何成员进程。
+    func testCompoundMissingMemberFailsBeforeAnyLaunch() async throws {
+        let (root, jdk) = try makeProject()
+        let one = try writeJar("one", root: root)
+        try writeJarConfig("One", jar: one, jdk: jdk, root: root)
+        try writeCompoundConfig("All", members: [
+            ("One", "JarApplicationType"),
+            ("Ghost", "JarApplicationType"),
+        ], root: root)
+
+        do {
+            _ = try await compound(named: "All", in: root)
+            XCTFail("引用缺失成员的 Compound 不应准备成功")
+        } catch let error as IdeaLightRunError {
+            guard case .unsupportedConfiguration(let detail) = error else {
+                return XCTFail("期望 unsupportedConfiguration，实际 \(error)")
+            }
+            XCTAssertTrue(detail.contains("Ghost"), detail)
+        }
+    }
+
+    /// 成环的 Compound 在准备阶段失败，而不是递归到栈溢出。
+    func testCompoundCycleIsRejected() async throws {
+        let (root, jdk) = try makeProject()
+        let one = try writeJar("one", root: root)
+        try writeJarConfig("One", jar: one, jdk: jdk, root: root)
+        try writeCompoundConfig("A", members: [("B", "CompoundRunConfigurationType")], root: root)
+        try writeCompoundConfig("B", members: [("A", "CompoundRunConfigurationType")], root: root)
+
+        do {
+            _ = try await compound(named: "A", in: root)
+            XCTFail("成环的 Compound 不应准备成功")
+        } catch let error as IdeaLightRunError {
+            guard case .unsupportedConfiguration(let detail) = error else {
+                return XCTFail("期望 unsupportedConfiguration，实际 \(error)")
+            }
+            XCTAssertTrue(detail.contains("循环"), detail)
+        }
+    }
+
     /// §23/§24 约束 8: 遇到 Gradle 项目时不由 GUI / CLI 自己判断——Core 明确报错并点明
     /// Gradle 的支持计划，绝不"跳过构建照常启动"。用真实 Gradle fixture。
     func testGradleProjectFailsClosedWithExplicitReason() async throws {

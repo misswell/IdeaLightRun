@@ -735,6 +735,8 @@ struct ConfigurationDetailView: View {
     @State private var detailTab: DetailTab = .info
     /// 多实例（P0-6 allowParallelRun）时控制台显示哪个会话；存 instanceID 字符串。
     @State private var consoleSessionInstanceID: String?
+    /// Compound 控制台显示哪个成员；nil = 合并的全部日志。
+    @State private var consoleMemberKey: String?
 
     enum DetailTab: String, CaseIterable {
         case info = "信息"
@@ -752,6 +754,7 @@ struct ConfigurationDetailView: View {
                 }
                 .task(id: store.selectedConfiguration?.uniqueKey) {
                     revealSecrets = false
+                    consoleMemberKey = nil
                     if let config = store.selectedConfiguration, let result = project.result {
                         await resolveDetails(config: config, result: result)
                     }
@@ -804,14 +807,49 @@ struct ConfigurationDetailView: View {
         if sessions.isEmpty {
             emptyPane(icon: "terminal", text: "尚未启动，无运行日志")
         } else if sessions.count == 1, let only = sessions.first {
-            LogConsoleView(model: only)
+            consoleView(for: only)
         } else {
             VStack(alignment: .leading, spacing: 0) {
                 instancePicker(sessions: sessions)
                 Divider()
                 if let selected = selectedConsoleSession(in: sessions) {
-                    LogConsoleView(model: selected)
+                    consoleView(for: selected)
                 }
+            }
+        }
+    }
+
+    /// 单进程直接显示日志；Compound 先让用户选成员（或看合并日志）。
+    @ViewBuilder
+    private func consoleView(for model: RunningProcessModel) -> some View {
+        if model.compoundMembers.isEmpty {
+            LogConsoleView(model: model)
+        } else {
+            compoundConsole(model: model)
+        }
+    }
+
+    private func compoundConsole(model: RunningProcessModel) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Picker("", selection: Binding(
+                get: { consoleMemberKey ?? "all" },
+                set: { consoleMemberKey = $0 == "all" ? nil : $0 }
+            )) {
+                Text("全部").tag("all")
+                ForEach(model.compoundMembers) { member in
+                    Text(member.name).tag(member.id)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Divider()
+            if let key = consoleMemberKey, let console = model.consoleModel(for: key) {
+                LogConsoleView(model: console)
+            } else {
+                LogConsoleView(model: model)
             }
         }
     }
@@ -1022,32 +1060,36 @@ struct ConfigurationDetailView: View {
                 }
 
                 section("运行信息") {
-                    if config.type == .jar {
-                        keyRow("JAR Path", config.jarPath, monospaced: true)
+                    if config.type == .compound {
+                        keyRow("成员", "\(config.compoundMembers.count) 个")
+                        if !config.beforeLaunchTasks.isEmpty {
+                            keyRow("Before Launch", "Compound 自身的任务暂不支持")
+                        }
                     } else {
-                        keyRow("Main Class", config.mainClass, monospaced: true)
-                        keyRow("Module", config.moduleName)
+                        if config.type == .jar {
+                            keyRow("JAR Path", config.jarPath, monospaced: true)
+                        } else {
+                            keyRow("Main Class", config.mainClass, monospaced: true)
+                            keyRow("Module", config.moduleName)
+                        }
+                        if let directory = resolvedModuleDirectory {
+                            keyRow("Module 目录", directory.path, monospaced: true)
+                        }
+                        keyRow("JDK", jdkText)
+                        keyRow("VM Options", config.vmOptions, monospaced: true)
+                        keyRow("Program Arguments", config.programArguments, monospaced: true)
+                        if !config.springProfiles.isEmpty {
+                            keyRow("Spring Profiles", config.springProfiles.joined(separator: ", "))
+                        }
+                        keyRow("Working Directory", resolvedWorkDir ?? config.workingDirectory, monospaced: true)
                     }
-                    if let directory = resolvedModuleDirectory {
-                        keyRow("Module 目录", directory.path, monospaced: true)
-                    }
-                    keyRow("JDK", jdkText)
-                    keyRow("VM Options", config.vmOptions, monospaced: true)
-                    keyRow("Program Arguments", config.programArguments, monospaced: true)
-                    if !config.springProfiles.isEmpty {
-                        keyRow("Spring Profiles", config.springProfiles.joined(separator: ", "))
-                    }
-                    keyRow("Working Directory", resolvedWorkDir ?? config.workingDirectory, monospaced: true)
                 }
 
                 if !config.compoundMembers.isEmpty {
+                    let session = store.displaySession(projectID: project.id, configKey: config.uniqueKey)
                     section("Compound 成员") {
                         ForEach(config.compoundMembers, id: \.self) { member in
-                            HStack(spacing: 6) {
-                                Image(systemName: "rectangle.stack")
-                                    .foregroundStyle(.secondary)
-                                Text(member.name)
-                            }
+                            compoundMemberRow(member: member, session: session)
                         }
                     }
                 }
@@ -1116,6 +1158,37 @@ struct ConfigurationDetailView: View {
         }
     }
 
+    /// Compound 成员行：没有会话时只显示引用；启动后带上成员自己的状态/PID/端口。
+    private func compoundMemberRow(member: CompoundMember, session: RunningProcessModel?) -> some View {
+        // XML 里的 type 可能过期（IDEA 里配置类型改过）：运行时按唯一同名配置解析，
+        // 快照 id 用的是解析后的类型，因此再按名字兜底匹配。
+        let snapshot = session?.compoundMembers.first { $0.id == member.uniqueKey }
+            ?? session?.compoundMembers.first { $0.name == member.name }
+        return HStack(spacing: 8) {
+            Image(systemName: "rectangle.stack")
+                .foregroundStyle(.secondary)
+            Text(member.name)
+            if let snapshot {
+                Text(snapshot.state.displayText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let pid = snapshot.pid {
+                    Text("PID \(pid)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                if !snapshot.ports.isEmpty {
+                    Text("端口 \(snapshot.ports.map(String.init).joined(separator: "、"))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
     private func runtimeBanner(model: RunningProcessModel) -> some View {
         HStack(spacing: 10) {
             if model.isBuilding {
@@ -1124,6 +1197,11 @@ struct ConfigurationDetailView: View {
             }
             Text(model.state.displayText)
                 .font(.callout.weight(.medium))
+            if !model.compoundMembers.isEmpty {
+                Text("\(model.compoundMembers.count) 个成员")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             if let pid = model.pid {
                 Text("PID \(pid)")
                     .font(.caption)

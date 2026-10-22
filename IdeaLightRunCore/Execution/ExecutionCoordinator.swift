@@ -19,9 +19,15 @@ public struct ExecutionCoordinator: Sendable {
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle? = nil
     ) async throws -> PreparedExecution {
-        try await prepare(
+        // §P0-10: 清掉上次异常遗留的启动产物（@argfile / manifest jar）
+        LaunchArtifactStore.cleanupOrphans()
+        // 先做类型/字段门禁，项目根不存在时也要先给出「这个配置不能跑」。
+        try Self.ensureRunnable(config)
+        let scan = try IntelliJProjectScanner().scan(projectRoot: projectRoot)
+        return try await prepareResolved(
             config: config,
             projectRoot: projectRoot,
+            scan: scan,
             log: log,
             progress: progress,
             processHandle: processHandle,
@@ -31,27 +37,25 @@ public struct ExecutionCoordinator: Sendable {
     }
 
     /// - Parameters:
+    ///   - scan: 一次启动共用同一份扫描结果；Compound 成员不再各自扫盘。
     ///   - gateOwner: Before Launch 引用同一项目的其他配置时复用的构建闸门持有者；
     ///     不复用会自锁（§3.7）。
-    ///   - visiting: 已走过的配置名，用于循环检测。
-    private func prepare(
+    ///   - visiting: 已走过的配置名（Compound 嵌套 + Before Launch 引用），用于循环检测。
+    private func prepareResolved(
         config: RunConfiguration,
         projectRoot: URL,
+        scan: ScanResult,
         log: @escaping LogCallback,
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle?,
         gateOwner: BuildGate.Owner?,
         visiting: [String]
     ) async throws -> PreparedExecution {
-        // §P0-10: 清掉上次异常遗留的启动产物（@argfile / manifest jar）
-        LaunchArtifactStore.cleanupOrphans()
-        // 先做类型/字段门禁，项目根不存在时也要先给出「这个配置不能跑」。
-        try Self.ensureRunnable(config)
-        let scan = try IntelliJProjectScanner().scan(projectRoot: projectRoot)
         // 再按项目实际构建系统与 Before Launch 引用做完整能力检查。
         try Self.ensureRunnable(config, scan: scan)
 
-        if config.type == .jar {
+        switch config.type {
+        case .jar:
             return try await prepareJar(
                 config: config,
                 projectRoot: projectRoot,
@@ -62,18 +66,34 @@ public struct ExecutionCoordinator: Sendable {
                 gateOwner: gateOwner,
                 visiting: visiting
             )
+        case .compound:
+            return try await prepareCompound(
+                config: config,
+                projectRoot: projectRoot,
+                scan: scan,
+                log: log,
+                progress: progress,
+                processHandle: processHandle,
+                gateOwner: gateOwner,
+                visiting: visiting
+            )
+        case .application, .springBoot:
+            return try await prepareJavaApplication(
+                config: config,
+                projectRoot: projectRoot,
+                scan: scan,
+                log: log,
+                progress: progress,
+                processHandle: processHandle,
+                gateOwner: gateOwner,
+                visiting: visiting
+            )
+        case .maven, .gradle, .junit, .unknown:
+            // ensureRunnable 已经拦下，这里只是保持 switch 穷尽。
+            throw IdeaLightRunError.unsupportedConfiguration(
+                detail: "“\(config.name)”（\(config.type.displayName)）当前不能直接启动。"
+            )
         }
-
-        return try await prepareJavaApplication(
-            config: config,
-            projectRoot: projectRoot,
-            scan: scan,
-            log: log,
-            progress: progress,
-            processHandle: processHandle,
-            gateOwner: gateOwner,
-            visiting: visiting
-        )
     }
 
     // MARK: - Application / Spring Boot
@@ -145,9 +165,10 @@ public struct ExecutionCoordinator: Sendable {
                         )
                     },
                     runReferenced: { referenced, chain in
-                        let referencedExecution = try await self.prepare(
+                        let referencedExecution = try await self.prepareResolved(
                             config: referenced,
                             projectRoot: projectRoot,
+                            scan: scan,
                             log: log,
                             progress: progress,
                             processHandle: processHandle,
@@ -189,6 +210,109 @@ public struct ExecutionCoordinator: Sendable {
             progress(.starting)
             return .process(try JavaRunPlanner.plan(resolved: resolved, classpath: classpath, jdk: build.jdk))
         }
+    }
+
+    // MARK: - Compound
+
+    /// §Compound: 成员按 IDEA 的顺序逐个准备（每个成员跑自己的 Before Launch），
+    /// 全部成功后才交给运行时统一启动。嵌套 Compound 在这里展开成叶子成员：
+    /// 对用户来说等价于按顺序启动所有叶子配置，运行时也因此只有真实进程。
+    private func prepareCompound(
+        config: RunConfiguration,
+        projectRoot: URL,
+        scan: ScanResult,
+        log: @escaping LogCallback,
+        progress: @escaping (ProcessState) -> Void,
+        processHandle: ProcessHandle?,
+        gateOwner: BuildGate.Owner?,
+        visiting: [String]
+    ) async throws -> PreparedExecution {
+        guard config.beforeLaunchTasks.filter(\.isEnabled).isEmpty else {
+            throw IdeaLightRunError.unsupportedBeforeLaunch(
+                detail: "配置 “\(config.name)” 是 Compound；Compound 自身的 Before Launch 任务暂不支持执行。"
+                    + "请把构建等任务放到成员配置中，IdeaLightRun 不会跳过它们直接启动。"
+            )
+        }
+        guard !config.compoundMembers.isEmpty else {
+            throw IdeaLightRunError.invalidConfiguration(detail: "配置 “\(config.name)” 没有引用任何子配置。")
+        }
+
+        let chain = visiting + [config.name]
+        var members: [CompoundMemberPlan] = []
+        var leafKeys: Set<String> = []
+
+        for member in config.compoundMembers {
+            if processHandle?.isCancelled == true {
+                throw IdeaLightRunError.launchCancelled(detail: "Compound 启动已被用户停止。")
+            }
+            let referenced: RunConfiguration
+            switch ConfigurationReferenceResolver.resolve(
+                name: member.name,
+                type: member.type.isEmpty ? nil : member.type,
+                in: scan.configurations,
+                allowNameFallback: true
+            ) {
+            case .found(let found):
+                referenced = found
+            case .notFound:
+                throw IdeaLightRunError.referencedConfigurationNotFound(
+                    detail: "Compound 配置 “\(config.name)” 引用了 “\(member.name)”，但当前项目里没有这个运行配置。"
+                )
+            case .typeMismatch:
+                throw IdeaLightRunError.referencedConfigurationNotFound(
+                    detail: "Compound 配置 “\(config.name)” 引用了 “\(member.name)”（类型 \(member.type)），"
+                        + "项目里存在同名配置但类型不匹配。请检查 IDEA 中的引用。"
+                )
+            }
+            if chain.contains(referenced.name) {
+                throw IdeaLightRunError.beforeLaunchCycle(chain: chain + [referenced.name])
+            }
+
+            log(LogLine(
+                stream: .system,
+                text: "[IdeaLightRun] Compound 成员：\(referenced.name)（\(referenced.type.displayName)）"
+            ))
+            progress(.preparing)
+            let execution = try await prepareResolved(
+                config: referenced,
+                projectRoot: projectRoot,
+                scan: scan,
+                log: log,
+                progress: progress,
+                processHandle: processHandle,
+                gateOwner: gateOwner,
+                visiting: chain
+            )
+
+            let leaves: [CompoundMemberPlan]
+            if case .compound(let nested) = execution {
+                leaves = nested.members
+            } else {
+                leaves = [CompoundMemberPlan(
+                    name: referenced.name,
+                    configurationKey: referenced.uniqueKey,
+                    execution: execution
+                )]
+            }
+            for leaf in leaves {
+                guard leafKeys.insert(leaf.configurationKey).inserted else {
+                    throw IdeaLightRunError.invalidConfiguration(
+                        detail: "Compound 配置 “\(config.name)” 重复引用了 “\(leaf.name)”。"
+                            + "同一配置一次启动只能出现一次。"
+                    )
+                }
+                members.append(leaf)
+            }
+        }
+
+        guard !members.isEmpty else {
+            throw IdeaLightRunError.invalidConfiguration(detail: "配置 “\(config.name)” 没有可启动的成员。")
+        }
+        if processHandle?.isCancelled == true {
+            throw IdeaLightRunError.launchCancelled(detail: "Compound 启动已被用户停止。")
+        }
+        progress(.starting)
+        return .compound(CompoundExecutionPlan(name: config.name, members: members))
     }
 
     // MARK: - JAR Application
@@ -286,9 +410,10 @@ public struct ExecutionCoordinator: Sendable {
                         )
                     },
                     runReferenced: { referenced, chain in
-                        let referencedExecution = try await self.prepare(
+                        let referencedExecution = try await self.prepareResolved(
                             config: referenced,
                             projectRoot: projectRoot,
+                            scan: scan,
                             log: log,
                             progress: progress,
                             processHandle: processHandle,
@@ -335,7 +460,8 @@ public struct ExecutionCoordinator: Sendable {
     static func ensureRunnable(_ config: RunConfiguration, scan: ScanResult) throws {
         let capability = ConfigurationCapabilityResolver.resolve(config, scan: scan)
         guard !capability.isLaunchable else { return }
-        if config.type != .jar, capability.buildSystem != .maven {
+        if config.type == .application || config.type == .springBoot,
+           capability.buildSystem != .maven {
             throw IdeaLightRunError.buildToolNotFound(
                 detail: capability.primaryReason ?? "无法确定项目的构建系统。"
             )
@@ -351,7 +477,7 @@ public struct ExecutionCoordinator: Sendable {
         let reason = capability.primaryReason ?? "当前版本尚未接管该类型。"
         throw IdeaLightRunError.unsupportedConfiguration(
             detail: "“\(config.name)”（\(config.type.displayName)）当前不能直接启动：\(reason)"
-                + " 现在能替代 IDEA Run 按钮的是 Application、Spring Boot 与 JAR Application 配置。"
+                + " 现在能替代 IDEA Run 按钮的是 Application、Spring Boot、JAR Application 与 Compound 配置。"
         )
     }
 

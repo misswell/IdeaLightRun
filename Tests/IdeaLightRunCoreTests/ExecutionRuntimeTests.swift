@@ -71,18 +71,123 @@ final class ExecutionRuntimeTests: XCTestCase {
         XCTAssertFalse(runtime.isRunning)
     }
 
-    func testCompoundExecutionIsRejectedUntilM3() {
-        let compound = CompoundExecutionPlan(name: "All", members: [])
+    func testCompoundExecutionStartsAllMembersWithIndependentPIDsAndLogs() throws {
+        let runtime = try makeCompoundRuntime([
+            ("Alpha", "/bin/echo", ["alpha-log"]),
+            ("Beta", "/bin/echo", ["beta-log"]),
+        ])
+        let lock = NSLock()
+        var pids: [String: Int32] = [:]
+        var memberLogs: [String: [String]] = [:]
+        var rootLogs: [String] = []
+
+        runtime.setHandlers(
+            onState: { _ in },
+            onLogLines: { batch in
+                lock.lock(); rootLogs += batch.map(\.text); lock.unlock()
+            },
+            onCompoundMember: { event in
+                lock.lock()
+                switch event.kind {
+                case .started(let pid):
+                    pids[event.memberName] = pid
+                case .logLines(let lines):
+                    memberLogs[event.memberName, default: []] += lines.map(\.text)
+                case .state:
+                    break
+                }
+                lock.unlock()
+            }
+        )
+
+        runtime.start()
+        XCTAssertTrue(runtime.waitUntilExit(timeout: 10))
+        Thread.sleep(forTimeInterval: 0.5)
+
+        lock.lock()
+        let observedPIDs = pids
+        let logs = memberLogs
+        let merged = rootLogs
+        lock.unlock()
+
+        XCTAssertEqual(observedPIDs.count, 2, "每个成员都要有自己的 PID")
+        XCTAssertNotEqual(observedPIDs["Alpha"], observedPIDs["Beta"])
+        XCTAssertTrue(observedPIDs.values.allSatisfy { $0 > 0 })
+        XCTAssertTrue(logs["Alpha", default: []].contains { $0.contains("alpha-log") })
+        XCTAssertTrue(logs["Beta", default: []].contains { $0.contains("beta-log") })
+        XCTAssertFalse(logs["Alpha", default: []].contains { $0.contains("beta-log") }, "成员日志不能串台")
+        XCTAssertTrue(merged.contains { $0.contains("[Alpha]") && $0.contains("alpha-log") }, "\(merged)")
+        XCTAssertTrue(merged.contains { $0.contains("[Beta]") && $0.contains("beta-log") }, "\(merged)")
+        XCTAssertEqual(runtime.state, .exited(0))
+    }
+
+    func testCompoundStopStopsEveryMember() throws {
+        let runtime = try makeCompoundRuntime([
+            ("One", "/bin/sleep", ["100"]),
+            ("Two", "/bin/sleep", ["100"]),
+        ])
+        runtime.start()
+        Thread.sleep(forTimeInterval: 0.4)
+        XCTAssertTrue(runtime.members.allSatisfy { $0.pid > 0 })
+
+        runtime.stop()
+        XCTAssertTrue(runtime.waitUntilExit(timeout: 8), "分组 Stop 必须停掉所有成员")
+        XCTAssertTrue(runtime.members.allSatisfy { $0.state.isTerminal })
+        XCTAssertTrue(runtime.state.isTerminal)
+    }
+
+    func testCompoundForceKillTerminatesEveryMember() throws {
+        let runtime = try makeCompoundRuntime([
+            ("One", "/bin/sleep", ["100"]),
+            ("Two", "/bin/sleep", ["100"]),
+        ])
+        runtime.start()
+        Thread.sleep(forTimeInterval: 0.4)
+
+        runtime.forceKill()
+        XCTAssertTrue(runtime.waitUntilExit(timeout: 8))
+        XCTAssertTrue(runtime.members.allSatisfy { $0.state.isTerminal })
+    }
+
+    /// 一个成员异常结束后，其余成员不能继续跑，否则会留下半套服务。
+    func testCompoundPartialFailureStopsRemainingMembers() throws {
+        let runtime = try makeCompoundRuntime([
+            ("Fail", "/usr/bin/false", []),
+            ("Server", "/bin/sleep", ["100"]),
+        ])
+        runtime.start()
+        XCTAssertTrue(runtime.waitUntilExit(timeout: 8), "失败清理后组合必须进入终态")
+        XCTAssertTrue(runtime.members.allSatisfy { $0.state.isTerminal })
+        XCTAssertEqual(runtime.state, .exited(1), "失败成员的退出码要保留")
+    }
+
+    func testEmptyCompoundIsRejected() {
         XCTAssertThrowsError(try ExecutionRuntime(
             configKey: "all",
             configName: "All",
-            execution: .compound(compound)
+            execution: .compound(CompoundExecutionPlan(name: "All", members: []))
         )) { error in
-            guard case IdeaLightRunError.unsupportedConfiguration(let detail) = error else {
-                return XCTFail("期望 unsupportedConfiguration，实际：\(error)")
+            guard case IdeaLightRunError.invalidConfiguration = error else {
+                return XCTFail("期望 invalidConfiguration，实际：\(error)")
             }
-            XCTAssertTrue(detail.contains("Milestone 3"), detail)
         }
+    }
+
+    private func makeCompoundRuntime(
+        _ members: [(String, String, [String])]
+    ) throws -> ExecutionRuntime {
+        let plans = members.map { name, executable, arguments in
+            CompoundMemberPlan(
+                name: name,
+                configurationKey: "test::\(name)",
+                execution: .process(plan(executable, arguments))
+            )
+        }
+        return try ExecutionRuntime(
+            configKey: "test::All",
+            configName: "All",
+            execution: .compound(CompoundExecutionPlan(name: "All", members: plans))
+        )
     }
 
     // MARK: - Before Launch 的同步执行

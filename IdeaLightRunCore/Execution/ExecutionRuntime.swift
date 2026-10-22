@@ -1,20 +1,56 @@
 import Foundation
 
+/// 组合执行期间某个成员的事件。GUI 用它给每个成员维护独立的
+/// 状态 / PID / 日志控制台；单进程运行时不会产生这类事件。
+public struct CompoundMemberEvent: Sendable {
+    public enum Kind: Sendable {
+        case started(Int32)
+        case state(ProcessState)
+        case logLines([LogLine])
+    }
+
+    public var memberIndex: Int
+    public var memberName: String
+    public var configurationKey: String
+    public var kind: Kind
+
+    public init(memberIndex: Int, memberName: String, configurationKey: String, kind: Kind) {
+        self.memberIndex = memberIndex
+        self.memberName = memberName
+        self.configurationKey = configurationKey
+        self.kind = kind
+    }
+}
+
 /// §4.2: Core 的统一执行器。GUI 与 CLI 只提交 `PreparedExecution`，
 /// 不再各自创建 `ManagedProcessSession`、抢着处理终态或解释计划。
 ///
-/// M2 覆盖单个进程；Compound 的统一调度在 M3 由组合执行器接管。
+/// §Compound: 组合配置持有多个成员运行时——每个成员有独立的 PID、日志缓冲与状态。
+/// 停止 / 强杀 / 等待退出按组传播；某个成员异常结束时先停掉其余成员，
+/// 不让一次组合启动留下半套服务。
 public final class ExecutionRuntime: @unchecked Sendable {
     public let configKey: String
     public let configName: String
     public let logBuffer: LogRingBuffer
     public let execution: PreparedExecution
 
-    private let session: ManagedProcessSession
+    /// 组合配置的成员运行时（按 IDEA 配置顺序）；单进程为空。
+    /// Compound 计划在准备阶段已展开嵌套，所以这里都是真正的进程执行器。
+    public private(set) var members: [ExecutionRuntime] = []
+
+    private let session: ManagedProcessSession?
     private let handlerLock = NSLock()
     private var stateHandler: ((ProcessState) -> Void)?
     private var logHandler: (([LogLine]) -> Void)?
     private var startedHandler: ((Int32) -> Void)?
+    private var compoundEventHandler: ((CompoundMemberEvent) -> Void)?
+
+    private let compoundLock = NSLock()
+    private var memberStates: [ProcessState] = []
+    private var hasStarted = false
+    private var lastPublishedState: ProcessState = .starting
+    /// 用户主动停止（或已因失败开始清理）后，成员的 SIGTERM 退出码不再触发第二轮清理。
+    private var stopRequested = false
 
     public init(
         configKey: String,
@@ -22,61 +58,242 @@ public final class ExecutionRuntime: @unchecked Sendable {
         execution: PreparedExecution,
         logBuffer: LogRingBuffer = LogRingBuffer()
     ) throws {
-        let plan: ExecutableLaunchPlan
-        switch execution {
-        case .process(let processPlan):
-            plan = processPlan
-        case .compound:
-            throw IdeaLightRunError.unsupportedConfiguration(
-                detail: "Compound 多配置执行将在 Milestone 3 接入，当前不能启动。"
-            )
-        }
-
         self.configKey = configKey
         self.configName = configName
         self.execution = execution
         self.logBuffer = logBuffer
 
-        let session = try ManagedProcessSession(
-            configKey: configKey,
-            configName: configName,
-            plan: plan,
-            logBuffer: logBuffer
-        )
-        self.session = session
-        session.onState = { [weak self] state in self?.deliverState(state) }
-        session.onLogLines = { [weak self] lines in self?.deliverLogs(lines) }
-        session.onStarted = { [weak self] pid in self?.deliverStarted(pid) }
+        switch execution {
+        case .process(let plan):
+            self.session = try ManagedProcessSession(
+                configKey: configKey,
+                configName: configName,
+                plan: plan,
+                logBuffer: logBuffer
+            )
+            session?.onState = { [weak self] state in self?.deliverState(state) }
+            session?.onLogLines = { [weak self] lines in self?.deliverLogs(lines) }
+            session?.onStarted = { [weak self] pid in self?.deliverStarted(pid) }
+        case .compound(let plan):
+            guard !plan.members.isEmpty else {
+                throw IdeaLightRunError.invalidConfiguration(
+                    detail: "Compound 配置 “\(plan.name)” 没有可启动的成员。"
+                )
+            }
+            self.session = nil
+            var runtimes: [ExecutionRuntime] = []
+            runtimes.reserveCapacity(plan.members.count)
+            for member in plan.members {
+                runtimes.append(try ExecutionRuntime(
+                    configKey: member.configurationKey,
+                    configName: member.name,
+                    execution: member.execution
+                ))
+            }
+            self.members = runtimes
+            self.memberStates = Array(repeating: .starting, count: runtimes.count)
+            for (index, runtime) in runtimes.enumerated() {
+                runtime.setHandlers(
+                    onStarted: { [weak self] pid in self?.memberStarted(index: index, pid: pid) },
+                    onState: { [weak self] state in self?.memberStateChanged(index: index, state: state) },
+                    onLogLines: { [weak self] lines in self?.memberLogged(index: index, lines: lines) }
+                )
+            }
+        }
     }
 
     /// 句柄必须在 `start()` 之前设置；回调可能来自后台线程，调用方负责线程切换。
     public func setHandlers(
         onStarted: ((Int32) -> Void)? = nil,
         onState: ((ProcessState) -> Void)? = nil,
-        onLogLines: (([LogLine]) -> Void)? = nil
+        onLogLines: (([LogLine]) -> Void)? = nil,
+        onCompoundMember: ((CompoundMemberEvent) -> Void)? = nil
     ) {
         handlerLock.lock()
         startedHandler = onStarted
         stateHandler = onState
         logHandler = onLogLines
+        compoundEventHandler = onCompoundMember
         handlerLock.unlock()
     }
 
-    public var state: ProcessState { session.state }
-    public var pid: Int32 { session.pid }
-    public var isRunning: Bool { session.isRunning }
+    public var state: ProcessState {
+        if let session { return session.state }
+        compoundLock.lock()
+        defer { compoundLock.unlock() }
+        guard hasStarted else { return .starting }
+        return Self.aggregateState(memberStates)
+    }
 
-    public func start() { session.start() }
-    public func stop() { session.stop() }
-    public func forceKill() { session.forceKill() }
+    public var pid: Int32 {
+        if let session { return session.pid }
+        return members.first { $0.pid > 0 }?.pid ?? 0
+    }
+
+    public var isRunning: Bool {
+        if let session { return session.isRunning }
+        return !state.isTerminal
+    }
+
+    public func start() {
+        if let session {
+            session.start()
+            return
+        }
+        compoundLock.lock()
+        hasStarted = true
+        compoundLock.unlock()
+
+        emitSystemLog("启动 Compound 配置 “\(configName)”，共 \(members.count) 个成员…")
+        for (index, member) in members.enumerated() {
+            emitSystemLog("启动成员 \(index + 1)/\(members.count)：“\(member.configName)”…")
+            // 前面的成员可能已经失败并请求停止；这里仍然 start()：
+            // 子会话会登记 pending stop，进程跑起来后立刻终止，不会停在 .starting。
+            member.start()
+        }
+    }
+
+    public func stop() {
+        if let session {
+            session.stop()
+            return
+        }
+        compoundLock.lock()
+        stopRequested = true
+        compoundLock.unlock()
+        for member in members where !member.state.isTerminal {
+            member.stop()
+        }
+    }
+
+    public func forceKill() {
+        if let session {
+            session.forceKill()
+            return
+        }
+        compoundLock.lock()
+        stopRequested = true
+        compoundLock.unlock()
+        for member in members where !member.state.isTerminal {
+            member.forceKill()
+        }
+    }
 
     @discardableResult
     public func waitUntilExit(timeout: TimeInterval) -> Bool {
-        session.waitUntilExit(timeout: timeout)
+        if let session {
+            return session.waitUntilExit(timeout: timeout)
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if members.allSatisfy({ $0.state.isTerminal }) { return true }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        return members.allSatisfy { $0.state.isTerminal }
     }
 
     public func appendSystemLog(_ text: String) {
-        session.appendSystemLog(text)
+        if let session {
+            session.appendSystemLog(text)
+        } else {
+            emitSystemLog(text)
+        }
+    }
+
+    // MARK: - Compound 事件与状态
+
+    private func memberStarted(index: Int, pid: Int32) {
+        deliverMemberEvent(index: index, kind: .started(pid))
+    }
+
+    private func memberLogged(index: Int, lines: [LogLine]) {
+        guard index < members.count else { return }
+        let prefix = "[\(members[index].configName)] "
+        // 组合根控制台拿到带成员前缀的合并日志；成员的独立控制台拿原始日志。
+        let merged = lines.map { LogLine(stream: $0.stream, text: prefix + $0.text) }
+        logBuffer.record(merged)
+        deliverLogs(merged)
+        deliverMemberEvent(index: index, kind: .logLines(lines))
+    }
+
+    private func memberStateChanged(index: Int, state: ProcessState) {
+        let aggregate: ProcessState
+        let changed: Bool
+        let shouldCleanup: Bool
+        compoundLock.lock()
+        guard index < memberStates.count else {
+            compoundLock.unlock()
+            return
+        }
+        memberStates[index] = state
+        aggregate = Self.aggregateState(memberStates)
+        changed = aggregate != lastPublishedState
+        lastPublishedState = aggregate
+        // 不要求此刻已有其他成员进入运行态：失败可能发生在后续成员尚未 start
+        // 之前（例如第一个成员立刻以非零码退出）。待启动成员收到 stop() 会登记
+        // pending stop，start() 后立即终止，不会留下半套服务。
+        shouldCleanup = !stopRequested && Self.isFailure(state)
+        if shouldCleanup { stopRequested = true }
+        compoundLock.unlock()
+
+        deliverMemberEvent(index: index, kind: .state(state))
+        if changed { deliverState(aggregate) }
+
+        if shouldCleanup {
+            let remaining = members.enumerated().filter { memberIndex, member in
+                memberIndex != index && !member.state.isTerminal && member.state != .stopping
+            }
+            if !remaining.isEmpty {
+                emitSystemLog("成员 “\(members[index].configName)” 已异常结束，正在停止其余成员…")
+            }
+            for (_, member) in remaining {
+                member.stop()
+            }
+        }
+        if changed, aggregate.isTerminal {
+            emitSystemLog("Compound 配置已结束：\(aggregate.displayText)")
+        }
+    }
+
+    private func emitSystemLog(_ text: String) {
+        let line = LogLine(stream: .system, text: "[IdeaLightRun] \(text)")
+        logBuffer.record([line])
+        deliverLogs([line])
+    }
+
+    private static func isFailure(_ state: ProcessState) -> Bool {
+        switch state {
+        case .failed:
+            return true
+        case .exited(let code):
+            return code != 0
+        default:
+            return false
+        }
+    }
+
+    /// 所有成员都进入终态后才宣布组合的终态；还有成员在跑时保持运行/停止中，
+    /// 否则 `waitUntilExit` / CLI 会在成员被清理前提前返回。
+    static func aggregateState(_ states: [ProcessState]) -> ProcessState {
+        guard !states.isEmpty else { return .starting }
+        if states.contains(where: { $0.isActive }) {
+            return states.contains(.stopping) ? .stopping : .running
+        }
+        if let failure = states.first(where: { state in
+            if case .failed = state { return true }
+            return false
+        }) {
+            return failure
+        }
+        if states.contains(.cancelled) { return .cancelled }
+        let codes = states.compactMap { state -> Int32? in
+            if case .exited(let code) = state { return code }
+            return nil
+        }
+        if codes.count == states.count {
+            return .exited(codes.first(where: { $0 != 0 }) ?? 0)
+        }
+        return .starting
     }
 
     // MARK: - Before Launch 的同步执行
@@ -177,6 +394,19 @@ public final class ExecutionRuntime: @unchecked Sendable {
         let handler = startedHandler
         handlerLock.unlock()
         handler?(pid)
+    }
+
+    private func deliverMemberEvent(index: Int, kind: CompoundMemberEvent.Kind) {
+        handlerLock.lock()
+        let handler = compoundEventHandler
+        handlerLock.unlock()
+        guard let handler, index < members.count else { return }
+        handler(CompoundMemberEvent(
+            memberIndex: index,
+            memberName: members[index].configName,
+            configurationKey: members[index].configKey,
+            kind: kind
+        ))
     }
 }
 

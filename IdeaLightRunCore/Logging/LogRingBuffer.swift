@@ -33,6 +33,19 @@ public final class LogRingBuffer: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// 只写入环形历史，不进入待推送队列。调用方已经自行完成批量投递
+    /// （Compound 根控制台的合并日志）时使用，否则 pending 永远无人取走。
+    public func record(_ newLines: [LogLine]) {
+        guard !newLines.isEmpty else { return }
+        lock.lock()
+        for line in newLines {
+            lines.append(line)
+            totalBytes += line.text.utf8.count + 1
+        }
+        trimLocked()
+        lock.unlock()
+    }
+
     /// 批量裁剪：一次算出要丢多少行，一次 `removeFirst(k)`。
     /// 原实现是 `while 超限 { lines.removeFirst() }`——每丢一行都要把整个数组尾部
     /// 前移一格，缓冲满之后每来一行就是 O(上限)，十万行级别的日志会让 IO 线程把

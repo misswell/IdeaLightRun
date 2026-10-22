@@ -1,6 +1,15 @@
 import Foundation
 import IdeaLightRunCore
 
+/// Compound 成员的展示快照：每个成员有独立的状态 / PID / 端口。
+struct CompoundMemberSnapshot: Identifiable, Equatable {
+    let id: String
+    let name: String
+    var state: ProcessState
+    var pid: Int32?
+    var ports: [Int]
+}
+
 /// GUI 侧的单次运行模型：包装 Core 的 ExecutionRuntime，回调统一切回主线程。
 /// 日志经 LogRingBuffer（§37 上限）+ 100ms 批量（§103）进入 NSTextView 控制台。
 /// 一个模型对应一个运行实例（RunSessionID），同一配置可并行多个实例（allowParallelRun）。
@@ -21,6 +30,8 @@ final class RunningProcessModel: LogViewModel, Identifiable {
     @Published private(set) var pid: Int32?
     /// 进程正在 LISTEN 的 TCP 端口（本机 lsof 探测，仅进程存活期间轮询）。
     @Published private(set) var listeningPorts: [Int] = []
+    /// Compound 成员快照；单进程配置为空。
+    @Published private(set) var compoundMembers: [CompoundMemberSnapshot] = []
 
     /// 构建期（classpath 解析/编译）进程句柄，Stop 用它终止 Maven。
     var buildHandle: ProcessHandle?
@@ -29,6 +40,7 @@ final class RunningProcessModel: LogViewModel, Identifiable {
     var onRestartNeeded: (() -> Void)?
     private(set) var runtime: ExecutionRuntime?
     private var portPollTask: Task<Void, Never>?
+    private var memberConsoles: [String: LogViewModel] = [:]
 
     /// 状态/PID 变更通知。本模型是 AppStore 里的嵌套 ObservableObject，SwiftUI 不会自动
     /// 观察它；不显式冒泡到 AppStore.objectWillChange，列表行状态、顶栏按钮和运行横幅会
@@ -73,6 +85,14 @@ final class RunningProcessModel: LogViewModel, Identifiable {
     /// PID 不在这里读取：会话在 onStarted（run() 成功）后才发布 PID（§P0-2）。
     func attach(runtime: ExecutionRuntime) {
         self.runtime = runtime
+        if !runtime.members.isEmpty {
+            compoundMembers = runtime.members.map {
+                CompoundMemberSnapshot(id: $0.configKey, name: $0.configName, state: $0.state, pid: nil, ports: [])
+            }
+            for member in runtime.members where memberConsoles[member.configKey] == nil {
+                memberConsoles[member.configKey] = LogViewModel()
+            }
+        }
         startPortPolling()
         runtime.setHandlers(
             onStarted: { [weak self] newPID in
@@ -106,19 +126,91 @@ final class RunningProcessModel: LogViewModel, Identifiable {
                 Task { @MainActor [weak self] in
                     self?.appendLog(batch)
                 }
+            },
+            onCompoundMember: { [weak self] event in
+                Task { @MainActor [weak self] in
+                    self?.applyCompoundEvent(event)
+                }
             }
         )
     }
 
+    /// 成员控制台：Compound 每个成员一份独立日志缓冲。
+    func consoleModel(for memberID: String) -> LogViewModel? {
+        memberConsoles[memberID]
+    }
+
+    private func applyCompoundEvent(_ event: CompoundMemberEvent) {
+        guard let index = compoundMembers.firstIndex(where: { $0.id == event.configurationKey }) else { return }
+        switch event.kind {
+        case .started(let newPID):
+            compoundMembers[index].pid = newPID
+            onChange?()
+        case .state(let newState):
+            compoundMembers[index].state = newState
+            switch newState {
+            case .exited(let code):
+                compoundMembers[index].pid = nil
+                compoundMembers[index].ports = []
+                memberConsoles[event.configurationKey]?.appendLog(
+                    LogLine(stream: .system, text: "[IdeaLightRun] 进程退出，退出码 \(code)")
+                )
+                appendLog(LogLine(
+                    stream: .system,
+                    text: "[IdeaLightRun] 成员 “\(event.memberName)” 退出，退出码 \(code)"
+                ))
+            case .failed(let detail):
+                compoundMembers[index].pid = nil
+                compoundMembers[index].ports = []
+                memberConsoles[event.configurationKey]?.appendLog(
+                    LogLine(stream: .system, text: "[IdeaLightRun] 启动/运行失败：\(detail)")
+                )
+                appendLog(LogLine(
+                    stream: .system,
+                    text: "[IdeaLightRun] 成员 “\(event.memberName)” 失败：\(detail)"
+                ))
+            case .cancelled:
+                compoundMembers[index].pid = nil
+                compoundMembers[index].ports = []
+            default:
+                break
+            }
+            onChange?()
+        case .logLines(let lines):
+            memberConsoles[event.configurationKey]?.appendLog(lines)
+        }
+    }
+
     /// 探测「启动了哪些端口」：Spring Boot 之类要几秒才 bind，轮询到进程终态为止。
     /// 只读本机 lsof（§64 不涉网），端口集合变化时发布并在控制台补一条系统消息。
+    /// Compound 对每个成员分别探测，端口不会串到别的成员身上。
     private func startPortPolling() {
         portPollTask?.cancel()
         portPollTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
                 if self.state.isTerminal { return }
-                if let pid = self.pid {
+                if !self.compoundMembers.isEmpty {
+                    var changed = false
+                    for index in self.compoundMembers.indices {
+                        guard let memberPID = self.compoundMembers[index].pid else { continue }
+                        let ports = await Task.detached(priority: .utility) {
+                            ListeningPortScanner.listeningPorts(pid: memberPID)
+                        }.value
+                        guard !Task.isCancelled, !self.state.isTerminal else { return }
+                        if ports != self.compoundMembers[index].ports {
+                            self.compoundMembers[index].ports = ports
+                            changed = true
+                            if !ports.isEmpty {
+                                let text = ports.map(String.init).joined(separator: "、")
+                                self.memberConsoles[self.compoundMembers[index].id]?.appendLog(
+                                    LogLine(stream: .system, text: "[IdeaLightRun] 正在监听端口: \(text)")
+                                )
+                            }
+                        }
+                    }
+                    if changed { self.onChange?() }
+                } else if let pid = self.pid {
                     let ports = await Task.detached(priority: .utility) {
                         ListeningPortScanner.listeningPorts(pid: pid)
                     }.value

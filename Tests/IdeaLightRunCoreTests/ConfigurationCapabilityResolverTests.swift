@@ -127,7 +127,7 @@ final class ConfigurationCapabilityResolverTests: XCTestCase {
     }
 
     func testPlannedAndUnsupportedTypes() {
-        let planned: [RunConfigurationType] = [.compound, .maven, .gradle]
+        let planned: [RunConfigurationType] = [.maven, .gradle]
         for type in planned {
             let capability = ConfigurationCapabilityResolver.resolve(config(type), scan: scan())
             XCTAssertEqual(capability.readiness, .planned, "\(type)")
@@ -140,6 +140,158 @@ final class ConfigurationCapabilityResolverTests: XCTestCase {
             XCTAssertEqual(capability.readiness, .unsupported, "\(type)")
             XCTAssertFalse(capability.isLaunchable, "\(type)")
         }
+    }
+
+    // MARK: - Compound
+
+    private func compound(
+        name: String = "All",
+        members: [CompoundMember],
+        beforeLaunch: [BeforeLaunchTask] = []
+    ) -> RunConfiguration {
+        var config = config(.compound, name: name, mainClass: nil, moduleName: nil, beforeLaunch: beforeLaunch)
+        config.compoundMembers = members
+        return config
+    }
+
+    private func member(_ name: String, _ type: RunConfigurationType = .application) -> CompoundMember {
+        CompoundMember(name: name, type: type.ideaTypeRaw)
+    }
+
+    private let modules = [ProjectModule(
+        name: "app",
+        directory: URL(fileURLWithPath: "/tmp/lr-capability-project", isDirectory: true),
+        artifactId: "app"
+    )]
+
+    func testCompoundWithValidMembersIsReady() {
+        let one = config(.application, name: "One")
+        let two = config(.application, name: "Two")
+        let all = compound(members: [member("One"), member("Two")])
+
+        let capability = ConfigurationCapabilityResolver.resolve(
+            all,
+            scan: scan(modules: modules, configurations: [one, two, all])
+        )
+
+        XCTAssertEqual(capability.readiness, .ready)
+        XCTAssertTrue(capability.isLaunchable, "\(capability.blockingIssues)")
+        XCTAssertTrue(capability.blockingIssues.isEmpty, "\(capability.blockingIssues)")
+    }
+
+    func testEmptyCompoundBlocksLaunch() {
+        let all = compound(members: [])
+        let capability = ConfigurationCapabilityResolver.resolve(all, scan: scan(configurations: [all]))
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertFalse(capability.isLaunchable)
+        XCTAssertTrue(capability.missingFields.contains("Compound 成员"))
+    }
+
+    func testCompoundMissingMemberBlocksLaunch() {
+        let all = compound(members: [member("Ghost")])
+        let capability = ConfigurationCapabilityResolver.resolve(all, scan: scan(configurations: [all]))
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("Ghost") && $0.contains("不存在") })
+    }
+
+    func testCompoundMemberTypeMismatchBlocksLaunch() {
+        // 同名配置有两种类型时不能按名字任选一个，必须提示类型不匹配。
+        let boot = config(.springBoot, name: "Same")
+        let jar = config(.jar, name: "Same", mainClass: nil, jarPath: "same.jar")
+        let all = compound(members: [member("Same", .application)])
+        let capability = ConfigurationCapabilityResolver.resolve(
+            all,
+            scan: scan(modules: modules, configurations: [boot, jar, all])
+        )
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("类型") }, "\(capability.blockingIssues)")
+    }
+
+    /// IDEA 的 toRun 按名字找成员：配置类型改过之后旧 type 会过期，
+    /// 只要同名配置唯一，仍应指向用户当初选的那个配置。
+    func testCompoundStaleTypeFallsBackToUniqueName() {
+        let app = config(.application, name: "One")
+        let all = compound(members: [member("One", .springBoot)])
+        let capability = ConfigurationCapabilityResolver.resolve(
+            all,
+            scan: scan(modules: modules, configurations: [app, all])
+        )
+        XCTAssertEqual(capability.readiness, .ready, "\(capability.blockingIssues)")
+        XCTAssertTrue(capability.isLaunchable)
+    }
+
+    /// 成员本身不能启动（Maven 配置仍是 planned）时，Compound 不能显示 READY。
+    func testCompoundUnsupportedMemberBlocksLaunch() {
+        let maven = config(.maven, name: "Build")
+        let all = compound(members: [member("Build", .maven)])
+        let capability = ConfigurationCapabilityResolver.resolve(
+            all,
+            scan: scan(configurations: [maven, all])
+        )
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("Build") }, "\(capability.blockingIssues)")
+    }
+
+    func testCompoundCycleBlocksLaunch() {
+        let a = compound(name: "A", members: [member("B", .compound)])
+        let b = compound(name: "B", members: [member("A", .compound)])
+        let capability = ConfigurationCapabilityResolver.resolve(
+            a,
+            scan: scan(configurations: [a, b])
+        )
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("循环") }, "\(capability.blockingIssues)")
+    }
+
+    func testNestedCompoundWithValidLeavesIsReady() {
+        let one = config(.application, name: "One")
+        let nested = compound(name: "Nested", members: [member("One")])
+        let all = compound(name: "All", members: [member("Nested", .compound)])
+        let capability = ConfigurationCapabilityResolver.resolve(
+            all,
+            scan: scan(modules: modules, configurations: [one, nested, all])
+        )
+        XCTAssertEqual(capability.readiness, .ready, "\(capability.blockingIssues)")
+        XCTAssertTrue(capability.isLaunchable)
+    }
+
+    /// 嵌套展开后同一个叶子配置出现两次，启动时会变成两个进程。
+    func testNestedCompoundDuplicateLeafBlocksLaunch() {
+        let one = config(.application, name: "One")
+        let nested = compound(name: "Nested", members: [member("One")])
+        let all = compound(name: "All", members: [member("Nested", .compound), member("One")])
+        let capability = ConfigurationCapabilityResolver.resolve(
+            all,
+            scan: scan(modules: modules, configurations: [one, nested, all])
+        )
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("重复引用") }, "\(capability.blockingIssues)")
+    }
+
+    func testCompoundOwnBeforeLaunchBlocksLaunch() {
+        let one = config(.application, name: "One")
+        let all = compound(
+            members: [member("One")],
+            beforeLaunch: [BeforeLaunchTask(kind: .build, isEnabled: true)]
+        )
+        let capability = ConfigurationCapabilityResolver.resolve(
+            all,
+            scan: scan(modules: modules, configurations: [one, all])
+        )
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("Before Launch") }, "\(capability.blockingIssues)")
+    }
+
+    /// 成员的提示（如 JAR 暂不存在）要冒泡到 Compound，不能显示成完全无警告。
+    func testCompoundMemberWarningBubblesUp() {
+        let jar = config(.jar, name: "Jar", mainClass: nil, jarPath: "target/missing.jar", moduleName: nil)
+        let all = compound(members: [member("Jar", .jar)])
+        let capability = ConfigurationCapabilityResolver.resolve(
+            all,
+            scan: scan(configurations: [jar, all])
+        )
+        XCTAssertEqual(capability.readiness, .warning, "\(capability.blockingIssues)")
+        XCTAssertTrue(capability.isLaunchable)
     }
 
     // MARK: - JAR Application

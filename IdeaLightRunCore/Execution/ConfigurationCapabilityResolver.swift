@@ -81,9 +81,17 @@ public enum ConfigurationCapabilityResolver {
     }
 
     private static func resolve(_ config: RunConfiguration, scan: ScanResult?) -> ConfigurationCapability {
+        resolve(config, scan: scan, visiting: [])
+    }
+
+    private static func resolve(
+        _ config: RunConfiguration,
+        scan: ScanResult?,
+        visiting: [String]
+    ) -> ConfigurationCapability {
         switch config.type {
         case .compound:
-            return terminal(.planned, "Compound 配置已识别；多配置启动将在 Milestone 3 接入，当前不能启动。")
+            return resolveCompound(config, scan: scan, visiting: visiting)
         case .maven:
             return terminal(.planned, "Maven 运行配置已识别；直接运行 Maven goal 将在 Milestone 5 接入，当前不能启动。")
         case .gradle:
@@ -257,6 +265,124 @@ public enum ConfigurationCapabilityResolver {
         )
     }
 
+    /// §Compound: 成员必须存在、类型一致、各自可启动；成员之间的嵌套引用也要查环。
+    /// 组合配置自身没有 Main Class / JAR / 构建系统字段：它的可运行性完全由成员决定。
+    private static func resolveCompound(
+        _ config: RunConfiguration,
+        scan: ScanResult?,
+        visiting: [String]
+    ) -> ConfigurationCapability {
+        var issues: [ConfigurationCapability.Issue] = []
+        var missingFields: [String] = []
+
+        func block(_ message: String) {
+            issues.append(ConfigurationCapability.Issue(kind: .blocking, message: message))
+        }
+        func warn(_ message: String) {
+            issues.append(ConfigurationCapability.Issue(kind: .warning, message: message))
+        }
+
+        if !config.beforeLaunchTasks.filter(\.isEnabled).isEmpty {
+            block("Compound 配置自身的 Before Launch 任务暂不支持执行；IdeaLightRun 不会跳过它们直接启动。请把构建等任务放到成员配置中。")
+        }
+        if config.compoundMembers.isEmpty {
+            missingFields.append("Compound 成员")
+            block("Compound 配置没有引用任何子配置，无法启动。")
+        }
+
+        if let scan {
+            let chain = visiting + [config.uniqueKey]
+            for member in config.compoundMembers {
+                let reference = ConfigurationReferenceResolver.resolve(
+                    name: member.name,
+                    type: member.type.isEmpty ? nil : member.type,
+                    in: scan.configurations,
+                    allowNameFallback: true
+                )
+                switch reference {
+                case .notFound:
+                    block("Compound 成员 “\(member.name)” 不存在于当前项目。")
+                case .typeMismatch:
+                    block("Compound 成员 “\(member.name)” 存在同名配置，但类型与引用（\(member.type)）不匹配。")
+                case .found(let referenced):
+                    if chain.contains(referenced.uniqueKey) {
+                        block("Compound 成员 “\(referenced.name)” 形成循环引用：\(displayChain(chain + [referenced.uniqueKey], scan: scan))")
+                        continue
+                    }
+                    let memberCapability = resolve(referenced, scan: scan, visiting: chain)
+                    if !memberCapability.isLaunchable {
+                        let reason = memberCapability.primaryReason ?? "当前版本不能启动。"
+                        block("Compound 成员 “\(referenced.name)”（\(referenced.type.displayName)）不能启动：\(reason)")
+                    } else if let warning = memberCapability.primaryReason {
+                        warn("Compound 成员 “\(referenced.name)” 有提示：\(warning)")
+                    }
+                }
+            }
+
+            // 嵌套 Compound 会被展开成叶子成员执行；跨层重复引用同一个配置
+            // 在启动时会变成"同一配置启动两次"，必须在能力阶段就拦住。
+            var leafKeys: Set<String> = []
+            for leaf in flattenedMembers(of: config, scan: scan, visiting: visiting) {
+                if !leafKeys.insert(leaf.uniqueKey).inserted {
+                    block("Compound 配置重复引用了 “\(leaf.name)”（\(leaf.type.displayName)）。同一配置一次启动只能出现一次。")
+                }
+            }
+        }
+
+        for warning in config.warnings {
+            if case .custom(let title, _) = warning, title == "Compound 配置为空", config.compoundMembers.isEmpty {
+                continue
+            }
+            warn("\(warning.title)：\(warning.detail)")
+        }
+
+        let readiness: Readiness
+        if issues.contains(where: { $0.kind == .blocking }) {
+            readiness = .unsupported
+        } else if issues.contains(where: { $0.kind == .warning }) {
+            readiness = .warning
+        } else {
+            readiness = .ready
+        }
+        return ConfigurationCapability(
+            readiness: readiness,
+            issues: issues,
+            missingFields: missingFields
+        )
+    }
+
+    /// 递归展开嵌套 Compound，只返回真正会启动进程的叶子配置。
+    /// 缺失/类型不匹配/成环的引用由调用方的逐项检查报告，这里跳过。
+    private static func flattenedMembers(
+        of config: RunConfiguration,
+        scan: ScanResult,
+        visiting: [String]
+    ) -> [RunConfiguration] {
+        let chain = visiting + [config.uniqueKey]
+        var result: [RunConfiguration] = []
+        for member in config.compoundMembers {
+            guard case .found(let referenced) = ConfigurationReferenceResolver.resolve(
+                name: member.name,
+                type: member.type.isEmpty ? nil : member.type,
+                in: scan.configurations,
+                allowNameFallback: true
+            ) else { continue }
+            guard !chain.contains(referenced.uniqueKey) else { continue }
+            if referenced.type == .compound {
+                result.append(contentsOf: flattenedMembers(of: referenced, scan: scan, visiting: chain))
+            } else {
+                result.append(referenced)
+            }
+        }
+        return result
+    }
+
+    private static func displayChain(_ keys: [String], scan: ScanResult) -> String {
+        keys.map { key in
+            scan.configurations.first(where: { $0.uniqueKey == key })?.name ?? key
+        }.joined(separator: " -> ")
+    }
+
     private static func terminal(
         _ readiness: Readiness,
         _ message: String,
@@ -297,10 +423,9 @@ public enum ConfigurationCapabilityResolver {
         type: String?,
         in configurations: [RunConfiguration]
     ) -> Bool {
-        let sameName = configurations.filter { $0.name == name }
-        if let type, !type.isEmpty {
-            return sameName.contains { $0.type.ideaTypeRaw == type }
+        if case .found = ConfigurationReferenceResolver.resolve(name: name, type: type, in: configurations) {
+            return true
         }
-        return !sameName.isEmpty
+        return false
     }
 }

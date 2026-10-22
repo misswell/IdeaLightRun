@@ -43,6 +43,18 @@ final class LogRingBufferTests: XCTestCase {
         XCTAssertEqual(buffer.count, 2)
     }
 
+    /// Compound 根缓冲用 record 写合并日志：历史要留下，但不能再进 pending，
+    /// 否则调用方自己投递后 pending 永远没人取走。
+    func testRecordKeepsHistoryWithoutPending() {
+        let buffer = LogRingBuffer()
+        buffer.record([
+            LogLine(stream: .stdout, text: "[One] hello"),
+            LogLine(stream: .stdout, text: "[Two] world"),
+        ])
+        XCTAssertEqual(buffer.snapshot().map(\.text), ["[One] hello", "[Two] world"])
+        XCTAssertTrue(buffer.drainPending().isEmpty)
+    }
+
     func testClear() {
         let buffer = LogRingBuffer()
         buffer.append(LogLine(stream: .stdout, text: "x"))

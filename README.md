@@ -43,16 +43,18 @@
 
 ## 什么配置能直接启动
 
-**Maven 项目**里的 **Application**、**Spring Boot**，以及 **JAR Application**（不要求项目是 Maven）。其余按情况标记：
+**Maven 项目**里的 **Application**、**Spring Boot**，**JAR Application**（不要求项目是 Maven），以及引用这些配置的 **Compound**。其余按情况标记：
 
 | 标记 | 覆盖范围 |
 | --- | --- |
-| `PLANNED` | Compound、Maven、Gradle 类型——认得出来，本版不接管启动 |
-| `UNSUPPORTED` | JUnit 与未知类型（未知字段保留在 `rawOptions` 里，不丢信息） |
+| `PLANNED` | Maven、Gradle 类型——认得出来，本版不接管启动 |
+| `UNSUPPORTED` | JUnit 与未知类型（未知字段保留在 `rawOptions` 里，不丢信息）；Compound 引用了缺失、类型不匹配或不支持启动的成员时也归到这里，信息页写明具体是哪个成员 |
 
 `READY` / `WARNING` 由 Core 按项目实际情况计算：缺 Main Class / JAR Path、启用了暂不支持的 Before Launch 任务、引用了不存在的配置都会阻止启动；模块缺失、宏无法解析等只产生警告。项目同时存在 `pom.xml` 与 Gradle 构建文件时，先看配置所属模块目录里的构建脚本；仍无法判断时固定使用 Maven 并显示 `WARNING`，不依赖偶然的判断顺序。
 
 JAR Application 按 IDEA 的语义启动：`java [VM Options] -jar <JAR Path> [Program Arguments]`。`JAR_PATH` 支持 `$PROJECT_DIR$` / `$MODULE_DIR$` 等宏，未填 Working Directory 时默认项目根；`ALTERNATIVE_JRE_PATH` 启用时优先使用该 JDK。JAR 尚不存在只显示 `WARNING`（Before Launch 可能生成它），真正启动前会再次校验，届时仍缺失则失败。Before Launch 里有 Build / Build Project / Maven goal 时，才要求可用的 Maven 与 Module。
+
+Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准备（每个成员执行自己的 Before Launch），全部成功后才一起启动；嵌套 Compound 展开成叶子配置，运行时只有真实进程。每个成员有独立的 PID、日志、端口与状态，控制台可在「全部 / 各成员」之间切换。Run 启动整组，Stop / Force Kill 停止整组；任一成员异常退出会停止其余成员，不会留下半组孤儿进程。Compound 自身的 Before Launch 任务、引用缺失或类型不匹配的成员、跨层重复引用同一配置都会阻止启动，不会静默跳过。
 
 三点容易踩：
 
@@ -89,6 +91,7 @@ JAR Application 按 IDEA 的语义启动：`java [VM Options] -jar <JAR Path> [P
 ## 日志与环境变量
 
 - 控制台与构建页：等宽字体，每行前缀短时间（`时:分`，随系统区域设置），stdout 常态、stderr 红、系统消息灰，新输出始终滚到最新一行；「清空日志」只清显示，不影响进程
+- Compound 运行中，控制台顶部提供「全部 / 各成员」切换：「全部」是带 `[成员名]` 前缀的合并日志，单个成员页只显示它自己的输出
 - 控制台与构建页顶部的查找分两套语义：「搜索」只把匹配内容高亮（忽略大小写），▲▼ 在上一个/下一个匹配之间跳转并显示「当前/总数」，不改变显示的行；「筛选」（漏斗）按关键词把未匹配的行从显示中过滤掉，可与来源筛选（全部 / 输出 / 错误 / 系统）叠加，激活时显示「匹配行数 / 总行数」。两者都只影响显示，不影响日志保留上限（§37），页签切换后条件保持
 - 「换行」勾选框控制长行显示：**默认不换行**，长行用横向滚动条查看（新日志跟到底时横向位置保持不动，不跳到最长行末尾）；勾选后自动折行。偏好全局生效并跨启动记忆
 - 长跑服务不会吃满内存：日志在内存中保留最近 20000 行 / 10MB，超出丢弃最旧行（§37）。需要完整历史请用项目自己的日志文件
@@ -159,11 +162,10 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 
 ## 当前进度
 
-已完成：Core 解析与宏、Maven 编译与 classpath、启动流水线、统一 `PreparedExecution` / `ExecutionRuntime` 执行器、JAR Application 启动、进程与日志、GUI 三栏、Build/Rebuild/Clean、运行端口检测、扫描诊断与统一配置能力计算、在线更新。
+已完成：Core 解析与宏、Maven 编译与 classpath、启动流水线、统一 `PreparedExecution` / `ExecutionRuntime` 执行器、JAR Application 启动、Compound 多配置编排（独立进程 / 日志 / 端口、分组控制、嵌套展开与部分失败清理）、进程与日志、GUI 三栏、Build/Rebuild/Clean、运行端口检测、扫描诊断与统一配置能力计算、在线更新。
 
 待做：
 
-- Compound 多配置启动
 - Gradle 构建与运行
 - Maven 运行配置与 JUnit 测试运行
 - Before Launch 扩展（Build, no error check / Build Artifacts / Run External Tool / Launch Web Browser）与 Restart to Apply 提示
@@ -197,14 +199,14 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 ## 测试
 
 ```bash
-swift test                                        # 本地全量：340 用例
-swift test --skip MavenClasspathIntegrationTests  # CI 集合：337 用例（跳过那 3 个要真实下载依赖的）
+swift test                                        # 本地全量：360 用例
+swift test --skip MavenClasspathIntegrationTests  # CI 集合：357 用例（跳过那 3 个要真实下载依赖的）
 ```
 
 覆盖范围：
 
 - **解析层** — RunConfigurationParser（alias / rawOptions / Before Launch / JAR 字段）、WorkspaceParser（流式、只取 RunManager、跳过模板）、ProjectScanner（§7 来源优先级去重、§6 深度上限 4、忽略目录）、MacroResolver（§11 全部宏与 IDEA 上下文变量，运行配置与 IML 路径共用）、ModuleResolver（§13 五种方式）、JDKResolver（§23–25 优先级与 major version 模糊匹配）
-- **构建与启动** — JavaRunPlanner（§26–§29）、JarRunPlanner（`java -jar` 参数顺序、默认工作目录、缺失/不可读 JAR）、ExecutionRuntime（日志/PID/终态转发、Stop、Before Launch 同步执行与取消）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator（Dock 启动无 PATH 时的绝对路径枚举）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
+- **构建与启动** — JavaRunPlanner（§26–§29）、JarRunPlanner（`java -jar` 参数顺序、默认工作目录、缺失/不可读 JAR）、ExecutionRuntime（日志/PID/终态转发、Stop、Before Launch 同步执行与取消）、Compound（成员按引用顺序准备、嵌套展开、缺失/类型不匹配/成环拦截、独立 PID 与日志、分组 Stop/Force Kill、部分失败清理）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator（Dock 启动无 PATH 时的绝对路径枚举）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
 - **诊断与能力** — ScanDiagnostic（读失败 / XML 损坏 / 配置目录不可读 / 重复配置 / 缺 Main Class / 不支持的 Before Launch 任务都带严重程度与建议，不静默丢配置）、ConfigurationCapabilityResolver（类型 + 构建系统 + 字段 + Module 解析 + Before Launch 统一裁决）、BuildSystemSelector（Maven/Gradle 共存时的确定性选择）、Gradle settings/projectDir 解析、Maven `$MODULE_DIR$` POM 路径、ProcessHandle 启动前取消与 SIGTERM→SIGKILL 升级
 - **进程与日志** — ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、LogRingBuffer（§37 上限）
 - **在线更新** — 版本比较与 fail-closed、发布元数据解析（JSON 与 expanded_assets 两条路径）、镜像链顺序与回退/取消/坏文件删除、更新助手参数契约与重启路径、designated requirement 解析与语义判定，以及把产物名 / bundle id / Team / 助手落点钉到 `scripts/` 与 `release.yml` **原文**的防漂移断言
