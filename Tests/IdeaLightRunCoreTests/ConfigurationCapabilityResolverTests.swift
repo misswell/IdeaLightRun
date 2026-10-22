@@ -340,8 +340,8 @@ final class ConfigurationCapabilityResolverTests: XCTestCase {
         XCTAssertTrue(capability.warningIssues.contains { $0.contains("JAR 文件当前不存在") })
     }
 
-    /// 只要 Before Launch 里有 Build / Build Project / Maven goal，就必须有可用的 Maven。
-    func testJarBeforeLaunchBuildRequiresMaven() throws {
+    /// 只要 Before Launch 里有构建类任务，就必须有可用的构建系统。
+    func testJarBeforeLaunchBuildRequiresBuildSystem() throws {
         let jar = try makeJarFile()
         let capability = ConfigurationCapabilityResolver.resolve(
             config(
@@ -350,11 +350,29 @@ final class ConfigurationCapabilityResolverTests: XCTestCase {
                 jarPath: jar.path,
                 beforeLaunch: [BeforeLaunchTask(kind: .build, isEnabled: true)]
             ),
-            scan: scan(maven: false, gradle: true)
+            scan: scan(maven: false, gradle: false, modules: modules)
         )
         XCTAssertEqual(capability.readiness, .unsupported)
         XCTAssertFalse(capability.isLaunchable)
-        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("Maven") })
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("构建系统") }, "\(capability.blockingIssues)")
+    }
+
+    /// M4：Gradle 项目里的 JAR 配置同样可以靠 Before Launch Build 产出/编译。
+    func testJarBeforeLaunchBuildIsReadyInGradleProject() throws {
+        let jar = try makeJarFile()
+        let gradleModule = ProjectModule(name: "app", directory: projectRoot, gradlePath: ":app")
+        let capability = ConfigurationCapabilityResolver.resolve(
+            config(
+                .jar,
+                mainClass: nil,
+                jarPath: jar.path,
+                beforeLaunch: [BeforeLaunchTask(kind: .build, isEnabled: true)]
+            ),
+            scan: scan(maven: false, gradle: true, modules: [gradleModule])
+        )
+        XCTAssertEqual(capability.readiness, .ready, "\(capability.blockingIssues)")
+        XCTAssertTrue(capability.isLaunchable)
+        XCTAssertEqual(capability.buildSystem, .gradle)
     }
 
     func testJarBeforeLaunchBuildRequiresResolvableModule() throws {
@@ -398,15 +416,16 @@ final class ConfigurationCapabilityResolverTests: XCTestCase {
 
     // MARK: - 构建系统选择
 
-    func testGradleOnlyProjectIsPlannedWithBuildSystemRecorded() {
+    /// M4：只有 Gradle 的项目现在可以启动，徽标必须给出 Gradle 构建系统。
+    func testGradleOnlyProjectIsReadyWithBuildSystemRecorded() {
         let capability = ConfigurationCapabilityResolver.resolve(
             config(.application),
             scan: scan(maven: false, gradle: true)
         )
-        XCTAssertEqual(capability.readiness, .planned)
+        XCTAssertEqual(capability.readiness, .ready)
         XCTAssertEqual(capability.buildSystem, .gradle)
-        XCTAssertFalse(capability.isLaunchable)
-        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("Gradle") })
+        XCTAssertTrue(capability.isLaunchable)
+        XCTAssertTrue(capability.blockingIssues.isEmpty, "\(capability.blockingIssues)")
     }
 
     func testMissingBuildSystemBlocksLaunch() {
@@ -434,8 +453,8 @@ final class ConfigurationCapabilityResolverTests: XCTestCase {
         )
 
         XCTAssertEqual(capability.buildSystem, .gradle)
-        XCTAssertEqual(capability.readiness, .planned)
-        XCTAssertFalse(capability.isLaunchable)
+        XCTAssertEqual(capability.readiness, .ready, "\(capability.blockingIssues)")
+        XCTAssertTrue(capability.isLaunchable)
     }
 
     /// 双构建系统且无模块归属证据：固定回退 Maven，但必须显示歧义警告。
@@ -497,6 +516,7 @@ final class ConfigurationCapabilityResolverTests: XCTestCase {
         XCTAssertFalse(capability.isLaunchable)
     }
 
+    /// 任务类型与项目构建系统错配时必须拦住：把 Gradle task 交给 Maven 会把任务静默换成另一套语义。
     func testGradleBeforeLaunchTaskBlocksMavenLaunch() {
         let capability = ConfigurationCapabilityResolver.resolve(
             config(
@@ -506,7 +526,46 @@ final class ConfigurationCapabilityResolverTests: XCTestCase {
             scan: scan()
         )
         XCTAssertEqual(capability.readiness, .unsupported)
-        XCTAssertTrue(capability.unsupportedBeforeLaunchTasks.contains { $0.contains("classes") })
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("Gradle") }, "\(capability.blockingIssues)")
+        XCTAssertTrue(capability.unsupportedBeforeLaunchTasks.isEmpty, "Gradle 任务已支持，不应再计入“不支持的任务”")
+    }
+
+    func testMavenBeforeLaunchTaskBlocksGradleLaunch() {
+        let capability = ConfigurationCapabilityResolver.resolve(
+            config(
+                .application,
+                beforeLaunch: [BeforeLaunchTask(kind: .mavenGoal(goal: "clean", pomFile: nil), isEnabled: true)]
+            ),
+            scan: scan(maven: false, gradle: true)
+        )
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.blockingIssues.contains { $0.contains("Maven") }, "\(capability.blockingIssues)")
+    }
+
+    /// M4：Gradle 项目与 Gradle Before Launch 任务同源时可以启动。
+    func testGradleBeforeLaunchTaskIsReadyInGradleProject() {
+        let capability = ConfigurationCapabilityResolver.resolve(
+            config(
+                .application,
+                beforeLaunch: [BeforeLaunchTask(kind: .gradleTask(task: "bootJar"), isEnabled: true)]
+            ),
+            scan: scan(maven: false, gradle: true)
+        )
+        XCTAssertEqual(capability.readiness, .ready, "\(capability.blockingIssues)")
+        XCTAssertTrue(capability.isLaunchable)
+        XCTAssertEqual(capability.buildSystem, .gradle)
+    }
+
+    func testEmptyGradleBeforeLaunchTaskBlocksLaunch() {
+        let capability = ConfigurationCapabilityResolver.resolve(
+            config(
+                .application,
+                beforeLaunch: [BeforeLaunchTask(kind: .gradleTask(task: " "), isEnabled: true)]
+            ),
+            scan: scan(maven: false, gradle: true)
+        )
+        XCTAssertEqual(capability.readiness, .unsupported)
+        XCTAssertTrue(capability.missingFields.contains("Gradle task"))
     }
 
     func testEmptyMavenBeforeLaunchGoalBlocksLaunch() {

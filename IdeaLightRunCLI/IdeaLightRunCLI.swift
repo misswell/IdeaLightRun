@@ -414,7 +414,7 @@ struct IdeaLightRunCLI {
             finished.signal()
         }
 
-        // Ctrl-C → 终止正在进行的 Maven 构建（对齐 IDEA 的 Stop Build）
+        // Ctrl-C → 终止正在进行的构建（对齐 IDEA 的 Stop Build）
         signal(SIGINT, SIG_IGN)
         let interruptSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: DispatchQueue.global())
         interruptSource.setEventHandler { handle.terminate() }
@@ -441,7 +441,7 @@ struct IdeaLightRunCLI {
               scan <path>                扫描项目并输出所有 Run Configuration（list 为别名）
               run <path> <config-name>   编译并启动指定配置（Ctrl-C 停止）
               build <path>               构建整个项目（IDEA 的 Build Project）
-              clean <path>               清空项目产物（Maven clean，只删 target/ 不编译）
+              clean <path>               清空项目产物（Maven clean / Gradle clean，不编译）
 
             OPTIONS:
               --json                     以 JSON 输出（scan）

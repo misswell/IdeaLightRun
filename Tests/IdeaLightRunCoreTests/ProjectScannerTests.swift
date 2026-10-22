@@ -153,6 +153,7 @@ final class ProjectScannerTests: XCTestCase {
               <configuration default="false" name="Incomplete" type="Application" factoryName="Application">
                 <method v="2">
                   <option name="Gradle.BeforeRunTask" enabled="true" tasks="bootJar" />
+                  <option name="Gradle.BeforeRunTask" enabled="true" tasks=" " />
                   <option name="Maven.BeforeRunTask" enabled="true" goal=" " />
                   <option name="ExternalTool" enabled="true" />
                 </method>
@@ -167,7 +168,7 @@ final class ProjectScannerTests: XCTestCase {
         XCTAssertEqual(Set(result.diagnostics.map(\.severity)), [.warning])
         let messages = result.diagnostics.map(\.message)
         XCTAssertTrue(messages.contains { $0.contains("缺少 Main Class") }, "实际：\(messages)")
-        XCTAssertTrue(messages.contains { $0.contains("Gradle 任务“bootJar”") }, "实际：\(messages)")
+        XCTAssertTrue(messages.contains { $0.contains("Gradle 任务为空") }, "实际：\(messages)")
         XCTAssertTrue(messages.contains { $0.contains("Maven Goal 为空") }, "实际：\(messages)")
         XCTAssertTrue(messages.contains { $0.contains("ExternalTool") }, "实际：\(messages)")
         XCTAssertTrue(result.diagnostics.allSatisfy { !($0.remediation ?? "").isEmpty })

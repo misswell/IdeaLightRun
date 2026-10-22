@@ -95,7 +95,7 @@ public enum ConfigurationCapabilityResolver {
         case .maven:
             return terminal(.planned, "Maven 运行配置已识别；直接运行 Maven goal 将在 Milestone 5 接入，当前不能启动。")
         case .gradle:
-            return terminal(.planned, "Gradle 运行配置已识别；Gradle 构建与运行将在 Milestone 4 接入，当前不能启动。")
+            return terminal(.planned, "Gradle 运行配置（直接执行 Gradle 任务）已识别；该类型尚未接入，当前不能启动。")
         case .junit:
             return terminal(.unsupported, "JUnit 测试运行尚未接入，当前不能启动。")
         case .unknown(let raw):
@@ -151,8 +151,10 @@ public enum ConfigurationCapabilityResolver {
                 }
             case .gradleTask(let task):
                 let display = task.trimmingCharacters(in: .whitespacesAndNewlines)
-                unsupportedTasks.append(display.isEmpty ? "Gradle（未命名任务）" : "Gradle: \(display)")
-                block("Before Launch 的 Gradle 任务“\(display)”尚未接入，IdeaLightRun 不会静默跳过它。")
+                if display.isEmpty || CommandLineTokenizer.tokenize(task).isEmpty {
+                    missingFields.append("Gradle task")
+                    block("Before Launch 的 Gradle 任务没有保存任务名，无法确定要执行什么。")
+                }
             case .runConfiguration(let name, let type):
                 if let scan, !referenceExists(name: name, type: type, in: scan.configurations) {
                     block("Before Launch 引用的配置 “\(name)” 不存在或类型不匹配。")
@@ -180,43 +182,65 @@ public enum ConfigurationCapabilityResolver {
                 modules: scan.modules
             )
             buildSystem = selection.kind
+            let enabledTasks = config.beforeLaunchTasks.filter(\.isEnabled)
+            let hasMavenTask = enabledTasks.contains { task in
+                if case .mavenGoal = task.kind { return true }
+                return false
+            }
+            let hasGradleTask = enabledTasks.contains { task in
+                if case .gradleTask = task.kind { return true }
+                return false
+            }
+            let needsBuildToolchain = enabledTasks.contains { task in
+                switch task.kind {
+                case .build, .buildProject, .mavenGoal, .gradleTask:
+                    return true
+                case .runConfiguration, .unknown:
+                    return false
+                }
+            }
+
             if config.type == .jar {
                 if selection.isAmbiguous {
                     warn(selection.reason)
                 }
-                let enabledTasks = config.beforeLaunchTasks.filter(\.isEnabled)
-                let needsMaven = enabledTasks.contains { task in
-                    switch task.kind {
-                    case .build, .buildProject, .mavenGoal:
-                        return true
-                    case .runConfiguration, .gradleTask, .unknown:
-                        return false
-                    }
+                if hasMavenTask, selection.kind != .maven {
+                    block("JAR 配置的 Before Launch 包含 Maven 任务，但当前项目无法使用 Maven：\(selection.reason)")
                 }
-                if needsMaven {
-                    if selection.kind != .maven {
-                        block("JAR 配置的 Before Launch 包含 Maven 构建任务，但当前项目无法使用 Maven：\(selection.reason)")
-                    } else if enabledTasks.contains(where: { task in
-                        if case .build = task.kind { return true }
-                        return false
-                    }) {
-                        let moduleName = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                        let resolution = ModuleResolver.resolveModule(
-                            named: moduleName.isEmpty ? nil : moduleName,
-                            mainClass: nil,
-                            projectRoot: scan.projectRoot,
-                            knownModules: scan.modules
-                        )
-                        if resolution.module == nil {
-                            block("JAR 配置的 Before Launch Build 需要可解析的 Module；请在 IDEA 的运行配置里选择 Module。")
-                        }
+                if hasGradleTask, selection.kind != .gradle {
+                    block("JAR 配置的 Before Launch 包含 Gradle 任务，但当前项目无法使用 Gradle：\(selection.reason)")
+                }
+                if needsBuildToolchain, selection.kind == nil {
+                    block("JAR 配置的 Before Launch 需要构建系统，但当前项目无法确定构建系统：\(selection.reason)")
+                }
+                if enabledTasks.contains(where: { task in
+                    if case .build = task.kind { return true }
+                    return false
+                }) {
+                    let moduleName = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let resolution = ModuleResolver.resolveModule(
+                        named: moduleName.isEmpty ? nil : moduleName,
+                        mainClass: nil,
+                        projectRoot: scan.projectRoot,
+                        knownModules: scan.modules
+                    )
+                    if resolution.module == nil {
+                        block("JAR 配置的 Before Launch Build 需要可解析的 Module；请在 IDEA 的运行配置里选择 Module。")
                     }
                 }
             } else {
                 switch selection.kind {
-                case .maven:
+                case .maven, .gradle:
                     if selection.isAmbiguous {
                         warn(selection.reason)
+                    }
+                    // 构建系统与 Before Launch 任务类型必须一致：把 Maven goal 交给
+                    // Gradle 执行（或反之）会静默改变任务语义。
+                    if hasGradleTask, selection.kind == .maven {
+                        block("Before Launch 的 Gradle 任务需要 Gradle，但当前项目使用 Maven。请改用 Maven Goal，或在 IDEA 中停用该任务。")
+                    }
+                    if hasMavenTask, selection.kind == .gradle {
+                        block("Before Launch 的 Maven 任务需要 Maven，但当前项目使用 Gradle。请改用 Gradle 任务，或在 IDEA 中停用该任务。")
                     }
                     if let moduleName = config.moduleName?.trimmingCharacters(in: .whitespacesAndNewlines),
                        !moduleName.isEmpty,
@@ -235,12 +259,6 @@ public enum ConfigurationCapabilityResolver {
                             block("找不到 Module “\(moduleName)”，启动时无法定位编译产物与 classpath。")
                         }
                     }
-                case .gradle:
-                    return terminal(
-                        .planned,
-                        "检测到 Gradle 项目；Gradle 构建与 classpath 解析将在 Milestone 4 接入，当前不能启动。",
-                        buildSystem: .gradle
-                    )
                 case nil:
                     block(selection.reason)
                 }

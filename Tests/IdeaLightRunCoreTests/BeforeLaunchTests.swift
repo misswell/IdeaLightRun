@@ -36,6 +36,9 @@ final class BeforeLaunchTests: XCTestCase {
                 recorder.record("maven")
                 recorder.recordGoals(goals, pomFile: pomFile)
             },
+            runGradleTasks: { tasks in
+                recorder.record("gradle:\(tasks.joined(separator: " "))")
+            },
             runReferenced: { config, chain in
                 recorder.record("run:\(config.name)")
                 recorder.recordReferenced(name: config.name, chain: chain)
@@ -171,22 +174,37 @@ final class BeforeLaunchTests: XCTestCase {
         XCTAssertEqual(recorder.calls, [])
     }
 
-    // MARK: - §3.2 fail closed
+    // MARK: - §3.5 Gradle task
 
-    func testGradleTaskBlocksLaunch() async throws {
+    /// Gradle.BeforeRunTask 原文逐项交给注入的执行动作，不转成 Maven 或其他命令。
+    func testGradleTaskIsPassedThroughVerbatim() async throws {
+        let recorder = Recorder()
+        try await BeforeLaunchExecutor().run(
+            for: config("G", tasks: [
+                BeforeLaunchTask(kind: .gradleTask(task: "clean bootJar"), isEnabled: true),
+            ]),
+            configurations: [],
+            actions: actions(recorder),
+            log: silence
+        )
+        XCTAssertEqual(recorder.calls, ["gradle:clean bootJar"])
+    }
+
+    func testEmptyGradleTaskBlocks() async throws {
         let recorder = Recorder()
         do {
             try await BeforeLaunchExecutor().run(
-                for: config("G", tasks: [BeforeLaunchTask(kind: .gradleTask(task: "bootRun"), isEnabled: true)]),
+                for: config("G", tasks: [BeforeLaunchTask(kind: .gradleTask(task: "  "), isEnabled: true)]),
                 configurations: [],
                 actions: actions(recorder),
                 log: silence
             )
-            XCTFail("Gradle Before Launch 在 Milestone 4 之前必须拦住")
+            XCTFail("没有保存任务名的 Gradle.BeforeRunTask 必须拦住")
         } catch let error as IdeaLightRunError {
             guard case .unsupportedBeforeLaunch(let detail) = error else { return XCTFail("实际：\(error)") }
-            XCTAssertTrue(detail.contains("bootRun"), "错误里要指出是哪个任务：\(detail)")
+            XCTAssertTrue(detail.contains("Gradle"), detail)
         }
+        XCTAssertEqual(recorder.calls, [])
     }
 
     func testUnknownTaskBlocksLaunch() async throws {
@@ -225,6 +243,7 @@ final class BeforeLaunchTests: XCTestCase {
             build: { throw IdeaLightRunError.buildFailed(detail: "编译失败") },
             buildProject: { recorder.record("buildProject") },
             runMavenGoals: { _, _ in recorder.record("maven") },
+            runGradleTasks: { _ in recorder.record("gradle") },
             runReferenced: { _, _ in recorder.record("referenced") }
         )
         do {
@@ -360,6 +379,7 @@ final class BeforeLaunchTests: XCTestCase {
             },
             buildProject: { recorder.record("buildProject") },
             runMavenGoals: { _, _ in recorder.record("maven") },
+            runGradleTasks: { _ in recorder.record("gradle") },
             runReferenced: { _, _ in recorder.record("referenced") }
         )
         do {

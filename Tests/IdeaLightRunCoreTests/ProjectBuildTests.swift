@@ -71,31 +71,66 @@ final class ProjectBuildTests: XCTestCase {
 
     // MARK: - 工具链解析（§4：与启动共用一套）
 
-    func testGradleProjectIsRejectedForBuild() {
-        do {
-            _ = try ProjectToolchain.resolveMaven(
-                projectRoot: Fixtures.url("GradleProject"),
-                context: ProjectBuildKind.build.actionName,
-                log: { _ in }
-            )
-            XCTFail("Gradle 项目当前不应进入构建流程")
-        } catch let error as IdeaLightRunError {
-            guard case .buildToolNotFound(let detail) = error else {
-                return XCTFail("期望 buildToolNotFound，实际 \(error)")
-            }
-            XCTAssertTrue(detail.contains("仅支持 Maven 项目直接构建"), detail)
-        } catch {
-            XCTFail("期望 buildToolNotFound，实际 \(error)")
-        }
+    /// 临时 Gradle 工程：settings + 假 gradlew（只记录参数，不真的构建）。
+    private func makeGradleProject() throws -> URL {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("lr-gradle-build-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: root.appendingPathComponent("app"), withIntermediateDirectories: true)
+        try "rootProject.name = 'demo'\ninclude 'app'\n".write(
+            to: root.appendingPathComponent("settings.gradle"), atomically: true, encoding: .utf8
+        )
+        try "".write(to: root.appendingPathComponent("build.gradle"), atomically: true, encoding: .utf8)
+        try "".write(to: root.appendingPathComponent("app/build.gradle"), atomically: true, encoding: .utf8)
+        let wrapper = root.appendingPathComponent("gradlew")
+        try """
+        #!/bin/sh
+        DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+        printf '%s\\n' "$*" >> "$DIR/gradlew.log"
+        exit 0
+        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
+        addTeardownBlock { try? fm.removeItem(at: root) }
+        return root
     }
 
-    func testErrorMessageReflectsCallingContext() {
+    /// M4：Gradle 项目不再被拒绝，而是解析出 Gradle 适配器；项目自带 gradlew 优先。
+    func testGradleProjectResolvesGradleAdapter() throws {
+        try XCTSkipIf(TestToolchain.availableJDK() == nil, "系统没有可用 JDK，跳过工具链测试")
+        let root = try makeGradleProject()
+        let toolchain = try ProjectToolchain.resolveForProjectBuild(
+            projectRoot: root,
+            context: "构建",
+            log: { _ in }
+        )
+        XCTAssertEqual(toolchain.kind, .gradle)
+        let gradle = try XCTUnwrap(toolchain.adapter as? GradleBuildService)
+        XCTAssertEqual(gradle.gradleExecutable.lastPathComponent, "gradlew")
+    }
+
+    /// 项目级 Rebuild 走 Gradle 时是 `clean classes`，且 Stop 杀的就是这个进程（--no-daemon）。
+    func testGradleProjectBuildRunsCleanThenClasses() async throws {
+        try XCTSkipIf(TestToolchain.availableJDK() == nil, "系统没有可用 JDK，跳过工具链测试")
+        let root = try makeGradleProject()
+        try await ProjectBuilder().build(
+            projectRoot: root,
+            kind: .rebuild,
+            log: { _ in }
+        )
+        let log = try String(contentsOf: root.appendingPathComponent("gradlew.log"), encoding: .utf8)
+        XCTAssertEqual(log.trimmingCharacters(in: .whitespacesAndNewlines), "--console=plain --no-daemon clean classes")
+    }
+
+    func testErrorMessageReflectsCallingContext() throws {
         // 同一段解析被启动与三种构建动作复用，报错里的动作名必须跟着调用方走
-        let gradleRoot = Fixtures.url("GradleProject")
+        let emptyRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lr-no-build-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: emptyRoot, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: emptyRoot) }
         func detail(_ context: String) -> String {
             do {
-                _ = try ProjectToolchain.resolveMaven(
-                    projectRoot: gradleRoot,
+                _ = try ProjectToolchain.resolveForProjectBuild(
+                    projectRoot: emptyRoot,
                     context: context,
                     log: { _ in }
                 )
@@ -106,9 +141,9 @@ final class ProjectBuildTests: XCTestCase {
                 return "\(error)"
             }
         }
-        XCTAssertTrue(detail("启动").contains("直接启动"))
-        XCTAssertTrue(detail("构建").contains("直接构建"))
-        XCTAssertTrue(detail("清理").contains("直接清理"))
+        XCTAssertTrue(detail("启动").contains("无法启动该项目"))
+        XCTAssertTrue(detail("构建").contains("无法构建该项目"))
+        XCTAssertTrue(detail("清理").contains("无法清理该项目"))
     }
 
     /// "停止"按在 Maven 起来之前：没有进程可终止，只能靠取消标记，

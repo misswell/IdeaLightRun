@@ -1,7 +1,8 @@
 import Foundation
 
-/// IDEA 的 Build / Rebuild Project 与 Maven 的 clean：项目级、作用于整个 reactor。
-/// 三者的区别只在 goal 序列，共用同一条工具链解析与串行构建管线。
+/// IDEA 的 Build / Rebuild Project 与 Clean：项目级、作用于整个构建。
+/// 三者的区别只在任务序列（Maven goal / Gradle task），
+/// 共用同一条工具链解析与串行构建管线。
 public enum ProjectBuildKind: String, CaseIterable, Sendable {
     case build
     case rebuild
@@ -16,7 +17,7 @@ public enum ProjectBuildKind: String, CaseIterable, Sendable {
         }
     }
 
-    /// 报错、进度与状态文案里的动作名（"仅支持 Maven 项目直接清理"）。
+    /// 报错、进度与状态文案里的动作名（"构建" / "重新构建" / "清理"）。
     public var actionName: String {
         switch self {
         case .build: return "构建"
@@ -29,11 +30,12 @@ public enum ProjectBuildKind: String, CaseIterable, Sendable {
         goalArguments.filter { !$0.hasPrefix("-") }.joined(separator: " ")
     }
 
+    /// 动作文案不含具体命令：Maven 与 Gradle 共用同一句，实际命令由适配器输出。
     public var startLogLine: String {
         switch self {
-        case .build: return "[IdeaLightRun] 构建项目（增量 compile）…"
-        case .rebuild: return "[IdeaLightRun] 重新构建项目（clean compile，全量）…"
-        case .clean: return "[IdeaLightRun] 清理项目产物（clean：只删 target/，不编译）…"
+        case .build: return "[IdeaLightRun] 构建项目（增量编译）…"
+        case .rebuild: return "[IdeaLightRun] 重新构建项目（清理后全量编译）…"
+        case .clean: return "[IdeaLightRun] 清理项目产物（不编译）…"
         }
     }
 }
@@ -63,7 +65,7 @@ public struct ProjectBuilder: Sendable {
         }
 
         progress(.preparing)
-        let toolchain = try ProjectToolchain.resolveMaven(
+        let toolchain = try ProjectToolchain.resolveForProjectBuild(
             projectRoot: projectRoot,
             context: kind.actionName,
             log: log
@@ -75,7 +77,7 @@ public struct ProjectBuilder: Sendable {
             }
             progress(.building)
             log(LogLine(stream: .system, text: kind.startLogLine))
-            try toolchain.service.buildProject(kind: kind, handle: processHandle, log: log)
+            try toolchain.adapter.buildProject(kind: kind, handle: processHandle, log: log)
             log(LogLine(stream: .system, text: "[IdeaLightRun] \(kind.actionName)完成"))
         }
     }

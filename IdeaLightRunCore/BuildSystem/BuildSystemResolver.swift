@@ -33,13 +33,10 @@ public enum BuildSystemResolver {
             log: log
         )
         return Resolution(
-            adapter: toolchain.service,
-            target: BuildTarget(
-                module: module,
-                variant: .maven(
-                    module: module.name,
-                    includeProvided: config.includeProvidedDependencies
-                )
+            adapter: toolchain.adapter,
+            target: toolchain.target(
+                for: module,
+                includeProvided: config.includeProvidedDependencies
             ),
             jdk: toolchain.jdk
         )

@@ -11,6 +11,12 @@ struct ProjectEntry: Identifiable, Equatable {
 
     var name: String { url.lastPathComponent }
     var id: String { url.standardizedFileURL.path }
+
+    /// Maven / Gradle 都缺失时才不能构建；两者共存仍可构建（由 Core 选择）。
+    var hasBuildSystem: Bool {
+        guard let result else { return false }
+        return result.buildSystem.maven != nil || result.buildSystem.gradle != nil
+    }
 }
 
 /// §98: 用户数据用 Codable + JSON，存 ~/Library/Application Support/IdeaLightRun/。
@@ -352,8 +358,8 @@ final class AppStore: ObservableObject {
     func build(projectID: String? = nil, kind: ProjectBuildKind) {
         guard let id = projectID ?? selectedProjectID,
               let project = projects.first(where: { $0.id == id }) else { return }
-        guard project.result?.buildSystem.maven != nil else {
-            alertMessage = "当前版本仅支持 Maven 项目\(kind.actionName)；Gradle 支持在 Milestone 4 提供。"
+        guard project.hasBuildSystem else {
+            alertMessage = "项目根未找到 Maven 或 Gradle 构建文件，无法\(kind.actionName)。"
             return
         }
         guard builds[id]?.phase.isBusy != true else { return }

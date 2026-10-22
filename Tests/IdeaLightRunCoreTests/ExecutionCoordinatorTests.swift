@@ -256,28 +256,96 @@ final class ExecutionCoordinatorTests: XCTestCase {
         }
     }
 
-    /// §23/§24 约束 8: 遇到 Gradle 项目时不由 GUI / CLI 自己判断——Core 明确报错并点明
-    /// Gradle 的支持计划，绝不"跳过构建照常启动"。用真实 Gradle fixture。
-    func testGradleProjectFailsClosedWithExplicitReason() async throws {
-        let root = Fixtures.url("GradleProject")
-        let scan = try IntelliJProjectScanner().scan(projectRoot: root)
-        let config = try XCTUnwrap(
-            scan.configurations.first { $0.name == "AppApplication" },
-            "fixture 里没有 AppApplication 配置"
-        )
-        do {
-            _ = try await ExecutionCoordinator().prepare(
-                config: config,
-                projectRoot: root,
-                log: { _ in },
-                progress: { _ in }
-            )
-            XCTFail("Gradle 项目不该产出一个可启动的计划")
-        } catch let error as IdeaLightRunError {
-            guard case .buildToolNotFound(let detail) = error else {
-                return XCTFail("期望 buildToolNotFound，实际 \(error)")
-            }
-            XCTAssertTrue(detail.contains("Gradle"), detail)
+    /// M4: Gradle 项目走同一条启动流水线。假 gradlew 只记录参数并写出 classpath，
+    /// 用真实 fixture 的 settings.gradle / module 结构验证 project path 与合并调用。
+    func testGradleApplicationPreparesPlanWithGradleClasspath() async throws {
+        try XCTSkipIf(TestToolchain.availableJDK() == nil, "系统没有可用 JDK，跳过 Gradle 启动流水线测试")
+        let jdk = try XCTUnwrap(TestToolchain.availableJDK())
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory
+            .appendingPathComponent("lr-gradle-run-\(UUID().uuidString)", isDirectory: true)
+        try fm.copyItem(at: Fixtures.url("GradleProject"), to: root)
+        addTeardownBlock {
+            ClasspathCache.clear(projectRoot: root, variant: .gradle(module: ":app", includeProvided: false))
+            ClasspathCache.clear(projectRoot: root, variant: .gradle(module: ":app", includeProvided: true))
+            try? FileManager.default.removeItem(at: root)
         }
+
+        let appClasses = root.appendingPathComponent("app/build/classes/java/main", isDirectory: true)
+        let utilClasses = root.appendingPathComponent("library/util/build/classes/java/main", isDirectory: true)
+        try fm.createDirectory(at: appClasses, withIntermediateDirectories: true)
+        try fm.createDirectory(at: utilClasses, withIntermediateDirectories: true)
+        let stubJar = root.appendingPathComponent("lib/stub.jar")
+        try fm.createDirectory(at: stubJar.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("PK".utf8).write(to: stubJar)
+
+        let wrapper = root.appendingPathComponent("gradlew")
+        try """
+        #!/bin/sh
+        DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+        printf '%s\\n' "$*" >> "$DIR/gradlew.log"
+        out=""
+        for arg in "$@"; do
+            case "$arg" in
+                -Didealightrun.classpath.file=*) out="${arg#-Didealightrun.classpath.file=}" ;;
+            esac
+        done
+        if [ -n "$out" ]; then
+            mkdir -p "$(dirname "$out")"
+            printf '%s\\n%s\\n' "$DIR/app/build/classes/java/main" "$DIR/lib/stub.jar" > "$out"
+        fi
+        exit 0
+        """.write(to: wrapper, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: wrapper.path)
+
+        // fixture 的 project SDK 是 "17"；这里显式指定本机可用 JDK，避免机器没装 17 时误跳。
+        try """
+        <component name="ProjectRunConfigurationManager">
+          <configuration default="false" name="AppApplication" type="SpringBootApplicationConfigurationType" factoryName="Spring Boot">
+            <module name="app" />
+            <option name="SPRING_BOOT_MAIN_CLASS" value="com.example.app.AppApplication" />
+            <option name="ALTERNATIVE_JRE_PATH" value="\(jdk.home.path)" />
+            <option name="ALTERNATIVE_JRE_PATH_ENABLED" value="true" />
+            <method v="2">
+              <option name="Make" enabled="true" />
+            </method>
+          </configuration>
+        </component>
+        """.write(to: root.appendingPathComponent(".run/AppApplication.run.xml"), atomically: true, encoding: .utf8)
+
+        let scan = try IntelliJProjectScanner().scan(projectRoot: root)
+        let config = try XCTUnwrap(scan.configurations.first { $0.name == "AppApplication" })
+        XCTAssertEqual(
+            ConfigurationCapabilityResolver.resolve(config, scan: scan).readiness,
+            .ready,
+            "Gradle Spring Boot 配置应可启动"
+        )
+
+        let execution = try await ExecutionCoordinator().prepare(
+            config: config,
+            projectRoot: root,
+            log: { _ in },
+            progress: { _ in }
+        )
+        let plan = try XCTUnwrap(execution.processPlan)
+        XCTAssertEqual(plan.mainClass, "com.example.app.AppApplication")
+        XCTAssertTrue(plan.classpath.contains(appClasses.path), "\(plan.classpath)")
+        XCTAssertTrue(plan.classpath.contains(stubJar.path), "\(plan.classpath)")
+
+        // 冷启动只启动一次 Gradle：编译与 classpath 解析在同一次调用里完成。
+        let log = try String(contentsOf: root.appendingPathComponent("gradlew.log"), encoding: .utf8)
+        let invocations = log.split(whereSeparator: \.isNewline).map(String.init)
+        XCTAssertEqual(invocations.count, 1, "应合并为一次 Gradle 调用：\n\(log)")
+        let invocation = try XCTUnwrap(invocations.first)
+        XCTAssertTrue(invocation.contains(":app:classes"), invocation)
+        XCTAssertTrue(invocation.contains(":app:ideaLightRunClasspath"), invocation)
+        XCTAssertTrue(invocation.contains("--no-daemon"), invocation)
+        XCTAssertTrue(invocation.contains("--init-script"), invocation)
+
+        let cached = ClasspathCache.load(
+            projectRoot: root,
+            variant: .gradle(module: ":app", includeProvided: false)
+        )
+        XCTAssertEqual(cached?.entries, [appClasses.path, stubJar.path])
     }
 }

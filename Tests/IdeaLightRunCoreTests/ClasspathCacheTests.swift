@@ -218,4 +218,95 @@ final class ClasspathCacheTests: XCTestCase {
             .empty
         )
     }
+
+    // MARK: - Gradle 变体与指纹（M4）
+
+    /// Gradle 的缓存身份是 project path，不是显示名；构建系统与 provided 也必须分开。
+    func testGradleVariantIdentityIsSeparate() {
+        let app = ClasspathVariant.gradle(module: ":app", includeProvided: false)
+        XCTAssertNotEqual(app, .gradle(module: ":app", includeProvided: true))
+        XCTAssertNotEqual(app, .gradle(module: ":library:app", includeProvided: false))
+        XCTAssertNotEqual(app, .maven(module: ":app", includeProvided: false))
+        XCTAssertNotEqual(
+            ClasspathCache.cacheDirectory(projectRoot: tempProject, variant: app),
+            ClasspathCache.cacheDirectory(
+                projectRoot: tempProject,
+                variant: .maven(module: ":app", includeProvided: false)
+            )
+        )
+    }
+
+    func testGradleOutputAndInitScriptLiveInVariantDirectory() {
+        let variant = ClasspathVariant.gradle(module: ":app", includeProvided: false)
+        let directory = ClasspathCache.cacheDirectory(projectRoot: tempProject, variant: variant)
+        let output = ClasspathCache.gradleOutputFileURL(projectRoot: tempProject, variant: variant)
+        let initScript = ClasspathCache.gradleInitScriptURL(projectRoot: tempProject, variant: variant)
+        XCTAssertEqual(output.deletingLastPathComponent(), directory)
+        XCTAssertEqual(initScript.deletingLastPathComponent(), directory)
+        XCTAssertNotEqual(output, initScript)
+    }
+
+    /// §57: Gradle 指纹覆盖构建脚本、JDK、wrapper 与 GRADLE_USER_HOME 全局配置。
+    func testGradleFingerprintTracksAllClasspathInputs() throws {
+        let root = URL(fileURLWithPath: tempProject.path, isDirectory: true)
+        let settings = root.appendingPathComponent("settings.gradle")
+        let appBuild = root.appendingPathComponent("app/build.gradle")
+        try FileManager.default.createDirectory(
+            at: appBuild.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try "rootProject.name = 'demo'\n".write(to: settings, atomically: true, encoding: .utf8)
+        try "".write(to: appBuild, atomically: true, encoding: .utf8)
+
+        let userHome = root.appendingPathComponent("gradle-home", isDirectory: true)
+        try FileManager.default.createDirectory(at: userHome, withIntermediateDirectories: true)
+        let globalProperties = userHome.appendingPathComponent("gradle.properties")
+        try "org.gradle.jvmargs=-Xmx1g\n".write(to: globalProperties, atomically: true, encoding: .utf8)
+
+        let wrapperDirectory = root.appendingPathComponent("gradle/wrapper", isDirectory: true)
+        try FileManager.default.createDirectory(at: wrapperDirectory, withIntermediateDirectories: true)
+        let wrapperProperties = wrapperDirectory.appendingPathComponent("gradle-wrapper.properties")
+        try "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.7-bin.zip\n".write(
+            to: wrapperProperties, atomically: true, encoding: .utf8
+        )
+
+        func fingerprint(jdk: Int? = 17) -> String {
+            ClasspathCache.gradleFingerprint(
+                projectRoot: root,
+                buildFiles: [settings, appBuild],
+                jdkMajor: jdk,
+                gradleUserHome: userHome
+            )
+        }
+
+        let baseline = fingerprint()
+        XCTAssertEqual(baseline, fingerprint(), "内容不变时指纹必须稳定")
+
+        try "dependencies { implementation 'x:y:1.0' }\n".write(
+            to: appBuild, atomically: true, encoding: .utf8
+        )
+        let afterBuildFile = fingerprint()
+        XCTAssertNotEqual(afterBuildFile, baseline, "构建脚本变化必须失效")
+
+        let afterJDK = fingerprint(jdk: 21)
+        XCTAssertNotEqual(afterJDK, afterBuildFile, "JDK major 变化必须失效")
+
+        try "org.gradle.jvmargs=-Xmx2g\n".write(
+            to: globalProperties, atomically: true, encoding: .utf8
+        )
+        let afterGlobal = fingerprint(jdk: 21)
+        XCTAssertNotEqual(afterGlobal, afterJDK, "GRADLE_USER_HOME 全局配置变化必须失效")
+
+        try "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.9-bin.zip\n".write(
+            to: wrapperProperties, atomically: true, encoding: .utf8
+        )
+        let afterWrapper = fingerprint(jdk: 21)
+        XCTAssertNotEqual(afterWrapper, afterGlobal, "wrapper 版本变化必须失效")
+
+        let initDirectory = userHome.appendingPathComponent("init.d", isDirectory: true)
+        try FileManager.default.createDirectory(at: initDirectory, withIntermediateDirectories: true)
+        try "allprojects { repositories { mavenLocal() } }\n".write(
+            to: initDirectory.appendingPathComponent("repos.gradle"), atomically: true, encoding: .utf8
+        )
+        XCTAssertNotEqual(fingerprint(jdk: 21), afterWrapper, "GRADLE_USER_HOME/init.d 变化必须失效")
+    }
 }

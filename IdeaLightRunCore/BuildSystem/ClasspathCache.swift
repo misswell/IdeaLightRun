@@ -19,6 +19,12 @@ public struct ClasspathVariant: Hashable, Codable, Sendable {
         ClasspathVariant(moduleIdentifier: module, buildSystem: "maven", includeProvided: includeProvided)
     }
 
+    /// `module` 用 Gradle project path（":app"），不用显示名：同名子项目在
+    /// 不同路径下是不同模块，用名字会让它们的缓存互相覆盖。
+    public static func gradle(module: String, includeProvided: Bool) -> ClasspathVariant {
+        ClasspathVariant(moduleIdentifier: module, buildSystem: "gradle", includeProvided: includeProvided)
+    }
+
     /// 参与哈希的完整身份，逐项成行避免拼接歧义。
     var cacheKey: String {
         "module=\(moduleIdentifier)\nbuildSystem=\(buildSystem)\nincludeProvided=\(includeProvided)"
@@ -64,6 +70,16 @@ public enum ClasspathCache {
     ) -> URL {
         cacheDirectory(projectRoot: projectRoot, variant: variant)
             .appendingPathComponent("classpath-maven-\(scope.rawValue).txt")
+    }
+
+    public static func gradleOutputFileURL(projectRoot: URL, variant: ClasspathVariant) -> URL {
+        cacheDirectory(projectRoot: projectRoot, variant: variant)
+            .appendingPathComponent("classpath-gradle.txt")
+    }
+
+    public static func gradleInitScriptURL(projectRoot: URL, variant: ClasspathVariant) -> URL {
+        cacheDirectory(projectRoot: projectRoot, variant: variant)
+            .appendingPathComponent("idealauncher-init.gradle")
     }
 
     public static func load(projectRoot: URL, variant: ClasspathVariant) -> CachedClasspath? {
@@ -156,6 +172,64 @@ public enum ClasspathCache {
             let modified = attributes[.modificationDate] as? Date ?? .distantPast
             let size = attributes[.size] as? Int ?? 0
             update("settings:\(modified.timeIntervalSince1970)|\(size)\n")
+        }
+
+        if let major = jdkMajor {
+            update("jdk:\(major)\n")
+        }
+
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// §57: Gradle fingerprint = settings / 各项目构建脚本 / version catalog /
+    /// wrapper properties / 根 gradle.properties / GRADLE_USER_HOME 的全局配置 + JDK major。
+    /// 依赖版本、插件与 source set 布局都藏在这些文件里，任何一处变化都必须重新解析。
+    public static func gradleFingerprint(
+        projectRoot: URL,
+        buildFiles: [URL],
+        jdkMajor: Int?,
+        gradleUserHome: URL
+    ) -> String {
+        var hasher = SHA256()
+        func update(_ string: String) {
+            hasher.update(data: Data(string.utf8))
+        }
+
+        // 生成 init script 的语义变化时必须让旧缓存失效。
+        update("engine:gradle-classpath-v1\n")
+
+        for file in buildFiles.sorted(by: { $0.path < $1.path }) {
+            update("file:\(file.path)\n")
+            if let content = try? Data(contentsOf: file) {
+                hasher.update(data: content)
+            }
+        }
+
+        // 全局配置与 Maven 的 settings.xml 同理：仓库、代理、镜像都会改变解析结果。
+        for name in ["gradle.properties", "init.gradle", "init.gradle.kts"] {
+            let url = gradleUserHome.appendingPathComponent(name)
+            guard let content = try? Data(contentsOf: url) else { continue }
+            update("user:\(name)\n")
+            hasher.update(data: content)
+        }
+        let initDirectory = gradleUserHome.appendingPathComponent("init.d", isDirectory: true)
+        if let entries = try? FileManager.default.contentsOfDirectory(
+            at: initDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) {
+            for entry in entries.sorted(by: { $0.path < $1.path }) {
+                guard let content = try? Data(contentsOf: entry) else { continue }
+                update("user-init:\(entry.lastPathComponent)\n")
+                hasher.update(data: content)
+            }
+        }
+
+        let wrapperProperties = projectRoot.appendingPathComponent("gradle/wrapper/gradle-wrapper.properties")
+        if let content = try? Data(contentsOf: wrapperProperties) {
+            update("wrapper:\n")
+            hasher.update(data: content)
         }
 
         if let major = jdkMajor {

@@ -225,19 +225,19 @@ public struct IntelliJProjectScanner: Sendable {
 
             for task in config.beforeLaunchTasks where task.isEnabled {
                 switch task.kind {
-                case .gradleTask(let taskName):
-                    diagnostics.append(ScanDiagnostic(
-                        file: config.source.file,
-                        severity: .warning,
-                        message: "配置“\(config.name)”的 Before Launch Gradle 任务“\(taskName)”当前版本尚未接管。",
-                        remediation: "暂时在 IDEA 中停用该 Gradle 任务；Gradle 构建支持将在后续版本接入。"
-                    ))
                 case .mavenGoal(let goal, _) where goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
                     diagnostics.append(ScanDiagnostic(
                         file: config.source.file,
                         severity: .warning,
                         message: "配置“\(config.name)”的 Before Launch Maven Goal 为空，执行时会被拒绝。",
                         remediation: "在 IDEA 中补全 Maven Goal，或停用该任务。"
+                    ))
+                case .gradleTask(let taskName) where CommandLineTokenizer.tokenize(taskName).isEmpty:
+                    diagnostics.append(ScanDiagnostic(
+                        file: config.source.file,
+                        severity: .warning,
+                        message: "配置“\(config.name)”的 Before Launch Gradle 任务为空，执行时会被拒绝。",
+                        remediation: "在 IDEA 中补全 Gradle 任务名，或停用该任务。"
                     ))
                 default:
                     break

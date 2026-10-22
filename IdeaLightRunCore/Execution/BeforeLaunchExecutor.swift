@@ -14,6 +14,8 @@ public struct BeforeLaunchExecutor: Sendable {
         /// §3.5: Maven.BeforeRunTask = 原样执行 IDEA 保存的 goal；pomFile 是任务保存的
         /// `file` 属性（§P0-9，可为 nil），调用方负责把它映射成 `-f`。
         public var runMavenGoals: @Sendable (_ goals: [String], _ pomFile: String?) async throws -> Void
+        /// §3.5: Gradle.BeforeRunTask = 原样执行 IDEA 保存的任务，不转成别的命令。
+        public var runGradleTasks: @Sendable (_ tasks: [String]) async throws -> Void
         /// §3.7: Run Another Configuration = 先跑完被引用的配置；chain 为当前引用链，用于循环检测。
         public var runReferenced: @Sendable (_ config: RunConfiguration, _ chain: [String]) async throws -> Void
 
@@ -21,11 +23,13 @@ public struct BeforeLaunchExecutor: Sendable {
             build: @escaping @Sendable () async throws -> Void,
             buildProject: @escaping @Sendable () async throws -> Void,
             runMavenGoals: @escaping @Sendable ([String], String?) async throws -> Void,
+            runGradleTasks: @escaping @Sendable ([String]) async throws -> Void,
             runReferenced: @escaping @Sendable (RunConfiguration, [String]) async throws -> Void
         ) {
             self.build = build
             self.buildProject = buildProject
             self.runMavenGoals = runMavenGoals
+            self.runGradleTasks = runGradleTasks
             self.runReferenced = runReferenced
         }
     }
@@ -69,10 +73,15 @@ public struct BeforeLaunchExecutor: Sendable {
                 log(LogLine(stream: .system, text: "[IdeaLightRun] Before Launch：mvn\(target) \(goals.joined(separator: " "))…"))
                 try await actions.runMavenGoals(goals, pomFile)
             case .gradleTask(let gradleTask):
-                throw IdeaLightRunError.unsupportedBeforeLaunch(
-                    detail: "配置 “\(config.name)” 的 Before Launch 需要执行 Gradle 任务“\(gradleTask)”；"
-                        + "当前版本只支持 Maven 项目启动，Gradle 支持在 Milestone 4 提供。"
-                )
+                let tasks = CommandLineTokenizer.tokenize(gradleTask)
+                guard !tasks.isEmpty else {
+                    throw IdeaLightRunError.unsupportedBeforeLaunch(
+                        detail: "配置 “\(config.name)” 的 Gradle.BeforeRunTask 没有保存任何任务，"
+                            + "无法确定要执行什么。请在 IDEA 中填写 Gradle task 后重试。"
+                    )
+                }
+                log(LogLine(stream: .system, text: "[IdeaLightRun] Before Launch：gradle \(tasks.joined(separator: " "))…"))
+                try await actions.runGradleTasks(tasks)
             case .runConfiguration(let name, let type):
                 let referenced = try Self.resolveReference(
                     name: name,

@@ -2,7 +2,7 @@
 
 独立 macOS Java 项目启动器：读取 IntelliJ IDEA 的 Run Configuration，不打开 IDEA 就能编译并启动 Java / Spring Boot 项目，也能直接启动已构建的 JAR。
 
-- **环境**：macOS 13 及以上（Apple Silicon / Intel 通用二进制）；本机 JDK；Application / Spring Boot 项目需是 Maven（有 `pom.xml` 或 `mvnw`），JAR Application 只要求 JAR 已构建
+- **环境**：macOS 13 及以上（Apple Silicon / Intel 通用二进制）；本机 JDK；Application / Spring Boot 项目需是 Maven（`pom.xml` / `mvnw`）或 Gradle（`settings.gradle(.kts)` / `build.gradle(.kts)` / `gradlew`），JAR Application 只要求 JAR 已构建
 - **隐私**：除用户主动点「检查更新…」外，全程 100% 本地——不联网、无后台常驻、不上传任何项目或本机信息（§64）
 
 > 原暂定名 LightRun，已正式更名为 IdeaLightRun。文中 § 编号均指向项目需求文档。
@@ -39,42 +39,43 @@
 
 运行中的服务会自动探测本机监听端口：只读本机 `lsof`，每 3 秒一次，进程结束后即停（不涉网，§64 不受影响）。信息页运行横幅显示「端口 …」，首次探测到端口或端口集合变化时，控制台也会记录一条灰色系统消息；信息页同时列出可运行性问题与扫描诊断（数量、严重程度、文件、原因和建议处理方式）。
 
-快捷键：**Run ⌘R**、**Stop ⌘.**、**Restart ⇧⌘R**、**构建项目 ⌘F9**、**重新构建项目 ⇧⌘F9**。「清理项目 / 停止构建 / 强制结束构建」在顶部 **构建** 菜单里，没有快捷键。顶部 **构建** 菜单的项一律不置灰：非 Maven 项目点了会弹窗说明原因，构建进行中再点则被忽略（同项目串行，§42）；摘要条和项目右键菜单里的构建三项会直接置灰，悬停提示写明「仅支持 Maven 项目；Gradle 支持在 Milestone 4 提供」。
+快捷键：**Run ⌘R**、**Stop ⌘.**、**Restart ⇧⌘R**、**构建项目 ⌘F9**、**重新构建项目 ⇧⌘F9**。「清理项目 / 停止构建 / 强制结束构建」在顶部 **构建** 菜单里，没有快捷键。顶部 **构建** 菜单的项一律不置灰：项目根既没有 Maven 也没有 Gradle 构建文件时点了会弹窗说明原因，构建进行中再点则被忽略（同项目串行，§42）；摘要条和项目右键菜单里的构建三项会直接置灰，悬停提示写明「项目根未找到 Maven 或 Gradle 构建文件」。
 
 ## 什么配置能直接启动
 
-**Maven 项目**里的 **Application**、**Spring Boot**，**JAR Application**（不要求项目是 Maven），以及引用这些配置的 **Compound**。其余按情况标记：
+**Maven 或 Gradle 项目**里的 **Application**、**Spring Boot**，**JAR Application**（不要求项目是 Maven / Gradle），以及引用这些配置的 **Compound**。其余按情况标记：
 
 | 标记 | 覆盖范围 |
 | --- | --- |
-| `PLANNED` | Maven、Gradle 类型——认得出来，本版不接管启动 |
+| `PLANNED` | Maven 运行配置（直接执行 goal，Milestone 5 接入）与 Gradle 运行配置（直接执行 task）——认得出来，本版不接管启动 |
 | `UNSUPPORTED` | JUnit 与未知类型（未知字段保留在 `rawOptions` 里，不丢信息）；Compound 引用了缺失、类型不匹配或不支持启动的成员时也归到这里，信息页写明具体是哪个成员 |
 
-`READY` / `WARNING` 由 Core 按项目实际情况计算：缺 Main Class / JAR Path、启用了暂不支持的 Before Launch 任务、引用了不存在的配置都会阻止启动；模块缺失、宏无法解析等只产生警告。项目同时存在 `pom.xml` 与 Gradle 构建文件时，先看配置所属模块目录里的构建脚本；仍无法判断时固定使用 Maven 并显示 `WARNING`，不依赖偶然的判断顺序。
+`READY` / `WARNING` 由 Core 按项目实际情况计算：缺 Main Class / JAR Path、启用了暂不支持的 Before Launch 任务、引用了不存在的配置都会阻止启动；模块缺失、宏无法解析等只产生警告。项目同时存在 `pom.xml` 与 Gradle 构建文件时，先看配置所属模块目录里的构建脚本；仍无法判断时固定使用 Maven 并显示 `WARNING`，不依赖偶然的判断顺序。Before Launch 里的 Maven Goal 只能用于 Maven 项目、Gradle Task 只能用于 Gradle 项目，错配会阻止启动而不是静默改跑另一套命令。
 
-JAR Application 按 IDEA 的语义启动：`java [VM Options] -jar <JAR Path> [Program Arguments]`。`JAR_PATH` 支持 `$PROJECT_DIR$` / `$MODULE_DIR$` 等宏，未填 Working Directory 时默认项目根；`ALTERNATIVE_JRE_PATH` 启用时优先使用该 JDK。JAR 尚不存在只显示 `WARNING`（Before Launch 可能生成它），真正启动前会再次校验，届时仍缺失则失败。Before Launch 里有 Build / Build Project / Maven goal 时，才要求可用的 Maven 与 Module。
+JAR Application 按 IDEA 的语义启动：`java [VM Options] -jar <JAR Path> [Program Arguments]`。`JAR_PATH` 支持 `$PROJECT_DIR$` / `$MODULE_DIR$` 等宏，未填 Working Directory 时默认项目根；`ALTERNATIVE_JRE_PATH` 启用时优先使用该 JDK。JAR 尚不存在只显示 `WARNING`（Before Launch 可能生成它），真正启动前会再次校验，届时仍缺失则失败。Before Launch 里有 Build / Build Project / Maven goal / Gradle task 时，才要求可用的 Maven 或 Gradle 与 Module。
 
 Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准备（每个成员执行自己的 Before Launch），全部成功后才一起启动；嵌套 Compound 展开成叶子配置，运行时只有真实进程。每个成员有独立的 PID、日志、端口与状态，控制台可在「全部 / 各成员」之间切换。Run 启动整组，Stop / Force Kill 停止整组；任一成员异常退出会停止其余成员，不会留下半组孤儿进程。Compound 自身的 Before Launch 任务、引用缺失或类型不匹配的成员、跨层重复引用同一配置都会阻止启动，不会静默跳过。
 
 三点容易踩：
 
-- Maven 只看项目根有没有 `pom.xml`。根目录只有 `.idea`、或所有 pom 都在子目录的项目，会被判成非 Maven 项目而拒绝启动
-- JAR Application 只有在 Before Launch 需要构建时才依赖 Maven；单纯运行已有 JAR 不需要
-- Gradle 项目目前只能浏览配置（Milestone 4 才支持启动）
+- Maven 只看项目根有没有 `pom.xml`。根目录只有 `.idea`、或所有 pom 都在子目录的项目，会被判成非 Maven 项目而拒绝启动。Gradle 项目根只要有 `settings.gradle(.kts)` 或 `build.gradle(.kts)` 即可；只有 `settings.gradle` 的聚合工程也能启动
+- JAR Application 只有在 Before Launch 需要构建时才依赖 Maven / Gradle；单纯运行已有 JAR 不需要
+- Gradle 运行配置（类型为 Gradle、在 IDEA 里直接执行 task 的配置）目前是 `PLANNED`；Application / Spring Boot / JAR 配置在 Gradle 项目里已经可以直接 Run
 
 ## 构建 / 重新构建 / 清理
 
-与 IDEA 一一对应，入口在摘要条按钮或 **构建** 菜单，输出走独立的「构建」页：
+与 IDEA 一一对应，入口在摘要条按钮或 **构建** 菜单，输出走独立的「构建」页。构建系统按项目自动选择，Maven 与 Gradle 共用同一条工具链解析与串行构建管线：
 
-| 动作 | 实际执行 | 用途 |
-| --- | --- | --- |
-| 构建（⌘F9） | `mvn -B -nsu -DskipTests compile`，整个 reactor | 增量编译 |
-| 重新构建（⇧⌘F9） | `mvn -B -nsu -DskipTests clean compile` | 清空产物后全量 |
-| 清理 | `mvn -B clean` | 只删各模块 `target/`，不编译 |
+| 动作 | Maven | Gradle | 用途 |
+| --- | --- | --- | --- |
+| 构建（⌘F9） | `mvn -B -nsu -DskipTests compile`，整个 reactor | `gradle --console=plain --no-daemon classes` | 增量编译 |
+| 重新构建（⇧⌘F9） | `mvn -B -nsu -DskipTests clean compile` | `gradle --console=plain --no-daemon clean classes` | 清空产物后全量 |
+| 清理 | `mvn -B clean` | `gradle --console=plain --no-daemon clean` | 只删产物，不编译 |
 
-用项目自己的 `mvnw` 时不加 `-B`（wrapper 自带进度输出）。
-
-- 三者都不跑测试、都不带 `-pl`，构建期可 **停止构建**（SIGTERM）或 **强制结束构建**（SIGKILL）
+- 用项目自己的 `mvnw` 时不加 `-B`（wrapper 自带进度输出）；有 `gradlew` 时优先用它，否则依次找 `GRADLE_HOME`、`PATH`、Homebrew / MacPorts / SDKMAN 常见位置和 `~/.gradle/wrapper/dists` 里的发行版
+- Gradle 固定 `--no-daemon`：Stop 终止的就是正在构建的进程，不会留下一个把构建跑完的后台 daemon；`--console=plain` 让日志可读、可按原文复现
+- 三者都不跑测试、Maven 不带 `-pl`，构建期可 **停止构建**（SIGTERM）或 **强制结束构建**（SIGKILL）
+- Gradle classpath 由临时 init script 读取 `sourceSets.main.runtimeClasspath`（勾选 Provided 时并入 `compileClasspath`），不重写项目依赖；缓存指纹覆盖 settings / 各项目构建脚本 / version catalog / wrapper / `GRADLE_USER_HOME` 全局配置 / JDK major
 
 ## Git 分支与拉取
 
@@ -86,7 +87,7 @@ Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准�
 - git 走绝对路径枚举（`/usr/bin/git` 等），不依赖 GUI 的 PATH；凭据交给系统钥匙串 helper，GUI 内不弹终端提示（`GIT_TERMINAL_PROMPT=0`），进程卡住 120 秒兜底 SIGTERM。
 - 网络只在用户点「拉取」（或切换分支触发 git 联网）时发生（§64 精神：无后台自查、无定时器）；平时只读本地 `.git`。子进程全部 `Process.arguments` 数组传参（§27）。
 - 切换分支不停止运行中的服务——已在跑的 Java 进程仍用旧代码，需要重新 Run 才会用新分支的产物。
-- 清理之后 Run 仍正常：若配置的 Before Launch 含 Make，编译步骤带 `-pl -am`，会连带重新产出依赖模块的 `target/classes`（§92/§93）；勾了 "Do not build before run" 的配置本来就不编译，清理后直接启动可能用到旧产物
+- 清理之后 Run 仍正常：若配置的 Before Launch 含 Make，Maven 的编译步骤带 `-pl -am`，会连带重新产出依赖模块的 `target/classes`（§92/§93）；Gradle 用 `:module:classes`，由 Gradle 按 task graph 先构建项目依赖。勾了 "Do not build before run" 的配置本来就不编译，清理后直接启动可能用到旧产物
 
 ## 日志与环境变量
 
@@ -132,7 +133,7 @@ swift run IdeaLightRunCLI scan /path/to/project          # 列出所有 Run Conf
 swift run IdeaLightRunCLI run /path/to/project UserApp   # 编译并启动，Ctrl-C 发 SIGTERM
 swift run IdeaLightRunCLI build /path/to/project          # IDEA 的 Build Project
 swift run IdeaLightRunCLI build /path/to/project --rebuild # Rebuild Project（clean compile）
-swift run IdeaLightRunCLI clean /path/to/project          # Maven clean（只删 target/，不编译）
+swift run IdeaLightRunCLI clean /path/to/project          # Maven clean / Gradle clean（只删产物，不编译）
 swift run IdeaLightRunCLI scan /path/to/project --json     # JSON 输出
 swift run IdeaLightRunCLI scan /path/to/project --show-secrets  # 环境变量明文（默认掩码）
 ```
@@ -147,7 +148,7 @@ swift run IdeaLightRunCLI scan /path/to/project --show-secrets  # 环境变量�
 IdeaLightRunCore/    核心库（GUI 与 CLI 共用，禁止另起一套启动逻辑）
   Domain/            RunConfiguration / ExecutableLaunchPlan / PreparedExecution / ProcessState / 统一错误模型
   IntelliJ/          ProjectScanner、RunConfiguration 解析（宽松 + alias）、MacroResolver、ModuleResolver
-  BuildSystem/       Maven 检测/编译/classpath 解析/缓存；ProjectToolchain + ProjectBuilder（启动与构建共用一条管线）；Gradle 检测、settings/projectDir 映射与构建系统选择（构建与运行尚未接入）
+  BuildSystem/       Maven 与 Gradle 的定位/编译/classpath 解析/缓存；ProjectToolchain + ProjectBuilder（启动与构建共用一条管线）；BuildSystemSelector（Maven/Gradle 共存时确定性选择）
   Execution/         ExecutionCoordinator、BeforeLaunchExecutor、ExecutionRuntime（GUI/CLI 统一执行器）、ConfigurationCapabilityResolver
   Java/              JDKResolver、JavaRunPlanner、JarRunPlanner
   Process/           ProcessSession（进程生命周期 + 日志捕获）
@@ -162,12 +163,11 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 
 ## 当前进度
 
-已完成：Core 解析与宏、Maven 编译与 classpath、启动流水线、统一 `PreparedExecution` / `ExecutionRuntime` 执行器、JAR Application 启动、Compound 多配置编排（独立进程 / 日志 / 端口、分组控制、嵌套展开与部分失败清理）、进程与日志、GUI 三栏、Build/Rebuild/Clean、运行端口检测、扫描诊断与统一配置能力计算、在线更新。
+已完成：Core 解析与宏、Maven / Gradle 编译与 classpath、启动流水线、统一 `PreparedExecution` / `ExecutionRuntime` 执行器、JAR Application 启动、Compound 多配置编排（独立进程 / 日志 / 端口、分组控制、嵌套展开与部分失败清理）、进程与日志、GUI 三栏、Build/Rebuild/Clean（Maven 与 Gradle）、运行端口检测、扫描诊断与统一配置能力计算、在线更新。
 
 待做：
 
-- Gradle 构建与运行
-- Maven 运行配置与 JUnit 测试运行
+- Maven 运行配置（直接执行 goal）与 Gradle 运行配置（直接执行 task）、JUnit 测试运行
 - Before Launch 扩展（Build, no error check / Build Artifacts / Run External Tool / Launch Web Browser）与 Restart to Apply 提示
 
 ## 在线更新实现要点
@@ -199,14 +199,14 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 ## 测试
 
 ```bash
-swift test                                        # 本地全量：360 用例
-swift test --skip MavenClasspathIntegrationTests  # CI 集合：357 用例（跳过那 3 个要真实下载依赖的）
+swift test                                        # 本地全量：396 用例
+swift test --skip MavenClasspathIntegrationTests  # CI 集合：393 用例（跳过那 3 个要真实下载依赖的）
 ```
 
 覆盖范围：
 
 - **解析层** — RunConfigurationParser（alias / rawOptions / Before Launch / JAR 字段）、WorkspaceParser（流式、只取 RunManager、跳过模板）、ProjectScanner（§7 来源优先级去重、§6 深度上限 4、忽略目录）、MacroResolver（§11 全部宏与 IDEA 上下文变量，运行配置与 IML 路径共用）、ModuleResolver（§13 五种方式）、JDKResolver（§23–25 优先级与 major version 模糊匹配）
-- **构建与启动** — JavaRunPlanner（§26–§29）、JarRunPlanner（`java -jar` 参数顺序、默认工作目录、缺失/不可读 JAR）、ExecutionRuntime（日志/PID/终态转发、Stop、Before Launch 同步执行与取消）、Compound（成员按引用顺序准备、嵌套展开、缺失/类型不匹配/成环拦截、独立 PID 与日志、分组 Stop/Force Kill、部分失败清理）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator（Dock 启动无 PATH 时的绝对路径枚举）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
+- **构建与启动** — JavaRunPlanner（§26–§29）、JarRunPlanner（`java -jar` 参数顺序、默认工作目录、缺失/不可读 JAR）、ExecutionRuntime（日志/PID/终态转发、Stop、Before Launch 同步执行与取消）、Compound（成员按引用顺序准备、嵌套展开、缺失/类型不匹配/成环拦截、独立 PID 与日志、分组 Stop/Force Kill、部分失败清理）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator / GradleLocator（Dock 启动无 PATH 时的绝对路径枚举与 wrapper 发行版兜底）、GradleBuildService（project path 任务、合并编译与 classpath 解析、provided 变体、缓存失效、失败与取消）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
 - **诊断与能力** — ScanDiagnostic（读失败 / XML 损坏 / 配置目录不可读 / 重复配置 / 缺 Main Class / 不支持的 Before Launch 任务都带严重程度与建议，不静默丢配置）、ConfigurationCapabilityResolver（类型 + 构建系统 + 字段 + Module 解析 + Before Launch 统一裁决）、BuildSystemSelector（Maven/Gradle 共存时的确定性选择）、Gradle settings/projectDir 解析、Maven `$MODULE_DIR$` POM 路径、ProcessHandle 启动前取消与 SIGTERM→SIGKILL 升级
 - **进程与日志** — ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、LogRingBuffer（§37 上限）
 - **在线更新** — 版本比较与 fail-closed、发布元数据解析（JSON 与 expanded_assets 两条路径）、镜像链顺序与回退/取消/坏文件删除、更新助手参数契约与重启路径、designated requirement 解析与语义判定，以及把产物名 / bundle id / Team / 助手落点钉到 `scripts/` 与 `release.yml` **原文**的防漂移断言

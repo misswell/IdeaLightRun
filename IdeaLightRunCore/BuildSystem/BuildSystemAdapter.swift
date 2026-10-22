@@ -18,6 +18,10 @@ public struct BuildTarget: Sendable {
 /// §9: 构建系统对启动流水线提供的能力。`ExecutionCoordinator` 只通过这个协议工作，
 /// 因此接入 Gradle 不需要在启动流水线里加 `if Gradle`。
 public protocol BuildSystemAdapter: Sendable {
+    /// classpath 缓存身份由适配器自己决定：Maven 用 artifactId，Gradle 用 project path。
+    /// 调用方不拼 `buildSystem` 字符串，避免两处对同一模块给出不同的缓存键。
+    func classpathVariant(for module: ProjectModule, includeProvided: Bool) -> ClasspathVariant
+
     /// Make / Build：编译目标模块及其构建范围内的依赖（§3.3）。
     func buildModule(
         _ target: BuildTarget,

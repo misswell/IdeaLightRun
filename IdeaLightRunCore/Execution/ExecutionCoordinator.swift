@@ -164,6 +164,16 @@ public struct ExecutionCoordinator: Sendable {
                             log: log
                         )
                     },
+                    runGradleTasks: { tasks in
+                        progress(.building)
+                        try adapter.runTasks(
+                            tasks,
+                            pomFile: nil,
+                            moduleDirectory: module.directory,
+                            handle: processHandle,
+                            log: log
+                        )
+                    },
                     runReferenced: { referenced, chain in
                         let referencedExecution = try await self.prepareResolved(
                             config: referenced,
@@ -338,17 +348,17 @@ public struct ExecutionCoordinator: Sendable {
         ).module
 
         let tasks = config.beforeLaunchTasks.filter(\.isEnabled)
-        let needsMavenToolchain = tasks.contains { task in
+        let needsToolchain = tasks.contains { task in
             switch task.kind {
-            case .build, .buildProject, .mavenGoal:
+            case .build, .buildProject, .mavenGoal, .gradleTask:
                 return true
-            case .runConfiguration, .gradleTask, .unknown:
+            case .runConfiguration, .unknown:
                 return false
             }
         }
 
         let toolchain: ProjectToolchain?
-        if needsMavenToolchain {
+        if needsToolchain {
             toolchain = try ProjectToolchain.resolve(
                 projectRoot: projectRoot,
                 result: scan,
@@ -372,27 +382,24 @@ public struct ExecutionCoordinator: Sendable {
                         guard let toolchain, let module else {
                             throw IdeaLightRunError.unsupportedBeforeLaunch(
                                 detail: "配置 “\(config.name)” 是 JAR Application，Before Launch 的 Build "
-                                    + "需要可解析的 Module 与 Maven 项目。"
+                                    + "需要可解析的 Module 与可用的 Maven / Gradle 项目。"
                             )
                         }
                         progress(.building)
-                        let target = BuildTarget(
-                            module: module,
-                            variant: .maven(
-                                module: module.name,
-                                includeProvided: config.includeProvidedDependencies
-                            )
+                        let target = toolchain.target(
+                            for: module,
+                            includeProvided: config.includeProvidedDependencies
                         )
-                        try toolchain.service.buildModule(target, handle: processHandle, log: log)
+                        try toolchain.adapter.buildModule(target, handle: processHandle, log: log)
                     },
                     buildProject: {
                         guard let toolchain else {
                             throw IdeaLightRunError.unsupportedBeforeLaunch(
-                                detail: "配置 “\(config.name)” 的 Before Launch 需要 Build Project，但当前项目无法使用 Maven。"
+                                detail: "配置 “\(config.name)” 的 Before Launch 需要 Build Project，但当前项目无法确定构建系统。"
                             )
                         }
                         progress(.building)
-                        try toolchain.service.buildProject(kind: .build, handle: processHandle, log: log)
+                        try toolchain.adapter.buildProject(kind: .build, handle: processHandle, log: log)
                     },
                     runMavenGoals: { goals, pomFile in
                         guard let toolchain else {
@@ -400,10 +407,37 @@ public struct ExecutionCoordinator: Sendable {
                                 detail: "配置 “\(config.name)” 的 Before Launch 需要 Maven，但当前项目无法使用 Maven。"
                             )
                         }
+                        guard toolchain.kind == .maven else {
+                            throw IdeaLightRunError.unsupportedBeforeLaunch(
+                                detail: "配置 “\(config.name)” 的 Before Launch 包含 Maven 任务，"
+                                    + "但当前项目使用 \(toolchain.kind.displayName) 构建。"
+                            )
+                        }
                         progress(.building)
-                        try toolchain.service.runTasks(
+                        try toolchain.adapter.runTasks(
                             goals,
                             pomFile: pomFile,
+                            moduleDirectory: module?.directory ?? projectRoot,
+                            handle: processHandle,
+                            log: log
+                        )
+                    },
+                    runGradleTasks: { tasks in
+                        guard let toolchain else {
+                            throw IdeaLightRunError.unsupportedBeforeLaunch(
+                                detail: "配置 “\(config.name)” 的 Before Launch 需要 Gradle，但当前项目无法使用 Gradle。"
+                            )
+                        }
+                        guard toolchain.kind == .gradle else {
+                            throw IdeaLightRunError.unsupportedBeforeLaunch(
+                                detail: "配置 “\(config.name)” 的 Before Launch 包含 Gradle 任务，"
+                                    + "但当前项目使用 \(toolchain.kind.displayName) 构建。"
+                            )
+                        }
+                        progress(.building)
+                        try toolchain.adapter.runTasks(
+                            tasks,
+                            pomFile: nil,
                             moduleDirectory: module?.directory ?? projectRoot,
                             handle: processHandle,
                             log: log
@@ -454,14 +488,15 @@ public struct ExecutionCoordinator: Sendable {
         try ensureRunnable(ConfigurationCapabilityResolver.resolve(config), for: config)
     }
 
-    /// 项目感知门禁：构建系统缺失或落到尚未接管的 Gradle 时，
-    /// 沿用 `buildToolNotFound` 的既有语义，让调用方拿到明确的工具链原因。
+    /// 项目感知门禁：构建系统缺失时沿用 `buildToolNotFound` 的既有语义，
+    /// 让调用方拿到明确的工具链原因；Maven / Gradle 都缺失才算缺工具链，
+    /// 其余阻断（缺 Module、Before Launch 类型不匹配）按配置问题报告。
     /// JAR Application 不需要构建系统本身，缺失原因（JAR Path / Before Launch）按配置错误报告。
     static func ensureRunnable(_ config: RunConfiguration, scan: ScanResult) throws {
         let capability = ConfigurationCapabilityResolver.resolve(config, scan: scan)
         guard !capability.isLaunchable else { return }
         if config.type == .application || config.type == .springBoot,
-           capability.buildSystem != .maven {
+           capability.buildSystem == nil {
             throw IdeaLightRunError.buildToolNotFound(
                 detail: capability.primaryReason ?? "无法确定项目的构建系统。"
             )

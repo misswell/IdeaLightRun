@@ -247,11 +247,11 @@ struct SidebarView: View {
                     .tag(project.id)
                     .contextMenu {
                         Button("构建项目") { store.build(projectID: project.id, kind: .build) }
-                            .disabled(project.result?.buildSystem.maven == nil)
+                            .disabled(!project.hasBuildSystem)
                         Button("重新构建项目") { store.build(projectID: project.id, kind: .rebuild) }
-                            .disabled(project.result?.buildSystem.maven == nil)
+                            .disabled(!project.hasBuildSystem)
                         Button("清理项目") { store.build(projectID: project.id, kind: .clean) }
-                            .disabled(project.result?.buildSystem.maven == nil)
+                            .disabled(!project.hasBuildSystem)
                         if store.builds[project.id]?.phase.isBusy == true {
                             Button("停止构建", role: .destructive) { store.stopBuild(projectID: project.id) }
                         }
@@ -553,8 +553,8 @@ struct ProjectSummaryView: View {
     private var buildControls: some View {
         let build = store.builds[project.id]
         let busy = build?.phase.isBusy ?? false
-        let mavenReady = project.result?.buildSystem.maven != nil
-        let unavailableHint = "仅支持 Maven 项目；Gradle 支持在 Milestone 4 提供"
+        let buildSystemReady = project.hasBuildSystem
+        let unavailableHint = "项目根未找到 Maven 或 Gradle 构建文件"
 
         return HStack(spacing: 8) {
             if busy {
@@ -565,7 +565,7 @@ struct ProjectSummaryView: View {
                     .foregroundStyle(.secondary)
                 Button("停止构建") { store.stopBuild(projectID: project.id) }
                     .disabled(build?.phase == .stopping)
-                    .help("终止 Maven 进程（SIGTERM）")
+                    .help("终止构建进程（SIGTERM）")
                 if build?.phase == .stopping {
                     Button(role: .destructive) {
                         store.forceKillBuild(projectID: project.id)
@@ -576,14 +576,14 @@ struct ProjectSummaryView: View {
                 }
             } else {
                 Button("构建") { store.build(projectID: project.id, kind: .build) }
-                    .disabled(!mavenReady)
-                    .help(mavenReady ? "增量编译整个项目（IDEA 的 Build Project，⌘F9）" : unavailableHint)
+                    .disabled(!buildSystemReady)
+                    .help(buildSystemReady ? "增量编译整个项目（IDEA 的 Build Project，⌘F9）" : unavailableHint)
                 Button("重新构建") { store.build(projectID: project.id, kind: .rebuild) }
-                    .disabled(!mavenReady)
-                    .help(mavenReady ? "清空产物后全量编译（IDEA 的 Rebuild Project，⇧⌘F9）" : unavailableHint)
+                    .disabled(!buildSystemReady)
+                    .help(buildSystemReady ? "清空产物后全量编译（IDEA 的 Rebuild Project，⇧⌘F9）" : unavailableHint)
                 Button("清理") { store.build(projectID: project.id, kind: .clean) }
-                    .disabled(!mavenReady)
-                    .help(mavenReady ? "只清空各模块 target/ 产物，不编译（Maven clean）" : unavailableHint)
+                    .disabled(!buildSystemReady)
+                    .help(buildSystemReady ? "只清空各模块产物，不编译（Maven clean / Gradle clean）" : unavailableHint)
             }
         }
         .controlSize(.small)
