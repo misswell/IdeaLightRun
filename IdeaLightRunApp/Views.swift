@@ -354,38 +354,45 @@ struct ConfigurationListView: View {
     @ViewBuilder
     private func configList(project: ProjectEntry) -> some View {
         if let result = project.result {
-            if result.configurations.isEmpty {
-                emptyState(icon: "tray", text: "未发现 Run Configuration")
-            } else {
-                List(selection: $store.selectedConfigurationKey) {
-                    ForEach(result.configurations) { config in
-                        let model = store.displaySession(projectID: project.id, configKey: config.uniqueKey)
-                        ConfigurationRow(
-                            config: config,
-                            runtimeState: model?.state,
-                            ports: model?.listeningPorts ?? [],
-                            instanceCount: store.activeSessions(projectID: project.id, configKey: config.uniqueKey).count
-                        )
-                        .tag(config.uniqueKey)
-                    }
+            VStack(spacing: 0) {
+                if !result.diagnostics.isEmpty {
+                    ScanDiagnosticsBanner(diagnostics: result.diagnostics)
+                    Divider()
                 }
-                .listStyle(.inset(alternatesRowBackgrounds: true))
-                .contextMenu(forSelectionType: String.self) { keys in
-                    if let key = keys.first {
-                        // 可用性跟随运行态，避免点了没反应的菜单项
-                        let model = store.displaySession(projectID: project.id, configKey: key)
-                        let config = project.result?.configurations.first { $0.uniqueKey == key }
-                        let launchable = config.map { store.canLaunch(projectID: project.id, config: $0) } ?? false
-                        Button("运行 ▶") { store.run(configKey: key, projectID: project.id) }
-                            .disabled(!launchable)
-                        Button("重启 ↻") { store.restart(configKey: key, projectID: project.id) }
-                            .disabled(model.map { $0.isBuilding || $0.state == .stopping } ?? false)
-                        Button("停止 ■", role: .destructive) { store.stop(configKey: key, projectID: project.id) }
-                            .disabled(model.map { !$0.state.isActive || $0.state == .stopping } ?? true)
+                if result.configurations.isEmpty {
+                    emptyState(icon: "tray", text: "未发现 Run Configuration")
+                } else {
+                    List(selection: $store.selectedConfigurationKey) {
+                        ForEach(result.configurations) { config in
+                            let model = store.displaySession(projectID: project.id, configKey: config.uniqueKey)
+                            ConfigurationRow(
+                                config: config,
+                                readiness: store.capability(for: config, projectID: project.id).readiness,
+                                runtimeState: model?.state,
+                                ports: model?.listeningPorts ?? [],
+                                instanceCount: store.activeSessions(projectID: project.id, configKey: config.uniqueKey).count
+                            )
+                            .tag(config.uniqueKey)
+                        }
                     }
-                } primaryAction: { keys in
-                    if let key = keys.first {
-                        store.selectedConfigurationKey = key
+                    .listStyle(.inset(alternatesRowBackgrounds: true))
+                    .contextMenu(forSelectionType: String.self) { keys in
+                        if let key = keys.first {
+                            // 可用性跟随运行态，避免点了没反应的菜单项
+                            let model = store.displaySession(projectID: project.id, configKey: key)
+                            let config = project.result?.configurations.first { $0.uniqueKey == key }
+                            let launchable = config.map { store.canLaunch(projectID: project.id, config: $0) } ?? false
+                            Button("运行 ▶") { store.run(configKey: key, projectID: project.id) }
+                                .disabled(!launchable)
+                            Button("重启 ↻") { store.restart(configKey: key, projectID: project.id) }
+                                .disabled(model.map { $0.isBuilding || $0.state == .stopping } ?? false)
+                            Button("停止 ■", role: .destructive) { store.stop(configKey: key, projectID: project.id) }
+                                .disabled(model.map { !$0.state.isActive || $0.state == .stopping } ?? true)
+                        }
+                    } primaryAction: { keys in
+                        if let key = keys.first {
+                            store.selectedConfigurationKey = key
+                        }
                     }
                 }
             }
@@ -414,6 +421,105 @@ struct ConfigurationListView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
+}
+
+/// 扫描诊断条：默认收起，展开后给出文件路径与「在访达中显示」。
+/// 读不出来的配置文件不能让用户以为项目里本来就没有配置。
+private struct ScanDiagnosticsBanner: View {
+    let diagnostics: [ScanDiagnostic]
+    @State private var expanded = false
+
+    private var hasProblems: Bool {
+        diagnostics.contains { $0.severity != .info }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: hasProblems ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                        .foregroundStyle(hasProblems ? Color.yellow : Color.gray)
+                    Text("扫描诊断 · \(scanDiagnosticSummary(diagnostics))")
+                        .font(.callout)
+                    Spacer()
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                ForEach(diagnostics) { diagnostic in
+                    ScanDiagnosticRow(diagnostic: diagnostic)
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background((hasProblems ? Color.yellow : Color.gray).opacity(0.10))
+    }
+}
+
+/// 诊断行同时服务列表上方横幅与信息页：文件、原因、建议必须一起出现。
+private struct ScanDiagnosticRow: View {
+    let diagnostic: ScanDiagnostic
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: iconName)
+                .foregroundStyle(iconColor)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(diagnostic.message)
+                    .font(.caption)
+                if let remediation = diagnostic.remediation, !remediation.isEmpty {
+                    Text("建议：\(remediation)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text(diagnostic.file.path)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            Spacer()
+            Button("显示") {
+                NSWorkspace.shared.activateFileViewerSelecting([diagnostic.file])
+            }
+            .buttonStyle(.link)
+            .font(.caption)
+        }
+    }
+
+    private var iconName: String {
+        switch diagnostic.severity {
+        case .error: return "xmark.octagon.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .info: return "info.circle.fill"
+        }
+    }
+
+    private var iconColor: Color {
+        switch diagnostic.severity {
+        case .error: return .red
+        case .warning: return .yellow
+        case .info: return .gray
+        }
+    }
+}
+
+private func scanDiagnosticSummary(_ diagnostics: [ScanDiagnostic]) -> String {
+    let errors = diagnostics.filter { $0.severity == .error }.count
+    let warnings = diagnostics.filter { $0.severity == .warning }.count
+    let infos = diagnostics.filter { $0.severity == .info }.count
+    var parts = ["\(diagnostics.count) 条"]
+    if errors > 0 { parts.append("错误 \(errors)") }
+    if warnings > 0 { parts.append("警告 \(warnings)") }
+    if infos > 0 { parts.append("提示 \(infos)") }
+    return parts.joined(separator: " · ")
 }
 
 struct ProjectSummaryView: View {
@@ -504,6 +610,8 @@ struct ProjectSummaryView: View {
 
 struct ConfigurationRow: View {
     let config: RunConfiguration
+    /// Core 计算的真实可运行性（含构建系统与 Before Launch），界面不再自行判断。
+    let readiness: Readiness
     let runtimeState: ProcessState?
     /// 运行中探测到的监听端口；显示在状态文字左侧。
     var ports: [Int] = []
@@ -586,7 +694,7 @@ struct ConfigurationRow: View {
         if let runtimeState {
             return runtimeState.displayText
         }
-        switch config.readiness {
+        switch readiness {
         case .ready: return "READY"
         case .warning: return "WARNING"
         case .planned: return "PLANNED"
@@ -605,7 +713,7 @@ struct ConfigurationRow: View {
             case .exited, .cancelled: return .secondary
             }
         }
-        switch config.readiness {
+        switch readiness {
         case .ready: return .green
         case .warning: return .orange
         case .planned: return .blue
@@ -882,6 +990,33 @@ struct ConfigurationDetailView: View {
             VStack(alignment: .leading, spacing: 18) {
                 if let model = store.displaySession(projectID: project.id, configKey: config.uniqueKey) {
                     runtimeBanner(model: model)
+                }
+
+                let capability = store.capability(for: config, projectID: project.id)
+                if !capability.issues.isEmpty {
+                    section("可运行性 · \(capability.readiness.rawValue.uppercased())") {
+                        ForEach(Array(capability.issues.enumerated()), id: \.offset) { _, issue in
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: issue.kind == .blocking
+                                    ? "xmark.octagon.fill"
+                                    : "exclamationmark.triangle.fill")
+                                    .foregroundStyle(issue.kind == .blocking ? .red : .yellow)
+                                Text(issue.message)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        if !capability.missingFields.isEmpty {
+                            keyRow("缺失字段", capability.missingFields.joined(separator: "、"))
+                        }
+                    }
+                }
+
+                if !result.diagnostics.isEmpty {
+                    section("扫描诊断 · \(scanDiagnosticSummary(result.diagnostics))") {
+                        ForEach(result.diagnostics) { diagnostic in
+                            ScanDiagnosticRow(diagnostic: diagnostic)
+                        }
+                    }
                 }
 
                 section("运行信息") {

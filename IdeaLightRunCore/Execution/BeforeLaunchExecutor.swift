@@ -104,9 +104,20 @@ public struct BeforeLaunchExecutor: Sendable {
         from sourceName: String
     ) throws -> RunConfiguration {
         let sameName = configurations.filter { $0.name == name }
-        if let type, !type.isEmpty,
-           let typed = sameName.first(where: { $0.type.ideaTypeRaw == type }) {
-            return typed
+        if let type, !type.isEmpty {
+            if let typed = sameName.first(where: { $0.type.ideaTypeRaw == type }) {
+                return typed
+            }
+            if sameName.isEmpty {
+                throw IdeaLightRunError.referencedConfigurationNotFound(
+                    detail: "配置 “\(sourceName)” 的 Before Launch 引用了 “\(name)”，但当前项目里没有这个运行配置。"
+                )
+            }
+            // 同名不同类型时不允许任选一个：那会把用户的构建任务换成另一套语义。
+            throw IdeaLightRunError.referencedConfigurationNotFound(
+                detail: "配置 “\(sourceName)” 的 Before Launch 引用了 “\(name)”（类型 \(type)），"
+                    + "项目里存在同名配置但类型不匹配。请检查 IDEA 中的引用。"
+            )
         }
         guard let found = sameName.first else {
             throw IdeaLightRunError.referencedConfigurationNotFound(

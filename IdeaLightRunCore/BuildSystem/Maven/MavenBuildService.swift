@@ -100,12 +100,22 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
     public func runTasks(
         _ tasks: [String],
         pomFile: String?,
+        moduleDirectory: URL,
         handle: ProcessHandle?,
         log: @escaping LogCallback
     ) throws {
         var base = tasks
         if let pomFile, !pomFile.isEmpty {
-            let resolved = Self.resolvePomPath(pomFile, projectRoot: projectRoot)
+            let resolution = Self.resolvePomPath(
+                pomFile,
+                projectRoot: projectRoot,
+                moduleDirectory: moduleDirectory,
+                environment: environment
+            )
+            for warning in resolution.warnings {
+                log(LogLine(stream: .system, text: "[IdeaLightRun] 警告（\(warning.title)）：\(warning.detail)"))
+            }
+            let resolved = resolution.value
             guard FileManager.default.fileExists(atPath: resolved) else {
                 throw IdeaLightRunError.invalidConfiguration(
                     detail: "Before Launch 的 Maven 任务指向的 pom 不存在：\(resolved)（原始值：\(pomFile)）"
@@ -121,15 +131,23 @@ public struct MavenBuildService: BuildSystemAdapter, Sendable {
         }
     }
 
-    /// IDEA 的 `file` 属性可以是 `$PROJECT_DIR$/$MODULE_DIR$` 宏、绝对路径或相对项目根的路径。
-    /// 适配器不知道 module 目录，`$MODULE_DIR$` 退化为项目根（Before Launch 的 Maven 任务
-    /// 实际都保存 `$PROJECT_DIR$` 或相对路径）。
-    static func resolvePomPath(_ raw: String, projectRoot: URL) -> String {
-        var path = raw
-            .replacingOccurrences(of: "$PROJECT_DIR$", with: projectRoot.path)
-            .replacingOccurrences(of: "$MODULE_DIR$", with: projectRoot.path)
-        if path.hasPrefix("/") { return path }
-        return projectRoot.appendingPathComponent(path).path
+    /// IDEA 的 `file` 属性可以是 `$PROJECT_DIR$/$MODULE_DIR$` 等宏、环境变量、绝对路径
+    /// 或相对项目根的路径。`$MODULE_DIR$` 指当前运行配置的模块目录，不是项目根。
+    static func resolvePomPath(
+        _ raw: String,
+        projectRoot: URL,
+        moduleDirectory: URL?,
+        environment: [String: String] = [:]
+    ) -> MacroResolution {
+        var resolution = MacroResolver(
+            projectDir: projectRoot,
+            moduleDir: moduleDirectory,
+            environment: environment
+        ).resolve(raw)
+        if !resolution.value.hasPrefix("/") {
+            resolution.value = projectRoot.appendingPathComponent(resolution.value).path
+        }
+        return resolution
     }
 
     public func hasFreshClasspathCache(for target: BuildTarget) -> Bool {

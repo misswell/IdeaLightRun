@@ -84,9 +84,18 @@ final class AppStore: ObservableObject {
         return models.first { !$0.state.isTerminal } ?? models.first
     }
 
+    /// 配置可运行性统一由 Core 计算（类型 + 构建系统 + 字段 + Before Launch），
+    /// GUI 只消费结果，不再自己按类型判断。
+    func capability(for config: RunConfiguration, projectID: String) -> ConfigurationCapability {
+        guard let result = projects.first(where: { $0.id == projectID })?.result else {
+            return ConfigurationCapabilityResolver.resolve(config)
+        }
+        return ConfigurationCapabilityResolver.resolve(config, scan: result)
+    }
+
     /// 能否再启动一个实例：不并行运行的配置同一时刻只允许一个活跃实例（§P0-6）。
     func canLaunch(projectID: String, config: RunConfiguration) -> Bool {
-        guard config.type.supportLevel == .supported else { return false }
+        guard capability(for: config, projectID: projectID).isLaunchable else { return false }
         return config.allowParallelRun || activeSessions(projectID: projectID, configKey: config.uniqueKey).isEmpty
     }
 

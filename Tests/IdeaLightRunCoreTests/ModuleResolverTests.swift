@@ -90,4 +90,36 @@ final class ModuleResolverTests: XCTestCase {
         )
         XCTAssertEqual(url?.path, "/Users/t/My Project/gateway/gateway.iml")
     }
+
+    /// IML 路径与运行配置走同一个 MacroResolver：$MODULE_DIR$ 必须以模块目录为准，
+    /// 百分号编码在宏展开之后解码。
+    func testIdeaFileURLResolutionUsesUnifiedModuleMacros() {
+        let projectRoot = URL(fileURLWithPath: "/Users/t/My Project", isDirectory: true)
+        let moduleDir = projectRoot.appendingPathComponent("gateway", isDirectory: true)
+
+        let moduleURL = ModuleResolver.resolveIdeaFileURL(
+            "file://$MODULE_DIR$/gateway.iml",
+            projectRoot: projectRoot,
+            moduleDir: moduleDir
+        )
+        XCTAssertEqual(moduleURL?.path, "/Users/t/My Project/gateway/gateway.iml")
+
+        let encoded = ModuleResolver.resolveIdeaFileURL(
+            "file://$PROJECT_DIR$/My%20Library/app.iml",
+            projectRoot: projectRoot,
+            moduleDir: moduleDir
+        )
+        XCTAssertEqual(encoded?.path, "/Users/t/My Project/My Library/app.iml")
+    }
+
+    func testIdeaFileURLResolutionExpandsEnvironmentVariables() {
+        let projectRoot = URL(fileURLWithPath: "/Users/t/demo", isDirectory: true)
+        let url = ModuleResolver.resolveIdeaFileURL(
+            "file://${SHARED_ROOT}/libs/demo.iml",
+            projectRoot: projectRoot,
+            moduleDir: projectRoot,
+            environment: ["SHARED_ROOT": "/opt/team"]
+        )
+        XCTAssertEqual(url?.path, "/opt/team/libs/demo.iml")
+    }
 }

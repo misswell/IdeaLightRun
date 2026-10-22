@@ -13,14 +13,28 @@ public struct ProjectToolchain: Sendable {
     public static func resolve(
         projectRoot: URL,
         result: ScanResult,
+        config: RunConfiguration? = nil,
         configJDKName: String? = nil,
         context: String,
         log: @escaping LogCallback
     ) throws -> ProjectToolchain {
-        // §15: 构建系统（当前 Maven；Gradle 在 Milestone 4）
-        guard let detection = result.buildSystem.maven else {
+        // §15/§P0-2: Maven 与 Gradle 同时存在时不得靠调用顺序决定；
+        // 选择规则收敛在 BuildSystemSelector，Maven 运行配置不会落到 Gradle。
+        let selection = BuildSystemSelector.select(
+            config: config,
+            detection: result.buildSystem,
+            modules: result.modules
+        )
+        if selection.isAmbiguous {
+            log(LogLine(stream: .system, text: "[IdeaLightRun] 警告：\(selection.reason)"))
+        }
+        guard let kind = selection.kind else {
+            throw IdeaLightRunError.buildToolNotFound(detail: selection.reason)
+        }
+        guard kind == .maven, let detection = result.buildSystem.maven else {
             throw IdeaLightRunError.buildToolNotFound(
-                detail: "当前版本仅支持 Maven 项目直接\(context)；Gradle 支持在 Milestone 4 提供。"
+                detail: "当前版本仅支持 Maven 项目直接\(context)；"
+                    + "检测到 Gradle 构建，Gradle 支持将在 Milestone 4 提供。"
             )
         }
 

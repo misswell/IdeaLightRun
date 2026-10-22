@@ -130,6 +130,15 @@ struct IdeaLightRunCLI {
         if result.ignoredDuplicateCount > 0 {
             print("已按来源优先级去重，忽略 \(result.ignoredDuplicateCount) 个重复配置")
         }
+        if !result.diagnostics.isEmpty {
+            print("扫描诊断（\(result.diagnostics.count)）：")
+            for diagnostic in result.diagnostics {
+                print("  [\(diagnostic.severity.rawValue.uppercased())] \(diagnostic.file.path)：\(diagnostic.message)")
+                if let remediation = diagnostic.remediation, !remediation.isEmpty {
+                    print("      建议：\(remediation)")
+                }
+            }
+        }
         print("")
 
         let jdkResolution = JDKResolver().resolve(
@@ -140,7 +149,11 @@ struct IdeaLightRunCLI {
         print("Run Configurations (\(result.configurations.count)):")
         print("")
         for config in result.configurations {
-            print("  [\(statusLabel(for: config))] \(config.name) · \(config.type.displayName)")
+            let capability = ConfigurationCapabilityResolver.resolve(config, scan: result)
+            print("  [\(statusLabel(for: capability.readiness))] \(config.name) · \(config.type.displayName)")
+            if let reason = capability.primaryReason {
+                print("      Reason:   \(reason)")
+            }
             if let mainClass = config.mainClass {
                 print("      Main:     \(mainClass)")
             }
@@ -207,8 +220,8 @@ struct IdeaLightRunCLI {
         }
     }
 
-    static func statusLabel(for config: RunConfiguration) -> String {
-        switch config.readiness {
+    static func statusLabel(for readiness: Readiness) -> String {
+        switch readiness {
         case .ready: return "READY"
         case .warning: return "WARNING"
         case .planned: return "PLANNED"

@@ -3,7 +3,8 @@ import XCTest
 
 /// §8/§22/§23: `ExecutionCoordinator` 是 GUI 与 CLI 唯一的启动入口，
 /// 「这个配置能不能跑」也只在这里判断。界面侧不许复制一份 `if SpringBoot`，
-/// 所以门禁必须排在扫盘、定位 Maven、解析 JDK 之前，并且与 `supportLevel` 同源。
+/// 所以门禁必须排在扫盘、定位 Maven、解析 JDK 之前，并且与
+/// `ConfigurationCapabilityResolver` 同源。
 final class ExecutionCoordinatorTests: XCTestCase {
     private func config(_ type: RunConfigurationType, name: String = "SomeConfig") -> RunConfiguration {
         RunConfiguration(
@@ -47,15 +48,16 @@ final class ExecutionCoordinatorTests: XCTestCase {
         }
     }
 
-    /// 门禁与界面徽标同源：`supportLevel == .supported` 的集合与放行的集合一致，
+    /// 门禁与界面徽标同源：Core 计算出的 `isLaunchable` 与放行的集合一致，
     /// 不会出现「行内说 Ready、点了被拦」或反之。
-    func testGateAgreesWithSupportLevelBadge() {
+    func testGateAgreesWithCapabilityBadge() {
         let all: [RunConfigurationType] = [
             .application, .springBoot, .jar, .maven, .gradle, .compound, .junit, .unknown("X"),
         ]
         for type in all {
             let passes = (try? ExecutionCoordinator.ensureRunnable(config(type))) != nil
-            XCTAssertEqual(passes, type.supportLevel == .supported, "\(type)")
+            let capability = ConfigurationCapabilityResolver.resolve(config(type))
+            XCTAssertEqual(passes, capability.isLaunchable, "\(type)")
         }
     }
 

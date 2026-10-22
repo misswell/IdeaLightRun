@@ -291,6 +291,22 @@ final class BeforeLaunchTests: XCTestCase {
         XCTAssertEqual(byName.type, .application, "没有 type 时按名字兜底取第一个")
     }
 
+    /// 有 type 但同名配置类型全不匹配时，不允许"取第一个"——那会把用户的构建任务
+    /// 静默换成另一套语义。
+    func testTypeMismatchIsRejectedInsteadOfPickingFirst() {
+        let app = config("Same", tasks: [], type: .application)
+        XCTAssertThrowsError(
+            try BeforeLaunchExecutor.resolveReference(
+                name: "Same", type: "JUnit", in: [app], from: "X"
+            )
+        ) { error in
+            guard case IdeaLightRunError.referencedConfigurationNotFound(let detail) = error else {
+                return XCTFail("实际：\(error)")
+            }
+            XCTAssertTrue(detail.contains("类型"), detail)
+        }
+    }
+
     /// §3.7: A → B → A 不能递归跑下去，要报出完整环。
     func testCycleIsReportedWithChain() async throws {
         let recorder = Recorder()
@@ -333,6 +349,37 @@ final class BeforeLaunchTests: XCTestCase {
         XCTAssertEqual(recorder.calls, [])
     }
 
+    /// Stop 落在两个任务之间：第一个任务照常收尾，后续任务一个都不能跑。
+    func testStopAfterFirstTaskSkipsTheRemainder() async throws {
+        let recorder = Recorder()
+        let handle = ProcessHandle()
+        let cancelling = BeforeLaunchExecutor.Actions(
+            build: {
+                recorder.record("build")
+                handle.terminate()
+            },
+            buildProject: { recorder.record("buildProject") },
+            runMavenGoals: { _, _ in recorder.record("maven") },
+            runReferenced: { _, _ in recorder.record("referenced") }
+        )
+        do {
+            try await BeforeLaunchExecutor().run(
+                for: config("S", tasks: [
+                    BeforeLaunchTask(kind: .build, isEnabled: true),
+                    BeforeLaunchTask(kind: .buildProject, isEnabled: true),
+                ]),
+                configurations: [],
+                actions: cancelling,
+                handle: handle,
+                log: silence
+            )
+            XCTFail("取消后不能再跑后续任务")
+        } catch let error as IdeaLightRunError {
+            guard case .launchCancelled = error else { return XCTFail("实际：\(error)") }
+        }
+        XCTAssertEqual(recorder.calls, ["build"])
+    }
+
     // MARK: - §30 XML → 任务
 
     func testMapperRecognisesBeforeLaunchVariants() throws {
@@ -373,34 +420,88 @@ final class BeforeLaunchTests: XCTestCase {
         )
     }
 
-    /// §P0-9: runTasks 把 `file` 映射成 `-f`，宏与相对路径都以项目根展开。
+    /// §P0-9: runTasks 把 `file` 映射成 `-f`；`$MODULE_DIR$` 必须落到当前模块，
+    /// 其余宏/相对路径按项目根展开。
     func testResolvePomPathVariants() {
         let root = URL(fileURLWithPath: "/work/demo")
+        let module = URL(fileURLWithPath: "/work/demo/user-service")
         XCTAssertEqual(
-            MavenBuildService.resolvePomPath("$PROJECT_DIR$/sub/pom.xml", projectRoot: root),
+            MavenBuildService.resolvePomPath(
+                "$PROJECT_DIR$/sub/pom.xml", projectRoot: root, moduleDirectory: module
+            ).value,
             "/work/demo/sub/pom.xml"
         )
         XCTAssertEqual(
-            MavenBuildService.resolvePomPath("submodule/pom.xml", projectRoot: root),
+            MavenBuildService.resolvePomPath(
+                "$MODULE_DIR$/pom.xml", projectRoot: root, moduleDirectory: module
+            ).value,
+            "/work/demo/user-service/pom.xml",
+            "$MODULE_DIR$ 指运行配置的模块目录，不是项目根"
+        )
+        XCTAssertEqual(
+            MavenBuildService.resolvePomPath(
+                "$MODULE_WORKING_DIR$/pom.xml", projectRoot: root, moduleDirectory: module
+            ).value,
+            "/work/demo/user-service/pom.xml",
+            "$MODULE_WORKING_DIR$ 同样必须落到模块目录"
+        )
+        XCTAssertEqual(
+            MavenBuildService.resolvePomPath(
+                "$PROJECT_DIR$/my service/pom.xml", projectRoot: root, moduleDirectory: module
+            ).value,
+            "/work/demo/my service/pom.xml",
+            "路径里的空格不能被拆开或转义"
+        )
+        XCTAssertEqual(
+            MavenBuildService.resolvePomPath(
+                "submodule/pom.xml", projectRoot: root, moduleDirectory: module
+            ).value,
             "/work/demo/submodule/pom.xml",
             "相对路径按项目根展开"
         )
         XCTAssertEqual(
-            MavenBuildService.resolvePomPath("/abs/pom.xml", projectRoot: root),
+            MavenBuildService.resolvePomPath(
+                "/abs/pom.xml", projectRoot: root, moduleDirectory: module
+            ).value,
             "/abs/pom.xml"
         )
+        XCTAssertEqual(
+            MavenBuildService.resolvePomPath(
+                "${MAVEN_POM_DIR}/pom.xml",
+                projectRoot: root,
+                moduleDirectory: module,
+                environment: ["MAVEN_POM_DIR": "/work/external"]
+            ).value,
+            "/work/external/pom.xml"
+        )
+
+        let unknown = MavenBuildService.resolvePomPath(
+            "$PROJECT_DIR$/$UNKNOWN$/pom.xml",
+            projectRoot: root,
+            moduleDirectory: module,
+            environment: [:]
+        )
+        XCTAssertEqual(unknown.value, "/work/demo/$UNKNOWN$/pom.xml", "未知宏保留原文，不能猜值")
+        XCTAssertTrue(unknown.warnings.contains(.unresolvedMacro(token: "$UNKNOWN$", rawValue: "$PROJECT_DIR$/$UNKNOWN$/pom.xml")))
     }
 
     /// §P0-9: 任务指向的 pom 不存在时必须报错，不能悄悄回退到项目根。
     func testRunTasksRejectsMissingPomFile() throws {
+        let root = URL(fileURLWithPath: "/tmp/lr-p0-9-\(UUID().uuidString)")
         let service = MavenBuildService(
-            projectRoot: URL(fileURLWithPath: "/tmp/lr-p0-9-\(UUID().uuidString)"),
-            rootPomURL: URL(fileURLWithPath: "/tmp/lr-p0-9-\(UUID().uuidString)/pom.xml"),
+            projectRoot: root,
+            rootPomURL: root.appendingPathComponent("pom.xml"),
             mavenExecutable: URL(fileURLWithPath: "/tmp/does-not-matter"),
             environment: [:]
         )
         do {
-            try service.runTasks(["clean"], pomFile: "$PROJECT_DIR$/ghost/pom.xml", handle: nil, log: { _ in })
+            try service.runTasks(
+                ["clean"],
+                pomFile: "$PROJECT_DIR$/ghost/pom.xml",
+                moduleDirectory: root,
+                handle: nil,
+                log: { _ in }
+            )
             XCTFail("pom 不存在必须报错")
         } catch let error as IdeaLightRunError {
             guard case .invalidConfiguration(let detail) = error else { return XCTFail("实际：\(error)") }

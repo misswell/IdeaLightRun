@@ -2,12 +2,6 @@ import Foundation
 
 // §8: 所有 IDEA XML 最终转为统一模型，UI 只面对该模型。
 
-public enum SupportLevel: String, Codable, Sendable {
-    case supported
-    case planned
-    case unsupported
-}
-
 public enum Readiness: String, Codable, Sendable {
     case ready
     case warning
@@ -73,18 +67,8 @@ public enum RunConfigurationType: Equatable, Hashable, Codable, Sendable {
         }
     }
 
-    /// §79: 只区分 Ready / Warning / Unsupported，不做兼容性分数。
-    public var supportLevel: SupportLevel {
-        switch self {
-        case .application, .springBoot:
-            return .supported
-        case .compound, .jar, .maven, .gradle:
-            return .planned
-        case .junit, .unknown:
-            return .unsupported
-        }
-    }
-
+    /// 类型本身只负责识别、显示与排序；能否启动由
+    /// `ConfigurationCapabilityResolver` 结合项目实际计算（§P0-5）。
     public var sortRank: Int {
         switch self {
         case .springBoot: return 0
@@ -293,14 +277,9 @@ public struct RunConfiguration: Identifiable, Equatable, Codable, Sendable {
 }
 
 extension RunConfiguration {
+    /// 没有项目上下文时的类型/字段级结论。界面与门禁需要项目感知的结果时，
+    /// 必须调用 `ConfigurationCapabilityResolver.resolve(_:scan:)`。
     public var readiness: Readiness {
-        switch type.supportLevel {
-        case .unsupported:
-            return .unsupported
-        case .planned:
-            return .planned
-        case .supported:
-            return warnings.isEmpty ? .ready : .warning
-        }
+        ConfigurationCapabilityResolver.resolve(self).readiness
     }
 }

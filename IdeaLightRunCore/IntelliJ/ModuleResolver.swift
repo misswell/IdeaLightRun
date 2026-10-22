@@ -59,9 +59,18 @@ public enum ModuleResolver {
                     .split(separator: ":")
                     .map(String.init)
                 guard let name = components.last, !name.isEmpty else { continue }
-                var directory = projectRoot
-                for component in components {
-                    directory = directory.appendingPathComponent(component, isDirectory: true)
+                let directory: URL
+                if let mapped = info.projectDirectories[gradlePath], !mapped.isEmpty {
+                    // settings.gradle 里显式映射的目录优先于按 project path 拼接
+                    directory = mapped.hasPrefix("/")
+                        ? URL(fileURLWithPath: mapped, isDirectory: true)
+                        : projectRoot.appendingPathComponent(mapped, isDirectory: true)
+                } else {
+                    var derived = projectRoot
+                    for component in components {
+                        derived = derived.appendingPathComponent(component, isDirectory: true)
+                    }
+                    directory = derived
                 }
                 add(ProjectModule(name: name, directory: directory, gradlePath: gradlePath))
             }
@@ -241,17 +250,25 @@ public enum ModuleResolver {
     }
 
     /// 形如 "file://$PROJECT_DIR$/gateway.iml" → 实际 URL。宏展开后再做百分号解码。
-    static func resolveIdeaFileURL(_ raw: String, projectRoot: URL, moduleDir: URL) -> URL? {
+    static func resolveIdeaFileURL(
+        _ raw: String,
+        projectRoot: URL,
+        moduleDir: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
         var string = raw
         let hasFileScheme = string.hasPrefix("file://")
         if hasFileScheme {
             string = String(string.dropFirst("file://".count))
         }
 
-        string = string
-            .replacingOccurrences(of: "$MODULE_DIR$", with: moduleDir.path)
-            .replacingOccurrences(of: "$PROJECT_DIR$", with: projectRoot.path)
-            .replacingOccurrences(of: "$MODULE_WORKING_DIR$", with: moduleDir.path)
+        // §11: IML/modules.xml 里的路径与运行配置共用同一套宏解析，
+        // 否则两处对同一个 $MODULE_DIR$ 会给出不同结果。
+        string = MacroResolver(
+            projectDir: projectRoot,
+            moduleDir: moduleDir,
+            environment: environment
+        ).resolve(string).value
 
         if hasFileScheme || string.hasPrefix("/") {
             if !string.hasPrefix("/") {

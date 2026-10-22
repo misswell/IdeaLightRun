@@ -88,6 +88,28 @@ final class ProcessTreeTests: XCTestCase {
         XCTAssertEqual(process.terminationStatus, Int32(SIGTERM))
     }
 
+    /// §P0-3/§5.5: attach 发现已取消时也要走 SIGTERM→SIGKILL 升级，
+    /// 不能只发一次 SIGTERM 就把忽略该信号的构建进程留在"停止中"。
+    func testProcessHandleCancelBeforeAttachEscalatesToSIGKILL() throws {
+        let handle = ProcessHandle()
+        handle.terminate()
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", "trap '' TERM; sleep 60"]
+        try process.run()
+        // 等 trap 生效再挂句柄，确保 SIGTERM 真的被忽略
+        Thread.sleep(forTimeInterval: 0.2)
+        handle.attach(process)
+
+        let deadline = Date().addingTimeInterval(6)
+        while process.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        XCTAssertFalse(process.isRunning, "忽略 SIGTERM 的进程必须在升级后被杀掉")
+        XCTAssertEqual(process.terminationStatus, Int32(SIGKILL))
+    }
+
     /// ProcessTree.allPIDs 对不存在/已退出的 root 应返回空，不得误伤无关进程。
     func testAllPIDsOfInvalidRootIsEmpty() {
         XCTAssertEqual(ProcessTree.allPIDs(root: -1), [])

@@ -24,6 +24,8 @@ public final class ProcessHandle: @unchecked Sendable {
 
     /// §P0-3: attach 必须尊重此前已发生的 cancel——取消先到、进程后挂上时，
     /// 拿到进程的第一时间就终止它，不能让"已取消"的构建继续跑完。
+    /// 终止走与正常 Stop 相同的 SIGTERM→SIGKILL 升级流程：构建进程忽略 SIGTERM 时
+    /// 不能永远停在"停止中"。
     func attach(_ process: Process) {
         lock.lock()
         self.process = process
@@ -31,7 +33,7 @@ public final class ProcessHandle: @unchecked Sendable {
         lock.unlock()
 
         if shouldTerminate {
-            ProcessTree.signal(root: process.processIdentifier, sig: SIGTERM)
+            ProcessTree.terminate(root: process.processIdentifier, escalationSeconds: 3)
         }
     }
 

@@ -17,10 +17,10 @@
 
 ## 快速上手
 
-1. 左侧栏 **添加项目**（或把项目文件夹直接拖进侧栏）。目录需包含 `.idea`、`pom.xml` 或 `build.gradle(.kts)` 之一，否则弹窗拒绝
+1. 左侧栏 **添加项目**（或把项目文件夹直接拖进侧栏）。目录需包含 `.idea`、`pom.xml`、`settings.gradle(.kts)` 或 `build.gradle(.kts)` 之一，否则弹窗拒绝
 2. 项目下自动列出 IDEA 里已有的 Run Configuration，无需再配一遍：Main Class、Module、JDK、VM Options、Program Arguments、Spring Profiles、环境变量、Working Directory 都从 IDEA 配置读，可在「信息」页签核对
-3. 选中一条 → **Run**（⌘R），界面自动切到「控制台」。它会先编译再启动，状态依次显示「解析依赖中 → 编译中 → 启动中 → 运行中」
-4. **Stop**（⌘.）发 SIGTERM；进入「停止中」后出现 **Force Kill**（SIGKILL）。**Restart**（⇧⌘R）= 停掉旧进程后重新编译启动
+3. 选中一条 → **Run**（⌘R），界面自动切到「控制台」。Run 按该配置的 Before Launch 执行构建：IDEA 里勾了 Make / Build Project 才会先编译，勾了 "Do not build before run" 则直接启动。状态依次显示「解析依赖中 → 编译中（如有）→ 启动中 → 运行中」
+4. **Stop**（⌘.）发 SIGTERM；进入「停止中」后出现 **Force Kill**（SIGKILL）。**Restart**（⇧⌘R）= 停掉旧进程后按同一配置重新准备并启动
 5. 退出应用时若仍有任务在跑，会先弹窗确认：**停止并退出**（默认；先 SIGTERM，最多等 2 秒再强杀，§66）、**强制结束**（直接 SIGKILL）或**取消**留在应用。没有任务在跑时直接退出，不打扰；在线更新安装前的自动退出也不二次确认（更新面板里已说明会停掉服务）。
 
 ## 界面
@@ -28,16 +28,16 @@
 | 区域 | 内容 |
 | --- | --- |
 | 左栏「项目」 | 项目列表（`扫描中…` / `N 个配置` / `扫描失败` / `待扫描`）、底部 **添加项目**；右键菜单可构建 / 重新构建 / 清理 / 重新扫描 / 移除。有活动时文件夹图标换成状态点：**绿**=有服务运行中、**黄**=正在编译或启动、**红**=最近一次运行失败（悬停看说明；无活动显示文件夹图标） |
-| 中栏 | 配置列表，顶栏为重新扫描 / 打开（图标即动作：默认访达图标，点击直接用访达打开项目目录；从下拉换成其他应用后图标跟着换成该应用并记住，下次点击直接用它打开。下拉列表固定顺序：访达、VS Code、Cursor、Zed、Default app、Terminal、iTerm2、Ghostty、Xcode、IntelliJ IDEA——未安装的置灰，Default app 即用系统默认处理者，访达始终在列表首位）/ 移除；上方摘要条显示构建系统、JDK、模块数、当前 git 分支与三个构建动作 |
+| 中栏 | 配置列表，顶栏为重新扫描 / 打开（图标即动作：默认访达图标，点击直接用访达打开项目目录；从下拉换成其他应用后图标跟着换成该应用并记住，下次点击直接用它打开。下拉列表固定顺序：访达、VS Code、Cursor、Zed、Default app、Terminal、iTerm2、Ghostty、Xcode、IntelliJ IDEA——未安装的置灰，Default app 即用系统默认处理者，访达始终在列表首位）/ 移除；上方摘要条显示构建系统、JDK、模块数、当前 git 分支与三个构建动作。扫描中读不了的文件、损坏的 XML 会在列表上方显示诊断条（数量 + 严重程度，展开可查看文件路径并在访达中定位），不再静默丢配置 |
 
 顶栏垃圾桶（以及侧栏右键菜单的「移除」）都会先弹二次确认，说明「只移除记录、不删磁盘文件」；该项目若有服务在跑，还会提示有几个会被一并停止。确认前不会动任何东西。
 | 右栏 | **信息 / 控制台 / 构建** 三个页签；顶栏分两行——第一行是当前配置名与类型，第二行是 `Run` `Stop` `Force Kill` `Restart` 与页签切换 |
 
-配置行右侧的标记：`READY` 可启动、`WARNING` 可启动但有警告、`PLANNED` 已识别但本版本不接管、`UNSUPPORTED` 不接管（§78）。运行状态依次为：准备中 / 解析依赖中 / 编译中 / 启动中 / 运行中 / 停止中 / 已退出 (N) / 已停止 / 失败。运行中探测到监听端口时，状态文字左侧会显示 `:8080 :8081` 这样的端口列表（每 3 秒刷新，进程退出即清空），悬停看完整列表。
+配置行右侧的标记：`READY` 可启动、`WARNING` 可启动但有警告、`PLANNED` 已识别但本版本不接管、`UNSUPPORTED` 不接管（§78）。标记由 Core 统一计算（类型、项目构建系统、缺失字段、Before Launch 任务都会影响结果），GUI 与 CLI 不各自判断。运行状态依次为：准备中 / 解析依赖中 / 编译中 / 启动中 / 运行中 / 停止中 / 已退出 (N) / 已停止 / 失败。运行中探测到监听端口时，状态文字左侧会显示 `:8080 :8081` 这样的端口列表（每 3 秒刷新，进程退出即清空），悬停看完整列表。
 
 中栏被压窄时按优先级让位：状态文字与端口永远完整显示（与配置名同级，不参与压缩；端口最多占 140pt，超长部分省略号收尾），配置名其次保留，副标题最先被省略；三者都能悬停看全称。此前端口优先级排在副标题之后，Spring Boot 的全限定类名普遍超宽，端口每轮布局都被压成零宽——表现为「明明在运行却看不到端口」。
 
-运行中的服务会自动探测本机监听端口：只读本机 `lsof`，每 3 秒一次，进程结束后即停（不涉网，§64 不受影响）。信息页运行横幅显示「端口 …」，首次探测到端口或端口集合变化时，控制台也会记录一条灰色系统消息。
+运行中的服务会自动探测本机监听端口：只读本机 `lsof`，每 3 秒一次，进程结束后即停（不涉网，§64 不受影响）。信息页运行横幅显示「端口 …」，首次探测到端口或端口集合变化时，控制台也会记录一条灰色系统消息；信息页同时列出可运行性问题与扫描诊断（数量、严重程度、文件、原因和建议处理方式）。
 
 快捷键：**Run ⌘R**、**Stop ⌘.**、**Restart ⇧⌘R**、**构建项目 ⌘F9**、**重新构建项目 ⇧⌘F9**。「清理项目 / 停止构建 / 强制结束构建」在顶部 **构建** 菜单里，没有快捷键。顶部 **构建** 菜单的项一律不置灰：非 Maven 项目点了会弹窗说明原因，构建进行中再点则被忽略（同项目串行，§42）；摘要条和项目右键菜单里的构建三项会直接置灰，悬停提示写明「仅支持 Maven 项目；Gradle 支持在 Milestone 4 提供」。
 
@@ -49,6 +49,8 @@
 | --- | --- |
 | `PLANNED` | Compound、JAR、Maven、Gradle 类型——认得出来，本版不接管启动 |
 | `UNSUPPORTED` | JUnit 与未知类型（未知字段保留在 `rawOptions` 里，不丢信息） |
+
+`READY` / `WARNING` 由 Core 按项目实际情况计算：缺 Main Class、启用了暂不支持的 Before Launch 任务、引用了不存在的配置都会阻止启动；模块缺失、宏无法解析等只产生警告。项目同时存在 `pom.xml` 与 Gradle 构建文件时，先看配置所属模块目录里的构建脚本；仍无法判断时固定使用 Maven 并显示 `WARNING`，不依赖偶然的判断顺序。
 
 两点容易踩：
 
@@ -79,7 +81,7 @@
 - git 走绝对路径枚举（`/usr/bin/git` 等），不依赖 GUI 的 PATH；凭据交给系统钥匙串 helper，GUI 内不弹终端提示（`GIT_TERMINAL_PROMPT=0`），进程卡住 120 秒兜底 SIGTERM。
 - 网络只在用户点「拉取」（或切换分支触发 git 联网）时发生（§64 精神：无后台自查、无定时器）；平时只读本地 `.git`。子进程全部 `Process.arguments` 数组传参（§27）。
 - 切换分支不停止运行中的服务——已在跑的 Java 进程仍用旧代码，需要重新 Run 才会用新分支的产物。
-- 清理之后 Run 仍正常：Run 的编译步骤带 `-pl -am`，会连带重新产出依赖模块的 `target/classes`（§92/§93）
+- 清理之后 Run 仍正常：若配置的 Before Launch 含 Make，编译步骤带 `-pl -am`，会连带重新产出依赖模块的 `target/classes`（§92/§93）；勾了 "Do not build before run" 的配置本来就不编译，清理后直接启动可能用到旧产物
 
 ## 日志与环境变量
 
@@ -139,7 +141,7 @@ swift run IdeaLightRunCLI scan /path/to/project --show-secrets  # 环境变量�
 IdeaLightRunCore/    核心库（GUI 与 CLI 共用，禁止另起一套启动逻辑）
   Domain/            RunConfiguration / JavaLaunchPlan / ProcessState / 统一错误模型
   IntelliJ/          ProjectScanner、RunConfiguration 解析（宽松 + alias）、MacroResolver、ModuleResolver
-  BuildSystem/       Maven 检测/编译/classpath 解析/缓存；ProjectToolchain + ProjectBuilder（启动与构建共用一条管线）；Gradle 检测（M4 实现）
+  BuildSystem/       Maven 检测/编译/classpath 解析/缓存；ProjectToolchain + ProjectBuilder（启动与构建共用一条管线）；Gradle 检测、settings/projectDir 映射与构建系统选择（构建与运行尚未接入）
   Java/              JDKResolver、LaunchPlanBuilder、JavaLauncher 流水线
   Process/           ProcessSession（进程生命周期 + 日志捕获）
   Logging/           LogRingBuffer（环形日志缓冲）
@@ -148,17 +150,20 @@ IdeaLightRunUpdate/  在线更新内核（版本比较、发布解析、镜像�
 IdeaLightRunUpdater/ 进程外安装助手（主 app 退出后替换 bundle 并重启，失败回滚）
 IdeaLightRunCLI/     开发期验证工具（scan / run / build / clean）
 IdeaLightRunApp/     SwiftUI GUI
-Tests/               单元 + Maven 多模块真实集成测试（共 138 用例）+ Fixtures
+Tests/               单元 + Maven 多模块真实集成测试（数量见文末「测试」）+ Fixtures
 ```
 
 ## 当前进度
 
-已完成：Core 解析与宏、Maven 编译与 classpath、启动流水线、进程与日志、GUI 三栏、Build/Rebuild/Clean、在线更新。
+已完成：Core 解析与宏、Maven 编译与 classpath、启动流水线、进程与日志、GUI 三栏、Build/Rebuild/Clean、运行端口检测、扫描诊断与统一配置能力计算、在线更新。
 
 待做：
 
-- **Milestone 4** — Gradle 构建与启动
-- **Milestone 5** — GUI 完整版（Compound 启动、Restart to Apply 提示、端口检测等 P1）
+- JAR Application 启动
+- Compound 多配置启动
+- Gradle 构建与运行
+- Maven 运行配置与 JUnit 测试运行
+- Before Launch 扩展（Build, no error check / Build Artifacts / Run External Tool / Launch Web Browser）与 Restart to Apply 提示
 
 ## 在线更新实现要点
 
@@ -189,14 +194,15 @@ Tests/               单元 + Maven 多模块真实集成测试（共 138 用例
 ## 测试
 
 ```bash
-swift test                                        # 本地全量：229 用例
-swift test --skip MavenClasspathIntegrationTests  # CI 集合：226 用例（跳过那 3 个要真实下载依赖的）
+swift test                                        # 本地全量：315 用例
+swift test --skip MavenClasspathIntegrationTests  # CI 集合：312 用例（跳过那 3 个要真实下载依赖的）
 ```
 
 覆盖范围：
 
-- **解析层** — RunConfigurationParser（alias / rawOptions / Before Launch）、WorkspaceParser（流式、只取 RunManager、跳过模板）、ProjectScanner（§7 来源优先级去重、§6 深度上限 4、忽略目录）、MacroResolver（§11 全部宏与 IDEA 上下文变量）、ModuleResolver（§13 五种方式）、JDKResolver（§23–25 优先级与 major version 模糊匹配）
+- **解析层** — RunConfigurationParser（alias / rawOptions / Before Launch）、WorkspaceParser（流式、只取 RunManager、跳过模板）、ProjectScanner（§7 来源优先级去重、§6 深度上限 4、忽略目录）、MacroResolver（§11 全部宏与 IDEA 上下文变量，运行配置与 IML 路径共用）、ModuleResolver（§13 五种方式）、JDKResolver（§23–25 优先级与 major version 模糊匹配）
 - **构建与启动** — LaunchPlanBuilder（§26–§29）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator（Dock 启动无 PATH 时的绝对路径枚举）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
+- **诊断与能力** — ScanDiagnostic（读失败 / XML 损坏 / 配置目录不可读 / 重复配置 / 缺 Main Class / 不支持的 Before Launch 任务都带严重程度与建议，不静默丢配置）、ConfigurationCapabilityResolver（类型 + 构建系统 + 字段 + Module 解析 + Before Launch 统一裁决）、BuildSystemSelector（Maven/Gradle 共存时的确定性选择）、Gradle settings/projectDir 解析、Maven `$MODULE_DIR$` POM 路径、ProcessHandle 启动前取消与 SIGTERM→SIGKILL 升级
 - **进程与日志** — ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、LogRingBuffer（§37 上限）
 - **在线更新** — 版本比较与 fail-closed、发布元数据解析（JSON 与 expanded_assets 两条路径）、镜像链顺序与回退/取消/坏文件删除、更新助手参数契约与重启路径、designated requirement 解析与语义判定，以及把产物名 / bundle id / Team / 助手落点钉到 `scripts/` 与 `release.yml` **原文**的防漂移断言
 

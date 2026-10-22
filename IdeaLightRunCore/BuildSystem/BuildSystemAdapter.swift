@@ -34,9 +34,12 @@ public protocol BuildSystemAdapter: Sendable {
 
     /// Before Launch 里配置的构建任务（Maven goal / Gradle task），原文逐项传递（§3.2）。
     /// `pomFile` 是任务保存的 `file` 属性（§P0-9）：对哪个 pom 执行；nil 表示项目根。
+    /// `moduleDirectory` 是当前运行配置解析出的模块目录，`$MODULE_DIR$` 必须按它展开，
+    /// 不能退化成项目根（§P0-9）。
     func runTasks(
         _ tasks: [String],
         pomFile: String?,
+        moduleDirectory: URL,
         handle: ProcessHandle?,
         log: @escaping LogCallback
     ) throws

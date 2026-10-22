@@ -13,11 +13,13 @@ public struct MavenDetection: Equatable, Codable, Sendable {
 
 public struct GradleDetection: Equatable, Codable, Sendable {
     public var settingsURL: URL?
-    public var buildFileURL: URL
+    /// 根级构建脚本。settings-only 项目（只有 settings.gradle(.kts)）没有根构建脚本，
+    /// 不能把不存在的路径当成已检测到的文件。
+    public var buildFileURL: URL?
     public var wrapperURL: URL?
     public var usesKotlinDSL: Bool
 
-    public init(settingsURL: URL?, buildFileURL: URL, wrapperURL: URL?, usesKotlinDSL: Bool) {
+    public init(settingsURL: URL?, buildFileURL: URL?, wrapperURL: URL?, usesKotlinDSL: Bool) {
         self.settingsURL = settingsURL
         self.buildFileURL = buildFileURL
         self.wrapperURL = wrapperURL
@@ -59,12 +61,15 @@ public enum BuildSystemDetector {
 
         let hasGroovySettings = fm.fileExists(atPath: groovySettings.path)
         let hasKotlinSettings = fm.fileExists(atPath: kotlinSettings.path)
-        let usesKotlin = hasKotlinSettings || fm.fileExists(atPath: kotlinBuild.path)
+        let hasGroovyBuild = fm.fileExists(atPath: groovyBuild.path)
+        let hasKotlinBuild = fm.fileExists(atPath: kotlinBuild.path)
+        let usesKotlin = hasKotlinSettings || hasKotlinBuild
         let hasSettings = hasGroovySettings || hasKotlinSettings
-        let hasBuild = fm.fileExists(atPath: groovyBuild.path) || fm.fileExists(atPath: kotlinBuild.path)
+        let hasBuild = hasGroovyBuild || hasKotlinBuild
 
         if hasSettings || hasBuild {
-            let buildFile = fm.fileExists(atPath: kotlinBuild.path) ? kotlinBuild : groovyBuild
+            // Kotlin DSL 项目优先取 .kts；只有 settings 时 buildFileURL 必须是 nil。
+            let buildFile: URL? = hasKotlinBuild ? kotlinBuild : (hasGroovyBuild ? groovyBuild : nil)
             let settings: URL? = hasKotlinSettings ? kotlinSettings : (hasGroovySettings ? groovySettings : nil)
             detection.gradle = GradleDetection(
                 settingsURL: settings,
@@ -77,11 +82,14 @@ public enum BuildSystemDetector {
         return detection
     }
 
-    /// §48: 项目根目录至少要有 .idea / pom.xml / build.gradle / build.gradle.kts 之一。
+    /// §48: 项目根目录至少要有 .idea / pom.xml / settings.gradle(.kts) / build.gradle(.kts) 之一。
+    /// 只有 settings.gradle(.kts) 的 Gradle 项目同样有效。
     public static func isValidProjectRoot(_ url: URL) -> Bool {
         let fm = FileManager.default
         if fm.fileExists(atPath: url.appendingPathComponent(".idea").path) { return true }
         if fm.fileExists(atPath: url.appendingPathComponent("pom.xml").path) { return true }
+        if fm.fileExists(atPath: url.appendingPathComponent("settings.gradle").path) { return true }
+        if fm.fileExists(atPath: url.appendingPathComponent("settings.gradle.kts").path) { return true }
         if fm.fileExists(atPath: url.appendingPathComponent("build.gradle").path) { return true }
         if fm.fileExists(atPath: url.appendingPathComponent("build.gradle.kts").path) { return true }
         return false

@@ -37,6 +37,32 @@ final class MacroResolverTests: XCTestCase {
         XCTAssertEqual(result.value, "/Users/tester/.m2/repository")
     }
 
+    /// 可稳定推导的固定宏：项目名、临时目录、用户名、主机名。
+    func testStableIDEFixedMacros() {
+        let resolver = makeResolver()
+        XCTAssertEqual(resolver.resolve("$PROJECT_NAME$").value, "demo")
+        XCTAssertEqual(
+            resolver.resolve("$TEMP_DIR$/x").value,
+            FileManager.default.temporaryDirectory.appendingPathComponent("x").path
+        )
+        XCTAssertEqual(resolver.resolve("$USER$").value, NSUserName())
+        XCTAssertEqual(resolver.resolve("$HOST$").value, ProcessInfo.processInfo.hostName)
+    }
+
+    /// 已知但依赖编辑器上下文的宏不能被同名环境变量顶替，否则配置会"看似成功、语义错误"。
+    func testIDEFixedMacrosNeverFallBackToEnvironment() {
+        let result = makeResolver(environment: [
+            "SelectedText": "leaked", "FilePath": "/tmp/leaked", "LineNumber": "42",
+        ]).resolve("$SelectedText$ $FilePath$ $LineNumber$")
+
+        XCTAssertEqual(result.value, "$SelectedText$ $FilePath$ $LineNumber$")
+        XCTAssertEqual(result.warnings.count, 3)
+        XCTAssertTrue(result.warnings.allSatisfy {
+            if case .ideaContextMacro = $0 { return true }
+            return false
+        })
+    }
+
     func testMissingModuleDirProducesWarning() {
         let result = makeResolver().resolve("$MODULE_DIR$/target")
         XCTAssertEqual(result.value, "$MODULE_DIR$/target")

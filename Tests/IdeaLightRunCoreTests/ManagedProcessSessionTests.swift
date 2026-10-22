@@ -53,6 +53,51 @@ final class ManagedProcessSessionTests: XCTestCase {
         }
     }
 
+    /// §P0-4: Stop 落在 start() 之前时，进程跑起来后立即终止；
+    /// 整个过程不得对外发布 .running——否则界面会闪一下"运行中"再退出。
+    func testStopBeforeStartNeverPublishesRunning() throws {
+        let session = try ManagedProcessSession(
+            configKey: "test", configName: "test",
+            plan: makePlan(executable: "/bin/sleep", arguments: ["100"])
+        )
+        var states: [ProcessState] = []
+        let lock = NSLock()
+        session.onState = { state in
+            lock.lock()
+            states.append(state)
+            lock.unlock()
+        }
+
+        session.stop()
+        session.start()
+        XCTAssertTrue(session.waitUntilExit(timeout: 10), "启动前的 Stop 必须在进程跑起来后生效")
+        lock.lock()
+        let observed = states
+        lock.unlock()
+        XCTAssertFalse(observed.contains(.running), "不得发布虚假的运行态：\(observed)")
+        XCTAssertTrue(session.state.isTerminal)
+    }
+
+    /// §P0-4: Stop 必须幂等。重复点击不能改变状态，也不能让进程在终态后"复活"。
+    func testRepeatedStopIsIdempotent() throws {
+        let session = try ManagedProcessSession(
+            configKey: "test", configName: "test",
+            plan: makePlan(executable: "/bin/sleep", arguments: ["100"])
+        )
+        session.start()
+        XCTAssertTrue(session.waitUntilExit(timeout: 5) == false)
+        session.stop()
+        session.stop()
+        session.stop()
+        XCTAssertTrue(session.waitUntilExit(timeout: 10))
+        let terminalState = session.state
+        XCTAssertTrue(terminalState.isTerminal, "\(terminalState)")
+
+        session.stop()
+        session.forceKill()
+        XCTAssertEqual(session.state, terminalState, "终态后的 Stop / Force Kill 必须是无操作")
+    }
+
     func testFailedLaunchReportsFailure() throws {
         // 使用不存在的 java 可执行文件 → init 直接抛错
         XCTAssertThrowsError(try ManagedProcessSession(

@@ -1,36 +1,64 @@
 import Foundation
 
+/// 宽松解析的结果：即使 XML 在中途损坏，已完整捕获的配置仍然可用；
+/// `xmlErrorMessage` 让扫描层把"损坏但读到了部分配置"如实告诉用户。
+public struct RunConfigurationParseOutcome: Sendable {
+    public var configurations: [RunConfiguration]
+    public var xmlErrorMessage: String?
+
+    public init(configurations: [RunConfiguration], xmlErrorMessage: String? = nil) {
+        self.configurations = configurations
+        self.xmlErrorMessage = xmlErrorMessage
+    }
+}
+
 /// 解析 .run/*.run.xml 与 .idea/runConfigurations/*.xml。
 /// 两种文件结构相同：根节点为 component name="ProjectRunConfigurationManager"。
 public enum ProjectRunConfigurationParser {
     public static func parse(fileURL: URL, kind: ConfigurationSource.Kind) throws -> [RunConfiguration] {
+        try parseOutcome(fileURL: fileURL, kind: kind).configurations
+    }
+
+    public static func parseOutcome(fileURL: URL, kind: ConfigurationSource.Kind) throws -> RunConfigurationParseOutcome {
         let data = try Data(contentsOf: fileURL)
         let parser = XMLParser(data: data)
         parser.shouldResolveExternalEntities = false
         let collector = SubtreeCollector { $0 == "configuration" }
         parser.delegate = collector
         // 宽松解析：即使报错也使用已捕获的内容（§10）。
-        parser.parse()
+        let succeeded = parser.parse()
 
         let modifiedAt = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationDate]) as? Date
         let source = ConfigurationSource(kind: kind, file: fileURL, modifiedAt: modifiedAt)
-        return collector.captured.compactMap { RunConfigurationMapper.map(node: $0, source: source) }
+        let configurations = collector.captured.compactMap { RunConfigurationMapper.map(node: $0, source: source) }
+        return RunConfigurationParseOutcome(
+            configurations: configurations,
+            xmlErrorMessage: succeeded ? nil : (parser.parserError?.localizedDescription ?? "XML 解析失败")
+        )
     }
 }
 
 /// §101: workspace.xml 可能非常大，流式解析，只关注 component name="RunManager"。
 public enum WorkspaceRunConfigurationParser {
     public static func parse(fileURL: URL) throws -> [RunConfiguration] {
+        try parseOutcome(fileURL: fileURL).configurations
+    }
+
+    public static func parseOutcome(fileURL: URL) throws -> RunConfigurationParseOutcome {
         let data = try Data(contentsOf: fileURL)
         let parser = XMLParser(data: data)
         parser.shouldResolveExternalEntities = false
         let delegate = WorkspaceRunManagerDelegate()
         parser.delegate = delegate
-        parser.parse()
+        let succeeded = parser.parse()
 
         let modifiedAt = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.modificationDate]) as? Date
         let source = ConfigurationSource(kind: .workspaceXML, file: fileURL, modifiedAt: modifiedAt)
-        return delegate.captured.compactMap { RunConfigurationMapper.map(node: $0, source: source) }
+        let configurations = delegate.captured.compactMap { RunConfigurationMapper.map(node: $0, source: source) }
+        return RunConfigurationParseOutcome(
+            configurations: configurations,
+            xmlErrorMessage: succeeded ? nil : (parser.parserError?.localizedDescription ?? "XML 解析失败")
+        )
     }
 }
 

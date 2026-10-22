@@ -45,8 +45,11 @@ public struct ExecutionCoordinator: Sendable {
     ) async throws -> ExecutableLaunchPlan {
         // §P0-10: 清掉上次异常遗留的启动产物（@argfile / manifest jar）
         LaunchArtifactStore.cleanupOrphans()
+        // 先做类型/字段门禁，项目根不存在时也要先给出「这个配置不能跑」。
         try Self.ensureRunnable(config)
         let scan = try IntelliJProjectScanner().scan(projectRoot: projectRoot)
+        // 再按项目实际构建系统与 Before Launch 引用做完整能力检查。
+        try Self.ensureRunnable(config, scan: scan)
 
         // ① Module 解析（§13）
         let moduleResolution = ModuleResolver.resolveModule(
@@ -96,7 +99,13 @@ public struct ExecutionCoordinator: Sendable {
                     },
                     runMavenGoals: { goals, pomFile in
                         progress(.building)
-                        try adapter.runTasks(goals, pomFile: pomFile, handle: processHandle, log: log)
+                        try adapter.runTasks(
+                            goals,
+                            pomFile: pomFile,
+                            moduleDirectory: module.directory,
+                            handle: processHandle,
+                            log: log
+                        )
                     },
                     runReferenced: { referenced, chain in
                         let referencedPlan = try await self.prepare(
@@ -153,17 +162,37 @@ public struct ExecutionCoordinator: Sendable {
         }
     }
 
-    // MARK: - 类型门禁（§23）
+    // MARK: - 能力门禁（§23/§P0-5）
 
     /// 运行类型判断留在 Core：GUI / CLI 不许自己 `if Maven`、`if SpringBoot`。
-    /// 支持的类型集合只有 `supportLevel` 一处定义，界面徽标与门禁不会漂移。
+    /// 可运行性由 `ConfigurationCapabilityResolver` 统一计算，界面徽标与门禁同源。
     static func ensureRunnable(_ config: RunConfiguration) throws {
-        guard config.type.supportLevel == .supported else {
-            throw IdeaLightRunError.unsupportedConfiguration(
-                detail: "“\(config.name)”（\(config.type.displayName)）当前不能直接启动；"
-                    + "现在能替代 IDEA Run 按钮的是 Application 与 Spring Boot 配置。"
+        try ensureRunnable(ConfigurationCapabilityResolver.resolve(config), for: config)
+    }
+
+    /// 项目感知门禁：构建系统缺失或落到尚未接管的 Gradle 时，
+    /// 沿用 `buildToolNotFound` 的既有语义，让调用方拿到明确的工具链原因。
+    static func ensureRunnable(_ config: RunConfiguration, scan: ScanResult) throws {
+        let capability = ConfigurationCapabilityResolver.resolve(config, scan: scan)
+        guard !capability.isLaunchable else { return }
+        if capability.buildSystem != .maven {
+            throw IdeaLightRunError.buildToolNotFound(
+                detail: capability.primaryReason ?? "无法确定项目的构建系统。"
             )
         }
+        try ensureRunnable(capability, for: config)
+    }
+
+    private static func ensureRunnable(
+        _ capability: ConfigurationCapability,
+        for config: RunConfiguration
+    ) throws {
+        guard !capability.isLaunchable else { return }
+        let reason = capability.primaryReason ?? "当前版本尚未接管该类型。"
+        throw IdeaLightRunError.unsupportedConfiguration(
+            detail: "“\(config.name)”（\(config.type.displayName)）当前不能直接启动：\(reason)"
+                + " 现在能替代 IDEA Run 按钮的是 Application 与 Spring Boot 配置。"
+        )
     }
 
     // MARK: - 被引用配置的完整执行（§3.7）

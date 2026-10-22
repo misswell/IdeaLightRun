@@ -27,6 +27,7 @@ public enum BuildSystemResolver {
         let toolchain = try ProjectToolchain.resolve(
             projectRoot: projectRoot,
             result: result,
+            config: config,
             configJDKName: config.jreReference,
             context: context,
             log: log
