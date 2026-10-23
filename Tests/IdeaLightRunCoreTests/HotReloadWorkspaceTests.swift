@@ -229,6 +229,86 @@ final class HotReloadWorkspaceTests: XCTestCase {
         XCTAssertNil(workspace.moduleWatch(forSourcePath: projectRoot.appendingPathComponent("README.md").path))
     }
 
+    func testSameClassNameInDifferentOutputRootsStaysDistinct() throws {
+        let secondRoot = projectRoot.appendingPathComponent("service-b/target/classes", isDirectory: true)
+        try FileManager.default.createDirectory(at: classesRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: secondRoot, withIntermediateDirectories: true)
+        _ = try write("target/classes/demo/Shared.class", "first-bytes")
+        _ = try write("service-b/target/classes/demo/Shared.class", "second-bytes")
+
+        let module = makeModule()
+        let target = BuildTarget(module: module, variant: .maven(module: "demo", includeProvided: false))
+        let workspace = HotReloadWorkspace(
+            projectRoot: projectRoot,
+            primaryModule: module,
+            primaryTarget: target,
+            moduleWatches: [],
+            outputRoots: [classesRoot, secondRoot]
+        )
+        let first = workspace.snapshot()
+        let firstPath = classesRoot.appendingPathComponent("demo/Shared.class").path
+        let secondPath = secondRoot.appendingPathComponent("demo/Shared.class").path
+        XCTAssertEqual(first.classNames[firstPath], "demo.Shared")
+        XCTAssertEqual(first.classNames[secondPath], "demo.Shared")
+        XCTAssertEqual(
+            first.classOrigins[firstPath],
+            classesRoot.standardizedFileURL.path
+        )
+        XCTAssertEqual(
+            first.classOrigins[secondPath],
+            secondRoot.standardizedFileURL.path
+        )
+
+        _ = try write("service-b/target/classes/demo/Shared.class", "second-bytes-longer")
+        let single = workspace.snapshot().diff(from: first)
+        XCTAssertEqual(single.classChanges.count, 1, "只改一份时不能把另一份也算进来")
+        XCTAssertEqual(single.classChanges[0].className, "demo.Shared")
+        XCTAssertEqual(
+            single.classChanges[0].outputRoot,
+            secondRoot.standardizedFileURL.path
+        )
+
+        let previous = workspace.snapshot()
+        _ = try write("target/classes/demo/Shared.class", "first-bytes-longer")
+        _ = try write("service-b/target/classes/demo/Shared.class", "second-bytes-longest")
+        let both = workspace.snapshot().diff(from: previous)
+        XCTAssertEqual(both.classChanges.count, 2, "同名类必须按输出目录保留两条变更")
+        XCTAssertEqual(
+            Set(both.classChanges.compactMap(\.outputRoot)),
+            [classesRoot.standardizedFileURL.path, secondRoot.standardizedFileURL.path]
+        )
+        XCTAssertEqual(Set(both.classChanges.map(\.className)), ["demo.Shared"])
+    }
+
+    func testRemovedSameNameClassKeepsItsOrigin() throws {
+        let secondRoot = projectRoot.appendingPathComponent("service-b/target/classes", isDirectory: true)
+        try FileManager.default.createDirectory(at: classesRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: secondRoot, withIntermediateDirectories: true)
+        _ = try write("target/classes/demo/Shared.class", "first-bytes")
+        _ = try write("service-b/target/classes/demo/Shared.class", "second-bytes")
+        let module = makeModule()
+        let target = BuildTarget(module: module, variant: .maven(module: "demo", includeProvided: false))
+        let workspace = HotReloadWorkspace(
+            projectRoot: projectRoot,
+            primaryModule: module,
+            primaryTarget: target,
+            moduleWatches: [],
+            outputRoots: [classesRoot, secondRoot]
+        )
+        let previous = workspace.snapshot()
+        try FileManager.default.removeItem(
+            at: secondRoot.appendingPathComponent("demo/Shared.class")
+        )
+        let diff = workspace.snapshot().diff(from: previous)
+        XCTAssertEqual(diff.classChanges.count, 1)
+        XCTAssertEqual(diff.classChanges[0].kind, .removed)
+        XCTAssertEqual(diff.classChanges[0].className, "demo.Shared")
+        XCTAssertEqual(
+            diff.classChanges[0].outputRoot,
+            secondRoot.standardizedFileURL.path
+        )
+    }
+
     func testClassNameMappingExcludesMultiReleaseAndModuleInfo() {
         let root = classesRoot.path
         XCTAssertEqual(

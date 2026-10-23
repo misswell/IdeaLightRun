@@ -41,6 +41,9 @@ public struct HotReloadWorkspaceSnapshot: Equatable, Sendable {
     public var outputResources: [String: HotReloadFileState]
     /// 绝对 class 文件路径 → JVM 二进制类名（`com.foo.Outer$Inner`）。
     public var classNames: [String: String]
+    /// 绝对 class 文件路径 → 它所在的输出目录。多模块可能产出同名类，
+    /// 只靠类名无法判断 JVM 实际加载的是哪一份。
+    public var classOrigins: [String: String]
     public var capturedAt: Date
     public var truncated: Bool
 
@@ -50,6 +53,7 @@ public struct HotReloadWorkspaceSnapshot: Equatable, Sendable {
         classes: [String: HotReloadFileState] = [:],
         outputResources: [String: HotReloadFileState] = [:],
         classNames: [String: String] = [:],
+        classOrigins: [String: String] = [:],
         capturedAt: Date = Date(),
         truncated: Bool = false
     ) {
@@ -58,6 +62,7 @@ public struct HotReloadWorkspaceSnapshot: Equatable, Sendable {
         self.classes = classes
         self.outputResources = outputResources
         self.classNames = classNames
+        self.classOrigins = classOrigins
         self.capturedAt = capturedAt
         self.truncated = truncated
     }
@@ -355,20 +360,21 @@ public struct HotReloadWorkspace: Sendable {
         var classes: [String: HotReloadFileState] = [:]
         var outputResources: [String: HotReloadFileState] = [:]
         var classNames: [String: String] = [:]
+        var classOrigins: [String: String] = [:]
 
         for watch in moduleWatches {
             for root in watch.codeRoots {
                 collect(root: root, previous: previous?.sources, budget: budget) { url in
                     Self.codeExtensions.contains(url.pathExtension.lowercased())
-                } into: { state, url in
-                    sources[url.path] = state
+                } into: { state, _ in
+                    sources[state.path] = state
                 }
             }
             for root in watch.resourceRoots {
                 collect(root: root, previous: previous?.sourceResources, budget: budget) { _ in
                     true
-                } into: { state, url in
-                    sourceResources[url.path] = state
+                } into: { state, _ in
+                    sourceResources[state.path] = state
                 }
             }
         }
@@ -381,14 +387,18 @@ public struct HotReloadWorkspace: Sendable {
             }
             collect(root: root, previous: oldFiles, budget: budget) { _ in
                 true
-            } into: { state, url in
-                if url.pathExtension.lowercased() == "class" {
-                    if let name = Self.className(forClassFile: url.path, outputRoot: rootPath) {
-                        classes[url.path] = state
-                        classNames[url.path] = name
+            } into: { state, _ in
+                if state.path.hasSuffix(".class") {
+                    if let name = Self.className(
+                        forClassFile: state.path,
+                        outputRoot: rootPath
+                    ) {
+                        classes[state.path] = state
+                        classNames[state.path] = name
+                        classOrigins[state.path] = rootPath
                     }
                 } else {
-                    outputResources[url.path] = state
+                    outputResources[state.path] = state
                 }
             }
         }
@@ -399,6 +409,7 @@ public struct HotReloadWorkspace: Sendable {
             classes: classes,
             outputResources: outputResources,
             classNames: classNames,
+            classOrigins: classOrigins,
             truncated: budget.truncated
         )
     }
@@ -544,27 +555,39 @@ extension HotReloadWorkspaceSnapshot {
         diff.removedOutputResources = Set(previous.outputResources.keys)
             .subtracting(outputResources.keys).sorted()
 
-        var changesByName: [String: HotReloadClassChange] = [:]
+        // 同名类在不同模块/输出目录里是不同身份：不能按类名合并，
+        // 否则 Agent 会拿错文件，或者另一份变更被静默吞掉。
+        var changesByIdentity: [String: HotReloadClassChange] = [:]
         for path in changedKeys(previous.classes, classes) {
             guard let name = classNames[path] else { continue }
             let kind: HotReloadClassChangeKind = previous.classes[path] == nil ? .added : .modified
-            let change = HotReloadClassChange(className: name, filePath: path, kind: kind)
-            // 同名类只保留一条；修改优先于新增。
-            if let existing = changesByName[name], existing.kind == .modified, kind == .added {
-                continue
-            }
-            changesByName[name] = change
+            let origin = classOrigins[path]
+            changesByIdentity[Self.classIdentity(name: name, origin: origin)] = HotReloadClassChange(
+                className: name,
+                filePath: path,
+                kind: kind,
+                outputRoot: origin
+            )
         }
         for path in Set(previous.classes.keys).subtracting(classes.keys).sorted() {
             guard let name = previous.classNames[path] else { continue }
-            changesByName[name] = HotReloadClassChange(
+            let origin = previous.classOrigins[path]
+            changesByIdentity[Self.classIdentity(name: name, origin: origin)] = HotReloadClassChange(
                 className: name,
                 filePath: path,
-                kind: .removed
+                kind: .removed,
+                outputRoot: origin
             )
         }
-        diff.classChanges = changesByName.values.sorted { $0.className < $1.className }
+        diff.classChanges = changesByIdentity.values.sorted {
+            if $0.className != $1.className { return $0.className < $1.className }
+            return ($0.outputRoot ?? "") < ($1.outputRoot ?? "")
+        }
         return diff
+    }
+
+    static func classIdentity(name: String, origin: String?) -> String {
+        "\(origin ?? "")\u{0}\(name)"
     }
 
     private func changedKeys(

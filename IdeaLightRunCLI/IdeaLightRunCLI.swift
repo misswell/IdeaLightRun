@@ -542,7 +542,7 @@ struct IdeaLightRunCLI {
                     control.runtime = runtime
                     runtime.start()
                     while runtime.isRunning {
-                        Thread.sleep(forTimeInterval: 0.2)
+                        try? await Task.sleep(nanoseconds: 200_000_000)
                     }
                     control.runtime = nil
                     if control.isInterrupted {

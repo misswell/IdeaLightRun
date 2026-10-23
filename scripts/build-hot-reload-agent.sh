@@ -42,7 +42,18 @@ while IFS= read -r -d '' file; do
 done < <(find "$SOURCE_ROOT" -name '*.java' -type f -print0)
 [ "${#SOURCES[@]}" -gt 0 ] || { echo "❌ $SOURCE_ROOT 下没有 Java 源文件" >&2; exit 1; }
 
-"$JAVAC" --release 8 -encoding UTF-8 -Xlint:-options -d "$CLASSES" "${SOURCES[@]}"
+# --release 是 JDK 9 才有的选项；JDK 8 的 javac 只认 -source/-target。
+JAVAC_VERSION="$("$JAVAC" -version 2>&1 | awk 'NR==1 {print $2}')"
+case "$JAVAC_VERSION" in
+    1.8*|8)
+        RELEASE_FLAGS=(-source 8 -target 8 -Xlint:-options)
+        ;;
+    *)
+        RELEASE_FLAGS=(--release 8 -Xlint:-options)
+        ;;
+esac
+
+"$JAVAC" "${RELEASE_FLAGS[@]}" -encoding UTF-8 -d "$CLASSES" "${SOURCES[@]}"
 "$JAR" cfm "$OUT" "$MANIFEST" -C "$CLASSES" .
 
 # 验证产物：Premain-Class 必须在 Manifest 里，主类必须真的打进 jar。

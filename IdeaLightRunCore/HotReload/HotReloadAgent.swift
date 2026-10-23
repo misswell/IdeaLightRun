@@ -116,11 +116,14 @@ public struct HotReloadAgentClassResult: Equatable, Sendable {
     }
 
     public var className: String
+    /// 对应的 class 文件。同名类可能来自不同输出目录，必须用它区分结果。
+    public var filePath: String
     public var code: Code
     public var message: String
 
-    public init(className: String, code: Code, message: String) {
+    public init(className: String, filePath: String, code: Code, message: String) {
         self.className = className
+        self.filePath = filePath
         self.code = code
         self.message = message
     }
@@ -141,6 +144,8 @@ public struct HotReloadAgentResponse: Equatable, Sendable {
 public enum HotReloadAgentProtocol {
     public static let magic: UInt32 = 0x494C_5231  // "ILR1"
     public static let maxFrameSize = 64 * 1024 * 1024
+    /// 留出 magic / token / opcode 与帧长度的余量，避免请求写到一半被 Agent 拒绝。
+    public static let maxRequestPayloadSize = maxFrameSize - 16 * 1024
     public static let maxStringBytes = 8 * 1024
     public static let maxTokenBytes = 256
 
@@ -200,12 +205,21 @@ public final class HotReloadAgentClient: @unchecked Sendable {
         try request(opcode: .status, payload: Data())
     }
 
-    public func reload(classes: [(name: String, path: String)]) throws -> HotReloadAgentResponse {
+    public func reload(
+        classes: [(name: String, path: String, origin: String?)]
+    ) throws -> HotReloadAgentResponse {
         var payload = Data()
         Self.appendUInt32(UInt32(classes.count), to: &payload)
         for entry in classes {
             try Self.appendString(entry.name, to: &payload)
             try Self.appendString(entry.path, to: &payload)
+            try Self.appendString(entry.origin ?? "", to: &payload)
+        }
+        guard payload.count <= HotReloadAgentProtocol.maxRequestPayloadSize else {
+            throw IdeaLightRunError.hotReloadUnavailable(
+                detail: "本次变更集超过 \(HotReloadAgentProtocol.maxRequestPayloadSize / 1024) KB，"
+                    + "无法作为一整组原子发送；请减少一次保存涉及的类后重试。"
+            )
         }
         return try request(opcode: .reload, payload: payload)
     }
@@ -254,11 +268,17 @@ public final class HotReloadAgentClient: @unchecked Sendable {
             classes.reserveCapacity(count)
             for _ in 0..<count {
                 let className = try Self.readString(from: fd)
+                let filePath = try Self.readString(from: fd)
                 guard let code = HotReloadAgentClassResult.Code(rawValue: try Self.readUInt8(from: fd)) else {
                     throw IdeaLightRunError.hotReloadUnavailable(detail: "热更新 Agent 返回了未知的类状态。")
                 }
                 let detail = try Self.readString(from: fd)
-                classes.append(HotReloadAgentClassResult(className: className, code: code, message: detail))
+                classes.append(HotReloadAgentClassResult(
+                    className: className,
+                    filePath: filePath,
+                    code: code,
+                    message: detail
+                ))
             }
             if status == .unauthorized {
                 message = "热更新控制凭据被 Agent 拒绝。"
@@ -366,7 +386,7 @@ public enum HotReloadAgentEndpoint {
         portFile: URL,
         timeout: TimeInterval,
         isCancelled: () -> Bool = { false }
-    ) throws -> UInt16 {
+    ) async throws -> UInt16 {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if isCancelled() {
@@ -377,7 +397,7 @@ public enum HotReloadAgentEndpoint {
                let port = UInt16(text), port > 0 {
                 return port
             }
-            Thread.sleep(forTimeInterval: 0.1)
+            try? await Task.sleep(nanoseconds: 100_000_000)
         }
         throw IdeaLightRunError.hotReloadUnavailable(
             detail: "内置 HotReloadAgent 未在 \(Int(timeout)) 秒内就绪；请确认应用没有以禁用 Agent 的方式启动。"

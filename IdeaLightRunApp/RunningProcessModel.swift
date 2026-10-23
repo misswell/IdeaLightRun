@@ -179,6 +179,16 @@ final class RunningProcessModel: LogViewModel, Identifiable {
         }
     }
 
+    /// 文件监听启动失败后的“重试监听”。
+    func retryHotReloadWatcher(memberID: String? = nil) {
+        if let memberID,
+           let index = compoundMembers.firstIndex(where: { $0.id == memberID }) {
+            runtime?.members[index].retryHotReloadWatcher()
+        } else {
+            runtime?.retryHotReloadWatcher()
+        }
+    }
+
     /// 成员控制台：Compound 每个成员一份独立日志缓冲。
     func consoleModel(for memberID: String) -> LogViewModel? {
         memberConsoles[memberID]

@@ -205,6 +205,14 @@ public final class ExecutionRuntime: @unchecked Sendable {
         session?.dismissRestartPrompt()
     }
 
+    /// 文件监听启动失败后的“重试监听”。Compound 请对 `members[index]` 调用。
+    public func retryHotReloadWatcher() {
+        hotReloadLock.lock()
+        let session = hotReloadSession
+        hotReloadLock.unlock()
+        session?.retryWatcher()
+    }
+
     private func startHotReload() {
         hotReloadLock.lock()
         let session = hotReloadSession

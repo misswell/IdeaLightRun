@@ -97,6 +97,8 @@ public enum HotReloadState: Equatable, Sendable {
     /// 已编译并交给 DevTools / 外部 Agent，IdeaLightRun 不宣称替换结果。
     case delegated
     case agentUnavailable
+    /// FSEventStream 创建或启动失败；此时保存源码不会被发现。
+    case watcherUnavailable
     /// 检测到源码变化但自动编译已关闭，等待用户手动触发。
     case attention
     case stopped
@@ -116,6 +118,7 @@ public enum HotReloadState: Equatable, Sendable {
         case .restarted: return "已请求重启"
         case .delegated: return "已交给外部后端"
         case .agentUnavailable: return "Agent 不可用"
+        case .watcherUnavailable: return "文件监听不可用"
         case .attention: return "待手动编译"
         case .stopped: return "已停止"
         }
@@ -129,7 +132,7 @@ public enum HotReloadState: Equatable, Sendable {
     public var needsAttention: Bool {
         switch self {
         case .compileFailed, .failed, .unsupported, .requiresRestart,
-             .agentUnavailable, .attention, .partial:
+             .agentUnavailable, .watcherUnavailable, .attention, .partial:
             return true
         default:
             return false
@@ -155,11 +158,20 @@ public struct HotReloadClassChange: Equatable, Sendable {
     public var className: String
     public var filePath: String
     public var kind: HotReloadClassChangeKind
+    /// 该 class 文件所属的输出目录。同名类可能来自多个模块的 target/classes，
+    /// Agent 必须据此匹配实际 ClassLoader，不能按类名取第一个。
+    public var outputRoot: String?
 
-    public init(className: String, filePath: String, kind: HotReloadClassChangeKind) {
+    public init(
+        className: String,
+        filePath: String,
+        kind: HotReloadClassChangeKind,
+        outputRoot: String? = nil
+    ) {
         self.className = className
         self.filePath = filePath
         self.kind = kind
+        self.outputRoot = outputRoot
     }
 }
 
@@ -173,6 +185,13 @@ public enum HotReloadFailureKind: String, Equatable, Sendable {
     case bytecodeRejected
     case classRemoved
     case agentUnreachable
+    /// 同名类在多个 ClassLoader / 输出目录中出现，无法唯一确认该改哪一个。
+    case ambiguousClass
+    /// 请求的输出目录与类实际加载来源不一致。
+    case classOriginMismatch
+    /// 同一请求里的其它类被 JVM 拒绝，整组原子提交未发生；
+    /// 这个类本身可能只是被牵连，但确实没有应用。
+    case atomicGroupAborted
     case unknown
 
     public var displayText: String {
@@ -184,6 +203,9 @@ public enum HotReloadFailureKind: String, Equatable, Sendable {
         case .bytecodeRejected: return "字节码被 JVM 拒绝"
         case .classRemoved: return "类文件已删除"
         case .agentUnreachable: return "Agent 控制通道不可达"
+        case .ambiguousClass: return "同名类无法唯一匹配"
+        case .classOriginMismatch: return "类加载来源不匹配"
+        case .atomicGroupAborted: return "整组未应用（组内类被拒绝）"
         case .unknown: return "未知原因"
         }
     }
@@ -191,7 +213,7 @@ public enum HotReloadFailureKind: String, Equatable, Sendable {
     /// 标准 HotSwap 无法跨越的边界；只能换增强 Agent 或重启。
     public var requiresEnhancedAgentOrRestart: Bool {
         switch self {
-        case .schemaChange, .notModifiable, .classRemoved:
+        case .schemaChange, .notModifiable, .classRemoved, .atomicGroupAborted:
             return true
         default:
             return false
@@ -200,6 +222,9 @@ public enum HotReloadFailureKind: String, Equatable, Sendable {
 
     public static func classify(_ message: String) -> HotReloadFailureKind {
         let lower = message.lowercased()
+        if lower.contains("atomic group") {
+            return .atomicGroupAborted
+        }
         if lower.contains("schema") {
             return .schemaChange
         }
@@ -211,6 +236,12 @@ public enum HotReloadFailureKind: String, Equatable, Sendable {
         }
         if lower.contains("classnotfound") || lower.contains("class not found") {
             return .classNotFound
+        }
+        if lower.contains("ambiguous") || lower.contains("cannot uniquely match") {
+            return .ambiguousClass
+        }
+        if lower.contains("origin mismatch") || lower.contains("loaded from") {
+            return .classOriginMismatch
         }
         if lower.contains("verifyerror") || lower.contains("classformaterror")
             || lower.contains("illegalclassformat") || lower.contains("bytecode") {
@@ -341,6 +372,9 @@ public struct HotReloadSnapshot: Equatable, Sendable {
     public var awaitingRestartConfirmation: Bool
     public var canManualTrigger: Bool
     public var isWatching: Bool
+    /// 监听启动失败的原文；非空时界面必须显示原因，不能只留一个“监听中”。
+    public var watcherIssue: String?
+    public var canRetryWatcher: Bool
     public var lastUpdated: Date
 
     public init(
@@ -353,6 +387,8 @@ public struct HotReloadSnapshot: Equatable, Sendable {
         awaitingRestartConfirmation: Bool = false,
         canManualTrigger: Bool = false,
         isWatching: Bool = false,
+        watcherIssue: String? = nil,
+        canRetryWatcher: Bool = false,
         lastUpdated: Date = Date()
     ) {
         self.state = state
@@ -364,6 +400,8 @@ public struct HotReloadSnapshot: Equatable, Sendable {
         self.awaitingRestartConfirmation = awaitingRestartConfirmation
         self.canManualTrigger = canManualTrigger
         self.isWatching = isWatching
+        self.watcherIssue = watcherIssue
+        self.canRetryWatcher = canRetryWatcher
         self.lastUpdated = lastUpdated
     }
 

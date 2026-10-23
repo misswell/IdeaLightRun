@@ -33,21 +33,55 @@ public final class HotReloadSession: @unchecked Sendable {
     private var pendingCompileTargets: [String: BuildTarget] = [:]
 
     private var agentClient: HotReloadAgentClient?
-    private var watcher: HotReloadFileWatcher?
+    private var watcher: (any HotReloadFileWatching)?
+    /// 只有 FSEventStream 真正启动成功后才为 true；watcher 对象存在不代表正在监听。
+    private var watcherActive = false
+    private var watcherIssue: String?
+    private var watcherStarting = false
+    private let makeWatcher: @Sendable (
+        HotReloadWorkspace,
+        @escaping @Sendable ([String]) -> Void
+    ) -> any HotReloadFileWatching
     private var startTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
     private var compileHandle: ProcessHandle?
 
-    public init(
+    public convenience init(
         plan: HotReloadLaunchPlan,
         log: @escaping @Sendable (String) -> Void,
         onSnapshot: @escaping @Sendable (HotReloadSnapshot) -> Void,
         onRestartRequested: (@Sendable (String) -> Bool)? = nil
     ) {
+        self.init(
+            plan: plan,
+            log: log,
+            onSnapshot: onSnapshot,
+            onRestartRequested: onRestartRequested,
+            makeWatcher: { workspace, onEvents in
+                HotReloadFileWatcher(
+                    roots: [workspace.projectRoot],
+                    isRelevant: { workspace.isRelevantPath($0) },
+                    onEvents: onEvents
+                )
+            }
+        )
+    }
+
+    init(
+        plan: HotReloadLaunchPlan,
+        log: @escaping @Sendable (String) -> Void,
+        onSnapshot: @escaping @Sendable (HotReloadSnapshot) -> Void,
+        onRestartRequested: (@Sendable (String) -> Bool)? = nil,
+        makeWatcher: @escaping @Sendable (
+            HotReloadWorkspace,
+            @escaping @Sendable ([String]) -> Void
+        ) -> any HotReloadFileWatching
+    ) {
         self.plan = plan
         self.log = log
         self.onSnapshot = onSnapshot
         self.onRestartRequested = onRestartRequested
+        self.makeWatcher = makeWatcher
     }
 
     public var currentSnapshot: HotReloadSnapshot {
@@ -86,6 +120,9 @@ public final class HotReloadSession: @unchecked Sendable {
         stopped = true
         let watcher = self.watcher
         self.watcher = nil
+        watcherActive = false
+        watcherIssue = nil
+        watcherStarting = false
         let client = agentClient
         agentClient = nil
         let handle = compileHandle
@@ -145,6 +182,37 @@ public final class HotReloadSession: @unchecked Sendable {
         onSnapshot(snapshot)
     }
 
+    /// 监听启动失败后的“重试监听”。重试用当前基准重新对账，
+    /// 即使失败期间有保存，也会在启动成功后补检并排队处理。
+    public func retryWatcher() {
+        lock.lock()
+        let canRetry = !stopped && started && plan.configuration.hasAnyWatcher
+            && !watcherActive && !watcherStarting && watcherIssue != nil
+        if canRetry {
+            watcherStarting = true
+        }
+        let previous = baseline
+        lock.unlock()
+        guard canRetry else { return }
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            defer { self.finishWatcherStart() }
+            guard !self.isStopped else { return }
+            let initial = previous ?? self.plan.workspace.snapshot()
+            self.publish(.listening, detail: "正在重试文件监听…")
+            if self.installWatcherAndReconcile(initialBaseline: initial) {
+                self.publish(.listening, detail: self.readyDetail())
+            }
+        }
+    }
+
+    private func finishWatcherStart() {
+        lock.lock()
+        watcherStarting = false
+        lock.unlock()
+    }
+
     private func startInternal() async {
         for note in plan.notes {
             log("[HotReload] \(note)")
@@ -162,7 +230,7 @@ public final class HotReloadSession: @unchecked Sendable {
                 return
             }
             do {
-                let port = try HotReloadAgentEndpoint.waitForPort(
+                let port = try await HotReloadAgentEndpoint.waitForPort(
                     portFile: agentLaunch.portFileURL,
                     timeout: 20,
                     isCancelled: { self.isStopped }
@@ -174,15 +242,10 @@ public final class HotReloadSession: @unchecked Sendable {
                         detail: "内置 Agent 初始化失败：\(status.message)"
                     )
                 }
-                lock.lock()
-                if stopped {
-                    lock.unlock()
+                guard installAgent(client) else {
                     client.shutdown()
                     return
                 }
-                agentClient = client
-                backendReady = true
-                lock.unlock()
                 log("[HotReload] 内置 Agent 已连接（127.0.0.1:\(port)）：\(status.message)")
             } catch {
                 if isStopped { return }
@@ -193,50 +256,88 @@ public final class HotReloadSession: @unchecked Sendable {
                 return
             }
         } else {
-            lock.lock()
-            backendReady = true
-            lock.unlock()
+            markBackendReady()
         }
 
         let baseline = plan.workspace.snapshot()
-        lock.lock()
-        if stopped {
-            lock.unlock()
-            return
-        }
-        self.baseline = baseline
-        lock.unlock()
+        guard installInitialBaseline(baseline) else { return }
         if baseline.truncated {
             log("[HotReload] 警告：监听文件数超过上限，部分变更可能不会被发现。")
-            lock.lock()
-            truncatedLogged = true
-            lock.unlock()
+            markTruncationLogged()
         }
 
         if plan.configuration.hasAnyWatcher {
-            let watcher = HotReloadFileWatcher(
-                roots: [plan.workspace.projectRoot],
-                isRelevant: { [workspace = plan.workspace] path in
-                    workspace.isRelevantPath(path)
-                },
-                onEvents: { [weak self] _ in
-                    self?.fileEventsReceived()
-                }
-            )
-            lock.lock()
-            if stopped {
-                lock.unlock()
-                return
-            }
-            self.watcher = watcher
-            lock.unlock()
-            watcher.start()
-            log("[HotReload] 监听 \(plan.workspace.moduleWatches.count) 个模块的源码与 \(plan.workspace.outputRoots.count) 个输出目录（去抖 \(Int(plan.configuration.effectiveDebounce * 1000)) ms）。")
+            guard installWatcherAndReconcile(initialBaseline: baseline) else { return }
         } else {
             log("[HotReload] 文件监听已关闭；只响应“立即编译并热更新”。")
         }
 
         publish(.listening, detail: readyDetail())
+    }
+
+    /// 先启动监听，再用第二次快照与启动前的基准对账：
+    /// 建立基准与启动监听之间如果有保存，FSEvents 从 SinceNow 开始会漏掉，
+    /// 第二次快照能发现差异并排队一次处理，避免永久丢事件。
+    ///
+    /// 返回 false 表示启动失败或会话已停止；失败原因已经通过快照发布。
+    private func installWatcherAndReconcile(initialBaseline: HotReloadWorkspaceSnapshot) -> Bool {
+        lock.lock()
+        if stopped {
+            lock.unlock()
+            return false
+        }
+        watcherStarting = true
+        lock.unlock()
+
+        let watcher = makeWatcher(plan.workspace) { [weak self] _ in
+            self?.fileEventsReceived()
+        }
+        let result = watcher.start()
+
+        lock.lock()
+        if stopped {
+            watcherStarting = false
+            lock.unlock()
+            watcher.stop()
+            return false
+        }
+        watcherStarting = false
+        if result.isSuccess {
+            self.watcher = watcher
+            watcherActive = true
+            watcherIssue = nil
+        } else {
+            // 启动失败的对象不能留作“正在监听”；重试时会重新创建。
+            watcherActive = false
+            watcherIssue = result.failureReason
+        }
+        lock.unlock()
+
+        guard result.isSuccess else {
+            watcher.stop()
+            let reason = result.failureReason ?? "未知原因"
+            let detail = "文件监听启动失败：\(reason) 保存源码不会触发热更新。可点击“重试监听”。"
+            publish(.watcherUnavailable, detail: detail)
+            log("[HotReload] \(detail)")
+            return false
+        }
+
+        let reconciled = plan.workspace.snapshot(reusing: initialBaseline)
+        if isStopped { return false }
+        let missed = reconciled.diff(from: initialBaseline)
+        if missed.isEmpty {
+            setBaseline(reconciled)
+        } else {
+            // 保留启动前基准，交给正常的处理周期做 diff；不能直接覆盖，
+            // 否则第二次快照里的变更会被当成“已处理”而丢失。
+            let sourceCount = missed.changedSources.count + missed.removedSources.count
+            log("[HotReload] 监听启动后对账发现 \(sourceCount) 个源码、\(missed.classChanges.count) 个 class 变更；"
+                + "已排队处理，避免初始化窗口丢事件。")
+            scheduleCycle(after: plan.configuration.effectiveDebounce, manual: false)
+        }
+
+        log("[HotReload] 监听 \(plan.workspace.moduleWatches.count) 个模块的源码与 \(plan.workspace.outputRoots.count) 个输出目录（去抖 \(Int(plan.configuration.effectiveDebounce * 1000)) ms）。")
+        return true
     }
 
     private func readyDetail() -> String {
@@ -287,30 +388,112 @@ public final class HotReloadSession: @unchecked Sendable {
         lock.unlock()
     }
 
+    private struct CycleStart {
+        var previous: HotReloadWorkspaceSnapshot
+        var manual: Bool
+        var pendingTargets: [BuildTarget]
+    }
+
     private func runCycle() async {
+        guard let start = beginCycle() else { return }
+        await processCycle(previous: start.previous, manual: start.manual, pendingTargets: start.pendingTargets)
+        if endCycle() {
+            scheduleCycle(after: 0.15, manual: false)
+        }
+    }
+
+    private func beginCycle() -> CycleStart? {
         lock.lock()
+        defer { lock.unlock() }
         guard !stopped, !isProcessing, let previous = baseline else {
             if isProcessing { pendingCycle = true }
-            lock.unlock()
-            return
+            return nil
         }
         isProcessing = true
         let manual = manualRequested
         manualRequested = false
         let pendingTargets = manual ? Array(pendingCompileTargets.values) : []
-        lock.unlock()
+        return CycleStart(previous: previous, manual: manual, pendingTargets: pendingTargets)
+    }
 
-        await processCycle(previous: previous, manual: manual, pendingTargets: pendingTargets)
-
+    /// 返回 true 表示处理期间又来了事件，需要再排一轮。
+    private func endCycle() -> Bool {
         lock.lock()
         isProcessing = false
         let pending = pendingCycle
         pendingCycle = false
         let stillStopped = stopped
         lock.unlock()
-        if !stillStopped && pending {
-            scheduleCycle(after: 0.15, manual: false)
+        return !stillStopped && pending
+    }
+
+    private func installAgent(_ client: HotReloadAgentClient) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return false }
+        agentClient = client
+        backendReady = true
+        return true
+    }
+
+    private func markBackendReady() {
+        lock.lock()
+        backendReady = true
+        lock.unlock()
+    }
+
+    private func currentAgent() -> (ready: Bool, client: HotReloadAgentClient?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (backendReady, agentClient)
+    }
+
+    private func installInitialBaseline(_ snapshot: HotReloadWorkspaceSnapshot) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return false }
+        baseline = snapshot
+        return true
+    }
+
+    private func markTruncationLogged() {
+        lock.lock()
+        truncatedLogged = true
+        lock.unlock()
+    }
+
+    private func makeCompileHandle() -> ProcessHandle? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return nil }
+        let handle = ProcessHandle()
+        compileHandle = handle
+        return handle
+    }
+
+    private func finishCompileHandle() -> Bool {
+        lock.lock()
+        compileHandle = nil
+        let stillStopped = stopped
+        lock.unlock()
+        return stillStopped
+    }
+
+    private func clearPendingCompileTargets(_ targets: [BuildTarget]) {
+        lock.lock()
+        for target in targets {
+            pendingCompileTargets.removeValue(forKey: target.module.id)
         }
+        lock.unlock()
+    }
+
+    private func rememberPendingCompileTargets(_ targets: [BuildTarget]) {
+        guard !targets.isEmpty else { return }
+        lock.lock()
+        for target in targets {
+            pendingCompileTargets[target.module.id] = target
+        }
+        lock.unlock()
     }
 
     private func processCycle(
@@ -351,13 +534,7 @@ public final class HotReloadSession: @unchecked Sendable {
 
         if hasSourceWork && !plan.configuration.autoCompileOnChange && !manual {
             let targets = compileTargets(in: diff)
-            if !targets.isEmpty {
-                lock.lock()
-                for target in targets {
-                    pendingCompileTargets[target.module.id] = target
-                }
-                lock.unlock()
-            }
+            rememberPendingCompileTargets(targets)
             setBaseline(current)
             let summary = makeSummary(
                 diff: diff,
@@ -403,14 +580,7 @@ public final class HotReloadSession: @unchecked Sendable {
                 + (diff.changedSources.count > 5 ? " 等 \(diff.changedSources.count) 个" : ""))
         }
 
-        let handle = ProcessHandle()
-        lock.lock()
-        if stopped {
-            lock.unlock()
-            return
-        }
-        compileHandle = handle
-        lock.unlock()
+        guard let handle = makeCompileHandle() else { return }
 
         let compileError: Error?
         let session = self
@@ -434,11 +604,7 @@ public final class HotReloadSession: @unchecked Sendable {
             compileError = error
         }
 
-        lock.lock()
-        compileHandle = nil
-        let stoppedAfterCompile = stopped
-        lock.unlock()
-        if stoppedAfterCompile { return }
+        if finishCompileHandle() { return }
 
         let post = plan.workspace.snapshot(reusing: current)
 
@@ -470,11 +636,7 @@ public final class HotReloadSession: @unchecked Sendable {
         if preserved.hasSourceChangesDuringWork {
             signalPendingCycle()
         }
-        lock.lock()
-        for target in compileTargets {
-            pendingCompileTargets.removeValue(forKey: target.module.id)
-        }
-        lock.unlock()
+        clearPendingCompileTargets(compileTargets)
 
         let overall = post.diff(from: previous)
         var summary = makeSummary(
@@ -586,10 +748,7 @@ public final class HotReloadSession: @unchecked Sendable {
             return
         }
 
-        lock.lock()
-        let ready = backendReady
-        let client = agentClient
-        lock.unlock()
+        let (ready, client) = currentAgent()
         guard ready, let client else {
             summary.notes.append("Agent 不可用，未发送类替换请求。")
             publish(.agentUnavailable, detail: "Agent 不可用，无法应用本次变更。", summary: summary)
@@ -618,22 +777,35 @@ public final class HotReloadSession: @unchecked Sendable {
         }
 
         publish(.applying, detail: "正在替换 \(applicable.count) 个类…")
-        var resultsByName: [String: HotReloadAgentClassResult] = [:]
-        let batches = stride(from: 0, to: applicable.count, by: 50).map {
-            Array(applicable[$0..<min($0 + 50, applicable.count)])
+        if !applicable.isEmpty {
+            let duplicates = Dictionary(grouping: applicable, by: \.className)
+                .filter { $0.value.count > 1 }
+            if !duplicates.isEmpty {
+                summary.notes.append("有 \(duplicates.count) 个类名出现在多个输出目录；Agent 会按输出目录匹配实际 ClassLoader，不做“取第一个”。")
+            }
         }
+
+        var resultsByPath: [String: HotReloadAgentClassResult] = [:]
+        var resultsByName: [String: HotReloadAgentClassResult] = [:]
         var agentFailure: String?
-        for batch in batches {
+        if !applicable.isEmpty {
             if isStopped { return }
             do {
-                let response = try client.reload(classes: batch.map { ($0.className, $0.filePath) })
+                // 整组只发一个请求：Agent 用一次 redefineClasses 原子应用，
+                // 任一类结构失败时 JVM 不会留下“前一半新、后一半旧”的状态。
+                let response = try client.reload(classes: applicable.map {
+                    (name: $0.className, path: $0.filePath, origin: $0.outputRoot)
+                })
                 if response.status == .unauthorized {
                     throw IdeaLightRunError.hotReloadUnavailable(
                         detail: "内置 Agent 拒绝了控制凭据，热更新通道已失效。"
                     )
                 }
                 for result in response.classes {
-                    resultsByName[result.className] = result
+                    resultsByPath[result.filePath] = result
+                    if resultsByName[result.className] == nil {
+                        resultsByName[result.className] = result
+                    }
                 }
                 if response.classes.isEmpty, response.status != .ok {
                     throw IdeaLightRunError.hotReloadUnavailable(
@@ -643,12 +815,11 @@ public final class HotReloadSession: @unchecked Sendable {
             } catch {
                 agentFailure = (error as? IdeaLightRunError)?.localizedDescription
                     ?? error.localizedDescription
-                break
             }
         }
 
         if let agentFailure {
-            for change in applicable where resultsByName[change.className] == nil {
+            for change in applicable {
                 summary.failedClasses.append(HotReloadClassFailure(
                     className: change.className,
                     message: agentFailure,
@@ -661,10 +832,11 @@ public final class HotReloadSession: @unchecked Sendable {
         }
 
         for change in applicable {
-            guard let result = resultsByName[change.className] else {
+            guard let result = resultsByPath[change.filePath]
+                ?? (resultsByName.count == applicable.count ? resultsByName[change.className] : nil) else {
                 summary.failedClasses.append(HotReloadClassFailure(
                     className: change.className,
-                    message: "Agent 响应中没有这个类。",
+                    message: "Agent 响应中没有这个类（输出目录 \(change.outputRoot ?? "未知")）。",
                     kind: .unknown
                 ))
                 continue
@@ -884,7 +1056,10 @@ public final class HotReloadSession: @unchecked Sendable {
             summary: summary,
             awaitingRestartConfirmation: awaitingRestart,
             canManualTrigger: !stopped && !isProcessing && (backendReady || plan.delegatesApply),
-            isWatching: watcher != nil,
+            isWatching: watcherActive,
+            watcherIssue: watcherIssue,
+            canRetryWatcher: !stopped && plan.configuration.hasAnyWatcher
+                && !watcherActive && watcherIssue != nil,
             lastUpdated: Date()
         )
     }

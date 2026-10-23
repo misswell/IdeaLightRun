@@ -14,6 +14,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -22,10 +23,14 @@ import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
+import java.security.CodeSource;
 import java.security.MessageDigest;
+import java.security.ProtectionDomain;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -316,16 +321,110 @@ public final class HotReloadAgent {
             for (int index = 0; index < count; index++) {
                 String className = readString(input);
                 String path = readString(input);
-                requests.add(new ClassRequest(className, path));
+                String origin = readString(input);
+                requests.add(new ClassRequest(className, path, origin));
             }
 
-            List<ClassResult> results = new ArrayList<ClassResult>(requests.size());
+            ClassResult[] results = new ClassResult[requests.size()];
+            String[] appliedMessages = new String[requests.size()];
+            List<ClassDefinition> definitions = new ArrayList<ClassDefinition>();
+            Set<Class<?>> scheduled = Collections.newSetFromMap(
+                new IdentityHashMap<Class<?>, Boolean>()
+            );
+            boolean blockingFailure = false;
+            String blockingReason = null;
+
+            for (int index = 0; index < requests.size(); index++) {
+                ClassRequest request = requests.get(index);
+                Resolution resolution = resolve(instrumentation, request);
+                if (resolution.failure != null) {
+                    results[index] = ClassResult.failed(
+                        request.className,
+                        request.path,
+                        resolution.failure
+                    );
+                    if (!blockingFailure) {
+                        blockingReason = request.className + ": " + resolution.failure;
+                    }
+                    blockingFailure = true;
+                } else if (resolution.targets == null) {
+                    results[index] = ClassResult.skipped(
+                        request.className,
+                        request.path,
+                        resolution.message
+                    );
+                } else {
+                    for (Class<?> target : resolution.targets) {
+                        // 同一 Class 对象只能交给 redefineClasses 一次。
+                        if (scheduled.add(target)) {
+                            definitions.add(new ClassDefinition(target, resolution.bytecode));
+                        }
+                    }
+                    appliedMessages[index] = resolution.message;
+                }
+            }
+
+            if (blockingFailure) {
+                // 组内有一个类连“改哪个/能不能改”都无法确定时，整组都不发送；
+                // 不能先应用一半再告诉用户需要重启。
+                for (int index = 0; index < requests.size(); index++) {
+                    if (appliedMessages[index] != null) {
+                        results[index] = ClassResult.failed(
+                            requests.get(index).className,
+                            requests.get(index).path,
+                            "atomic group not applied: " + blockingReason
+                        );
+                    }
+                }
+            } else if (!definitions.isEmpty()) {
+                try {
+                    // JVM 保证 redefineClasses 的整组重定义是原子的：
+                    // 任一类的字节码被拒绝，所有类都保持旧定义。
+                    instrumentation.redefineClasses(
+                        definitions.toArray(new ClassDefinition[definitions.size()])
+                    );
+                    for (int index = 0; index < requests.size(); index++) {
+                        if (appliedMessages[index] != null) {
+                            results[index] = ClassResult.applied(
+                                requests.get(index).className,
+                                requests.get(index).path,
+                                appliedMessages[index]
+                            );
+                        }
+                    }
+                } catch (Throwable failure) {
+                    // 单类请求保留具体原因（schema / 字节码被拒），多类请求强调
+                    // “整组未应用”，避免把同组里被牵连的类误报成自身结构变更。
+                    String message = definitions.size() == 1
+                        ? "redefinition failed; class was not applied: " + describe(failure)
+                        : "atomic group redefinition failed; no classes were applied: "
+                            + describe(failure);
+                    for (int index = 0; index < requests.size(); index++) {
+                        if (appliedMessages[index] != null) {
+                            results[index] = ClassResult.failed(
+                                requests.get(index).className,
+                                requests.get(index).path,
+                                message
+                            );
+                        }
+                    }
+                }
+            }
+
+            List<ClassResult> ordered = new ArrayList<ClassResult>(requests.size());
             int applied = 0;
             int failed = 0;
             int skipped = 0;
-            for (ClassRequest request : requests) {
-                ClassResult result = reloadOne(instrumentation, request);
-                results.add(result);
+            for (int index = 0; index < requests.size(); index++) {
+                ClassResult result = results[index];
+                if (result == null) {
+                    result = ClassResult.failed(
+                        requests.get(index).className,
+                        requests.get(index).path,
+                        "internal error: no result"
+                    );
+                }
+                ordered.add(result);
                 if (result.code == CLASS_APPLIED) {
                     applied++;
                 } else if (result.code == CLASS_FAILED) {
@@ -337,65 +436,190 @@ public final class HotReloadAgent {
 
             String summary = "applied=" + applied + ", failed=" + failed + ", skipped=" + skipped;
             int status = failed == 0 && skipped == 0 ? STATUS_OK : STATUS_PARTIAL;
-            writeResponse(output, status, summary, results);
+            writeResponse(output, status, summary, ordered);
         }
     }
 
-    private static ClassResult reloadOne(Instrumentation instrumentation, ClassRequest request) {
+    /**
+     * 解析一个请求要重定义哪些已加载类。
+     *
+     * 同一个全限定类名可能被多个 ClassLoader 各加载一份；按名字取第一个会改错。
+     * 这里用 CodeSource 与请求的输出目录匹配：
+     * - 唯一副本：直接用（没有 CodeSource 时只能接受）；
+     * - 多副本：只改来源等于该输出目录的副本；来源全部未知或无法唯一确认时返回歧义错误。
+     * 多个来源相同的副本会一起加入整组原子重定义。
+     */
+    private static Resolution resolve(Instrumentation instrumentation, ClassRequest request) {
         if (request.className == null || request.className.isEmpty()) {
-            return ClassResult.failed("", "empty class name");
-        }
-        Class<?> target = null;
-        int copies = 0;
-        for (Class<?> loaded : instrumentation.getAllLoadedClasses()) {
-            if (request.className.equals(loaded.getName())) {
-                copies++;
-                if (target == null) {
-                    target = loaded;
-                }
-            }
-        }
-        if (target == null) {
-            return ClassResult.skipped(request.className, "class not loaded");
-        }
-        if (!instrumentation.isModifiableClass(target)) {
-            return ClassResult.failed(request.className, "class is not modifiable");
+            return Resolution.failed("empty class name");
         }
         if (request.path == null || request.path.isEmpty()) {
-            return ClassResult.failed(request.className, "class file path missing");
+            return Resolution.failed("class file path missing");
+        }
+
+        List<Class<?>> copies = new ArrayList<Class<?>>();
+        for (Class<?> loaded : instrumentation.getAllLoadedClasses()) {
+            if (request.className.equals(loaded.getName())) {
+                copies.add(loaded);
+            }
+        }
+        if (copies.isEmpty()) {
+            return Resolution.skipped("class not loaded");
+        }
+
+        String origin = normalizePath(request.origin);
+        if (origin == null) {
+            origin = deriveOrigin(request.className, request.path);
+        }
+
+        List<Class<?>> targets = new ArrayList<Class<?>>();
+        List<String> descriptions = new ArrayList<String>();
+        boolean hasUnknownOrigin = false;
+
+        if (copies.size() == 1) {
+            Class<?> only = copies.get(0);
+            String source = codeSourcePath(only);
+            if (source != null && origin != null && !samePath(source, origin)) {
+                return Resolution.failed(
+                    "origin mismatch: class is loaded from " + source + ", requested " + origin
+                );
+            }
+            targets.add(only);
+            descriptions.add(describe(only, source));
+        } else {
+            if (origin == null) {
+                return Resolution.failed(
+                    "ambiguous: " + copies.size()
+                        + " loaded copies and no output root to match; refusing to guess"
+                );
+            }
+            for (Class<?> copy : copies) {
+                String source = codeSourcePath(copy);
+                descriptions.add(describe(copy, source));
+                if (source == null) {
+                    hasUnknownOrigin = true;
+                } else if (samePath(source, origin)) {
+                    targets.add(copy);
+                }
+            }
+            if (targets.isEmpty()) {
+                if (hasUnknownOrigin) {
+                    return Resolution.failed(
+                        "ambiguous: " + copies.size()
+                            + " loaded copies, some without CodeSource; cannot uniquely match "
+                            + origin + " (" + join(descriptions) + ")"
+                    );
+                }
+                return Resolution.failed(
+                    "origin mismatch: loaded copies are " + join(descriptions)
+                        + ", requested " + origin
+                );
+            }
+            if (hasUnknownOrigin) {
+                return Resolution.failed(
+                    "ambiguous: besides " + origin + ", there are loaded copies without CodeSource ("
+                        + join(descriptions) + "); refusing to guess"
+                );
+            }
+        }
+
+        for (Class<?> target : targets) {
+            if (!instrumentation.isModifiableClass(target)) {
+                return Resolution.failed(
+                    "class is not modifiable (" + describe(target, codeSourcePath(target)) + ")"
+                );
+            }
         }
 
         byte[] bytecode;
         try {
             bytecode = Files.readAllBytes(Paths.get(request.path));
         } catch (IOException failure) {
-            return ClassResult.failed(request.className, "cannot read class file: " + failure);
+            return Resolution.failed("cannot read class file: " + failure);
         } catch (Throwable failure) {
-            return ClassResult.failed(request.className, "cannot read class file: " + failure);
+            return Resolution.failed("cannot read class file: " + failure);
         }
 
-        try {
-            instrumentation.redefineClasses(new ClassDefinition(target, bytecode));
-            String note = copies > 1 ? " (redefined one of " + copies + " loaded copies)" : "";
-            return ClassResult.applied(request.className, "redefined" + note);
-        } catch (UnmodifiableClassException failure) {
-            return ClassResult.failed(
-                request.className,
-                "class is not modifiable: " + String.valueOf(failure.getMessage())
-            );
-        } catch (UnsupportedOperationException failure) {
-            // JVM 对字段 / 方法 / 继承结构变更抛出的就是这一类：
-            // "attempted to change the schema" / "attempted to change the class hierarchy"。
-            return ClassResult.failed(request.className, String.valueOf(failure.getMessage()));
-        } catch (VerifyError failure) {
-            return ClassResult.failed(request.className, "bytecode rejected: " + failure);
-        } catch (ClassFormatError failure) {
-            return ClassResult.failed(request.className, "bytecode rejected: " + failure);
-        } catch (LinkageError failure) {
-            return ClassResult.failed(request.className, "bytecode rejected: " + failure);
-        } catch (Throwable failure) {
-            return ClassResult.failed(request.className, String.valueOf(failure));
+        String message = "redefined atomically from " + (origin == null ? "<unknown>" : origin);
+        if (targets.size() > 1) {
+            message += " (" + targets.size() + " loaded copies)";
         }
+        return Resolution.resolved(targets, bytecode, message);
+    }
+
+    private static String codeSourcePath(Class<?> clazz) {
+        try {
+            ProtectionDomain domain = clazz.getProtectionDomain();
+            if (domain == null) {
+                return null;
+            }
+            CodeSource source = domain.getCodeSource();
+            if (source == null) {
+                return null;
+            }
+            URL location = source.getLocation();
+            if (location == null || !"file".equalsIgnoreCase(location.getProtocol())) {
+                return null;
+            }
+            return canonicalPath(Paths.get(location.toURI()));
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static String deriveOrigin(String className, String classFile) {
+        String relative = className.replace('.', '/') + ".class";
+        String normalized = classFile.replace('\\', '/');
+        String suffix = "/" + relative;
+        if (normalized.endsWith(suffix)) {
+            return normalized.substring(0, normalized.length() - suffix.length());
+        }
+        return null;
+    }
+
+    private static String normalizePath(String path) {
+        if (path == null || path.isEmpty()) {
+            return null;
+        }
+        try {
+            return canonicalPath(Paths.get(path));
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static String canonicalPath(Path path) {
+        try {
+            return path.toRealPath().toString();
+        } catch (Throwable ignored) {
+            return path.toAbsolutePath().normalize().toString();
+        }
+    }
+
+    private static boolean samePath(String first, String second) {
+        return canonicalPath(Paths.get(first)).equals(canonicalPath(Paths.get(second)));
+    }
+
+    private static String describe(Class<?> clazz, String source) {
+        ClassLoader loader = clazz.getClassLoader();
+        String loaderName = loader == null ? "bootstrap" : loader.getClass().getName();
+        return loaderName + " -> " + (source == null ? "<unknown>" : source);
+    }
+
+    private static String describe(Throwable failure) {
+        String message = failure.getMessage();
+        return failure.getClass().getName() + (message == null ? "" : ": " + message);
+    }
+
+    private static String join(List<String> values) {
+        StringBuilder builder = new StringBuilder();
+        for (int index = 0; index < values.size(); index++) {
+            if (index > 0) {
+                builder.append("; ");
+            }
+            builder.append(values.get(index));
+        }
+        return builder.toString();
     }
 
     private static String statusMessage(Instrumentation instrumentation) {
@@ -451,6 +675,7 @@ public final class HotReloadAgent {
         output.writeInt(results.size());
         for (ClassResult result : results) {
             writeString(output, result.className);
+            writeString(output, result.path);
             output.writeByte(result.code);
             writeString(output, result.message);
         }
@@ -468,34 +693,68 @@ public final class HotReloadAgent {
     private static final class ClassRequest {
         final String className;
         final String path;
+        final String origin;
 
-        ClassRequest(String className, String path) {
+        ClassRequest(String className, String path, String origin) {
             this.className = className;
             this.path = path;
+            this.origin = origin;
+        }
+    }
+
+    /**
+     * 一个请求的解析结果：要么给出要一起重定义的 Class 对象和字节码，
+     * 要么是“类尚未加载”的跳过，要么是必须阻止整组提交的失败原因。
+     */
+    private static final class Resolution {
+        final List<Class<?>> targets;
+        final byte[] bytecode;
+        final String message;
+        final String failure;
+
+        private Resolution(List<Class<?>> targets, byte[] bytecode, String message, String failure) {
+            this.targets = targets;
+            this.bytecode = bytecode;
+            this.message = message;
+            this.failure = failure;
+        }
+
+        static Resolution resolved(List<Class<?>> targets, byte[] bytecode, String message) {
+            return new Resolution(targets, bytecode, message, null);
+        }
+
+        static Resolution skipped(String message) {
+            return new Resolution(null, null, message, null);
+        }
+
+        static Resolution failed(String failure) {
+            return new Resolution(null, null, failure, failure);
         }
     }
 
     private static final class ClassResult {
         final String className;
+        final String path;
         final int code;
         final String message;
 
-        ClassResult(String className, int code, String message) {
+        ClassResult(String className, String path, int code, String message) {
             this.className = className;
+            this.path = path;
             this.code = code;
             this.message = message;
         }
 
-        static ClassResult applied(String className, String message) {
-            return new ClassResult(className, CLASS_APPLIED, message);
+        static ClassResult applied(String className, String path, String message) {
+            return new ClassResult(className, path, CLASS_APPLIED, message);
         }
 
-        static ClassResult failed(String className, String message) {
-            return new ClassResult(className, CLASS_FAILED, message);
+        static ClassResult failed(String className, String path, String message) {
+            return new ClassResult(className, path, CLASS_FAILED, message);
         }
 
-        static ClassResult skipped(String className, String message) {
-            return new ClassResult(className, CLASS_SKIPPED, message);
+        static ClassResult skipped(String className, String path, String message) {
+            return new ClassResult(className, path, CLASS_SKIPPED, message);
         }
     }
 }

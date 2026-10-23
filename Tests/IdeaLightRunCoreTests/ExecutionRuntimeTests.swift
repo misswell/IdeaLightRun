@@ -193,20 +193,16 @@ final class ExecutionRuntimeTests: XCTestCase {
     // MARK: - Before Launch 的同步执行
 
     func testRunUntilExitSucceeds() async throws {
-        var lines: [String] = []
-        let lock = NSLock()
+        let lines = LockedLines()
         try await ExecutionRuntime.runUntilExit(
             execution: .process(plan("/bin/echo", ["referenced-ok"])),
             configName: "Referenced",
             processHandle: nil,
             log: { line in
-                lock.lock(); lines.append(line.text); lock.unlock()
+                lines.append(line.text)
             }
         )
-        lock.lock()
-        let text = lines.joined(separator: "\n")
-        lock.unlock()
-        XCTAssertTrue(text.contains("referenced-ok"), text)
+        XCTAssertTrue(lines.text.contains("referenced-ok"), lines.text)
     }
 
     func testRunUntilExitNonZeroFailsAsBuildFailure() async throws {
@@ -385,5 +381,22 @@ final class ExecutionRuntimeTests: XCTestCase {
         lock.unlock()
         XCTAssertTrue(observed.contains(.cancelled), "\(observed)")
         XCTAssertFalse(observed.contains { if case .failed = $0 { return true }; return false }, "用户停止不能报成测试失败：\(observed)")
+    }
+}
+
+private final class LockedLines: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+
+    func append(_ line: String) {
+        lock.lock()
+        lines.append(line)
+        lock.unlock()
+    }
+
+    var text: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return lines.joined(separator: "\n")
     }
 }

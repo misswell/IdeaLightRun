@@ -1258,7 +1258,8 @@ struct ConfigurationDetailView: View {
                     restartTitle: "重启应用",
                     onManual: { model?.requestHotReload() },
                     onRestart: { store.restart(configKey: config.uniqueKey, projectID: project.id) },
-                    onDismiss: { model?.dismissHotReloadRestartPrompt() }
+                    onDismiss: { model?.dismissHotReloadRestartPrompt() },
+                    onRetryWatcher: { model?.retryHotReloadWatcher() }
                 )
             } else if settings.enabled {
                 Divider()
@@ -1324,7 +1325,8 @@ struct ConfigurationDetailView: View {
                     memberRunning: snapshot != nil,
                     onManual: { session?.requestHotReload(memberID: memberID) },
                     onRestart: { store.restart(configKey: parentConfig.uniqueKey, projectID: project.id) },
-                    onDismiss: { session?.dismissHotReloadRestartPrompt(memberID: memberID) }
+                    onDismiss: { session?.dismissHotReloadRestartPrompt(memberID: memberID) },
+                    onRetryWatcher: { session?.retryHotReloadWatcher(memberID: memberID) }
                 )
             } else {
                 Text("\(member.name)（\(memberConfig.type.displayName)）：该类型不启动可热更新的 JVM。")
@@ -1603,6 +1605,7 @@ private struct CompoundMemberHotReloadView: View {
     let onManual: () -> Void
     let onRestart: () -> Void
     let onDismiss: () -> Void
+    let onRetryWatcher: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1638,7 +1641,8 @@ private struct CompoundMemberHotReloadView: View {
                     restartTitle: "重启整个组合",
                     onManual: onManual,
                     onRestart: onRestart,
-                    onDismiss: onDismiss
+                    onDismiss: onDismiss,
+                    onRetryWatcher: onRetryWatcher
                 )
             } else if configuration.enabled {
                 Text(memberRunning
@@ -1660,6 +1664,7 @@ private struct HotReloadStatusView: View {
     let onManual: () -> Void
     let onRestart: () -> Void
     let onDismiss: () -> Void
+    let onRetryWatcher: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1697,10 +1702,21 @@ private struct HotReloadStatusView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            if let issue = snapshot.watcherIssue, !issue.isEmpty, !snapshot.isWatching {
+                Label(issue, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack(spacing: 8) {
                 Button("立即编译并热更新", action: onManual)
                     .controlSize(.small)
                     .disabled(!snapshot.canManualTrigger)
+                if snapshot.canRetryWatcher {
+                    Button("重试监听", action: onRetryWatcher)
+                        .controlSize(.small)
+                }
                 if snapshot.awaitingRestartConfirmation {
                     Button("立即重启", action: onRestart)
                         .controlSize(.small)
@@ -1840,7 +1856,9 @@ private func hotReloadStateColor(_ state: HotReloadState) -> Color {
     case .succeeded: return .green
     case .listening, .compiling, .applying, .restarted: return .blue
     case .partial, .attention, .delegated: return .orange
-    case .compileFailed, .failed, .unsupported, .requiresRestart, .agentUnavailable: return .red
+    case .compileFailed, .failed, .unsupported, .requiresRestart, .agentUnavailable,
+         .watcherUnavailable:
+        return .red
     case .disabled, .stopped: return .gray
     }
 }

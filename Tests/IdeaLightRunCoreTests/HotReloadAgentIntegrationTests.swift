@@ -93,19 +93,296 @@ final class HotReloadAgentIntegrationTests: XCTestCase {
         )
     }
 
+    func testMultipleClassesAreRedefinedInOneAtomicGroup() throws {
+        let scenario = try makePairScenario(a: "a1", b: "b1")
+        defer { scenario.stop() }
+        scenario.session.start()
+
+        XCTAssertNotNil(
+            scenario.recorder.waitFor(timeout: 30) { $0.state == .listening && $0.isWatching },
+            "热更新会话未进入监听状态：\(scenario.diagnostics())"
+        )
+
+        try writePairSources(a: "a2", b: "b2")
+
+        let outcome = scenario.recorder.waitFor(timeout: 40) {
+            $0.summary != nil && !$0.state.isBusy && $0.state != .listening
+        }
+        XCTAssertEqual(outcome?.state, .succeeded, "两方法体应同组替换成功：\(scenario.diagnostics())")
+        XCTAssertEqual(outcome?.summary?.appliedClasses, ["demo.A", "demo.B"])
+        XCTAssertTrue(
+            waitForOutput(containing: "PAIR=a2:b2", timeout: 15),
+            "两个类的方法体都必须生效：\(scenario.output())"
+        )
+    }
+
+    func testStructuralFailureLeavesWholeGroupUnapplied() throws {
+        // App 同时调用 A 与 B：先改 A 的方法体，再让 B 增加字段。
+        // 如果按类逐个 redefine，会出现 A 已替换、B 失败的半更新状态。
+        let scenario = try makePairScenario(a: "a1", b: "b1")
+        defer { scenario.stop() }
+        scenario.session.start()
+
+        XCTAssertNotNil(
+            scenario.recorder.waitFor(timeout: 30) { $0.state == .listening && $0.isWatching },
+            "热更新会话未进入监听状态：\(scenario.diagnostics())"
+        )
+
+        try writePairSources(a: "a2", b: "b1", addFieldToB: true)
+
+        let outcome = scenario.recorder.waitFor(timeout: 40) {
+            $0.summary != nil && !$0.state.isBusy && $0.state != .listening
+        }
+        XCTAssertEqual(
+            outcome?.state,
+            .requiresRestart,
+            "整组被拒后必须报告需要重启：\(scenario.diagnostics())"
+        )
+        XCTAssertEqual(outcome?.summary?.appliedClasses, [])
+        let failures = outcome?.summary?.failedClasses ?? []
+        XCTAssertEqual(Set(failures.map(\.className)), ["demo.A", "demo.B"])
+        XCTAssertTrue(
+            failures.allSatisfy { $0.kind == .atomicGroupAborted },
+            "整组拒绝必须如实标注：\(failures.map { "\($0.className)=\($0.kind)" })"
+        )
+        XCTAssertTrue(scenario.process.isRunning, "redefine 失败不应杀死应用")
+        XCTAssertFalse(
+            scenario.output().contains("PAIR=a2"),
+            "组内结构失败时 A 也不能被单独应用：\(scenario.output())"
+        )
+        XCTAssertTrue(waitForOutput(containing: "PAIR=a1:b1", timeout: 5))
+    }
+
+    func testSameNameClassMatchesLoadedCopyByCodeSource() async throws {
+        let projectRoot = workRoot.appendingPathComponent("loader-project", isDirectory: true)
+        let appSources = projectRoot.appendingPathComponent("app-src", isDirectory: true)
+        let appClasses = projectRoot.appendingPathComponent("app-classes", isDirectory: true)
+        let leftDir = projectRoot.appendingPathComponent("left", isDirectory: true)
+        let rightDir = projectRoot.appendingPathComponent("right", isDirectory: true)
+        try FileManager.default.createDirectory(at: leftDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: rightDir, withIntermediateDirectories: true)
+
+        try compilePlugin(value: "left1", into: leftDir)
+        try compilePlugin(value: "right1", into: rightDir)
+        try writeLoaderApp(to: appSources)
+        try FileManager.default.createDirectory(at: appClasses, withIntermediateDirectories: true)
+        try Self.runTool(
+            javaHome.appendingPathComponent("bin/javac"),
+            [
+                "-encoding", "UTF-8", "-d", appClasses.path,
+                appSources.appendingPathComponent("demo/LoaderApp.java").path
+            ],
+            workingDirectory: projectRoot
+        )
+
+        let agentLaunch = try HotReloadAgentLaunch.prepare(jarURL: agentJar)
+        let outputURL = projectRoot.appendingPathComponent("loader.log")
+        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        let outputHandle = try FileHandle(forWritingTo: outputURL)
+        let process = Process()
+        process.executableURL = javaHome.appendingPathComponent("bin/java")
+        process.arguments = agentLaunch.jvmArguments + [
+            "-cp", appClasses.path,
+            "demo.LoaderApp", leftDir.path, rightDir.path
+        ]
+        process.currentDirectoryURL = projectRoot
+        process.standardOutput = outputHandle
+        process.standardError = outputHandle
+        try process.run()
+        defer {
+            terminate(process)
+            try? outputHandle.close()
+            agentLaunch.cleanup()
+        }
+
+        XCTAssertTrue(
+            waitForLog(at: outputURL, containing: "COPIES=left1:right1", timeout: 20),
+            "两个 ClassLoader 未按预期加载同名类"
+        )
+        try compilePlugin(value: "right2", into: rightDir)
+
+        let port = try await HotReloadAgentEndpoint.waitForPort(
+            portFile: agentLaunch.portFileURL,
+            timeout: 20
+        )
+        let client = try HotReloadAgentClient(port: port, token: agentLaunch.token)
+        defer { client.shutdown() }
+
+        let rightClassFile = rightDir.appendingPathComponent("dupe/Plugin.class")
+        let applied = try client.reload(classes: [(
+            name: "dupe.Plugin",
+            path: rightClassFile.path,
+            origin: rightDir.path
+        )])
+        XCTAssertEqual(applied.status, .ok, "实际响应：\(applied.message)")
+        XCTAssertEqual(applied.classes.first?.filePath, rightClassFile.path)
+        XCTAssertTrue(
+            waitForLog(at: outputURL, containing: "COPIES=left1:right2", timeout: 15),
+            "只有来源匹配的那份副本应被替换：\(readLog(at: outputURL))"
+        )
+
+        // 输出目录匹配不到任何已加载副本：必须拒绝，不能退回“取第一个”。
+        let wrongOrigin = projectRoot.appendingPathComponent("not-a-source", isDirectory: true)
+        try FileManager.default.createDirectory(at: wrongOrigin, withIntermediateDirectories: true)
+        let mismatch = try client.reload(classes: [(
+            name: "dupe.Plugin",
+            path: rightClassFile.path,
+            origin: wrongOrigin.path
+        )])
+        XCTAssertEqual(mismatch.status, .partial)
+        let mismatchResult = try XCTUnwrap(mismatch.classes.first)
+        XCTAssertTrue(mismatchResult.message.contains("origin mismatch"))
+        XCTAssertEqual(HotReloadFailureKind.classify(mismatchResult.message), .classOriginMismatch)
+
+        // 无法从路径推导输出来源、且存在两份副本：必须返回歧义错误。
+        let ambiguous = try client.reload(classes: [(
+            name: "dupe.Plugin",
+            path: rightDir.appendingPathComponent("dupe/Plugin.class.bin").path,
+            origin: ""
+        )])
+        XCTAssertEqual(ambiguous.status, .partial)
+        let ambiguousResult = try XCTUnwrap(ambiguous.classes.first)
+        XCTAssertTrue(ambiguousResult.message.contains("ambiguous"))
+        XCTAssertEqual(HotReloadFailureKind.classify(ambiguousResult.message), .ambiguousClass)
+        XCTAssertTrue(
+            readLog(at: outputURL).contains("COPIES=left1:right2"),
+            "被拒绝的请求不能改动任何副本"
+        )
+    }
+
     // MARK: - 场景
 
-    private func makeScenario(value: String) throws -> AgentScenario {
-        let projectRoot = workRoot.appendingPathComponent("project", isDirectory: true)
-        let sourceRoot = projectRoot.appendingPathComponent("src/main/java", isDirectory: true)
-        let sourceURL = sourceRoot.appendingPathComponent("demo/App.java")
-        let classesRoot = projectRoot.appendingPathComponent("target/classes", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: sourceURL.deletingLastPathComponent(),
+    private func compilePlugin(value: String, into output: URL) throws {
+        let sourceRoot = projectRootForPlugin(value: value)
+        try Self.runTool(
+            javaHome.appendingPathComponent("bin/javac"),
+            [
+                "-encoding", "UTF-8", "-d", output.path,
+                sourceRoot.appendingPathComponent("dupe/Plugin.java").path
+            ],
+            workingDirectory: sourceRoot
+        )
+    }
+
+    private func projectRootForPlugin(value: String) -> URL {
+        let root = workRoot.appendingPathComponent("plugin-\(value)", isDirectory: true)
+        let source = root.appendingPathComponent("dupe/Plugin.java")
+        try? FileManager.default.createDirectory(
+            at: source.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
+        let contents = """
+        package dupe;
+
+        public class Plugin {
+            public static String value() { return "\(value)"; }
+        }
+
+        """
+        try? Data(contents.utf8).write(to: source)
+        return root
+    }
+
+    private func writeLoaderApp(to sourceRoot: URL) throws {
+        let url = sourceRoot.appendingPathComponent("demo/LoaderApp.java")
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let contents = """
+        package demo;
+
+        import java.io.File;
+        import java.lang.reflect.Method;
+        import java.net.URL;
+        import java.net.URLClassLoader;
+
+        public class LoaderApp {
+            public static void main(String[] args) throws Exception {
+                URLClassLoader left = new URLClassLoader(
+                    new URL[] { new File(args[0]).toURI().toURL() },
+                    null
+                );
+                URLClassLoader right = new URLClassLoader(
+                    new URL[] { new File(args[1]).toURI().toURL() },
+                    null
+                );
+                Method leftValue = left.loadClass("dupe.Plugin").getMethod("value");
+                Method rightValue = right.loadClass("dupe.Plugin").getMethod("value");
+                while (true) {
+                    System.out.println(
+                        "COPIES=" + leftValue.invoke(null) + ":" + rightValue.invoke(null)
+                    );
+                    System.out.flush();
+                    Thread.sleep(100);
+                }
+            }
+        }
+
+        """
+        try Data(contents.utf8).write(to: url)
+    }
+
+    private func waitForLog(at url: URL, containing needle: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if readLog(at: url).contains(needle) { return true }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return readLog(at: url).contains(needle)
+    }
+
+    private func readLog(at url: URL) -> String {
+        (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    }
+
+    /// 同步收尾；异步测试的 defer 不能 await，把等待封在同步函数里也避免 noasync 告警。
+    private func terminate(_ process: Process) {
+        guard process.isRunning else { return }
+        process.terminate()
+        let deadline = Date().addingTimeInterval(5)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+    }
+
+    private func makeScenario(value: String) throws -> AgentScenario {
+        try startScenario(
+            sources: ["demo/App.java": singleClassSource(value: value)],
+            mainClass: "demo.App"
+        )
+    }
+
+    private func makePairScenario(a: String, b: String) throws -> AgentScenario {
+        try startScenario(
+            sources: [
+                "demo/App.java": pairAppSource,
+                "demo/A.java": pairClassSource(name: "A", value: a),
+                "demo/B.java": pairClassSource(name: "B", value: b)
+            ],
+            mainClass: "demo.App"
+        )
+    }
+
+    private func startScenario(
+        sources: [String: String],
+        mainClass: String
+    ) throws -> AgentScenario {
+        let projectRoot = workRoot.appendingPathComponent("project", isDirectory: true)
+        let sourceRoot = projectRoot.appendingPathComponent("src/main/java", isDirectory: true)
+        let classesRoot = projectRoot.appendingPathComponent("target/classes", isDirectory: true)
+        for (relative, contents) in sources {
+            let url = sourceRoot.appendingPathComponent(relative)
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data(contents.utf8).write(to: url, options: .atomic)
+        }
         try FileManager.default.createDirectory(at: classesRoot, withIntermediateDirectories: true)
-        try writeSource(value: value)
 
         let adapter = JavacAdapter(sourceRoot: sourceRoot, outputRoot: classesRoot, javaHome: javaHome)
         try adapter.buildModule(
@@ -124,7 +401,7 @@ final class HotReloadAgentIntegrationTests: XCTestCase {
         let process = Process()
         process.executableURL = javaHome.appendingPathComponent("bin/java")
         process.arguments = agentLaunch.jvmArguments
-            + ["-cp", classesRoot.path, "demo.App"]
+            + ["-cp", classesRoot.path, mainClass]
         process.currentDirectoryURL = projectRoot
         process.standardOutput = outputHandle
         process.standardError = outputHandle
@@ -183,6 +460,71 @@ final class HotReloadAgentIntegrationTests: XCTestCase {
             recorder: recorder,
             session: session
         )
+    }
+
+    private func singleClassSource(value: String, extraField: Bool = false) -> String {
+        let field = extraField ? "    static int extra = 0;\n" : ""
+        return """
+        package demo;
+
+        public class App {
+            static String value() { return "\(value)"; }
+        \(field)
+            public static void main(String[] args) throws Exception {
+                while (true) {
+                    System.out.println("VALUE=" + value());
+                    System.out.flush();
+                    Thread.sleep(100);
+                }
+            }
+        }
+
+        """
+    }
+
+    private var pairAppSource: String {
+        """
+        package demo;
+
+        public class App {
+            public static void main(String[] args) throws Exception {
+                while (true) {
+                    System.out.println("PAIR=" + A.value() + ":" + B.value());
+                    System.out.flush();
+                    Thread.sleep(100);
+                }
+            }
+        }
+
+        """
+    }
+
+    private func pairClassSource(name: String, value: String, extraField: Bool = false) -> String {
+        let field = extraField ? "    static int extra = 0;\n" : ""
+        return """
+        package demo;
+
+        public class \(name) {
+        \(field)
+            public static String value() { return "\(value)"; }
+        }
+
+        """
+    }
+
+    private func writePairSources(a: String, b: String, addFieldToB: Bool = false) throws {
+        try writePairFile("demo/A.java", pairClassSource(name: "A", value: a))
+        try writePairFile(
+            "demo/B.java",
+            pairClassSource(name: "B", value: b, extraField: addFieldToB)
+        )
+    }
+
+    private func writePairFile(_ relativePath: String, _ contents: String) throws {
+        let url = workRoot
+            .appendingPathComponent("project/src/main/java")
+            .appendingPathComponent(relativePath)
+        try Data(contents.utf8).write(to: url, options: .atomic)
     }
 
     /// 改源码必须换一个 inode：原子写会让 FSEvents 产生明确的变更事件，
