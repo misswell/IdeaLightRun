@@ -101,6 +101,10 @@ public enum HotReloadState: Equatable, Sendable {
     case watcherUnavailable
     /// 检测到源码变化但自动编译已关闭，等待用户手动触发。
     case attention
+    /// 用户关闭运行中的热更新，正在停止监听与后台任务。
+    case disabling
+    /// 运行中的热更新已被用户关闭；Java 进程继续运行。
+    case closed
     case stopped
 
     public var displayText: String {
@@ -120,12 +124,14 @@ public enum HotReloadState: Equatable, Sendable {
         case .agentUnavailable: return "Agent 不可用"
         case .watcherUnavailable: return "文件监听不可用"
         case .attention: return "待手动编译"
+        case .disabling: return "正在关闭"
+        case .closed: return "热更新已关闭"
         case .stopped: return "已停止"
         }
     }
 
     public var isBusy: Bool {
-        self == .compiling || self == .applying
+        self == .compiling || self == .applying || self == .disabling
     }
 
     /// 需要用户处理（重启 / 排查）的状态。

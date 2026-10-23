@@ -61,6 +61,16 @@ final class ExecutionRuntimeTests: XCTestCase {
         XCTAssertTrue(text.contains("hello-runtime"), text)
     }
 
+    func testRuntimeWithoutHotReloadPlanDoesNotCreateSession() throws {
+        let runtime = try makeRuntime("/bin/echo", ["no-hot-reload"])
+        XCTAssertNil(runtime.hotReloadSnapshot, "未启用的配置不得创建热更新会话")
+
+        runtime.start()
+        XCTAssertTrue(runtime.waitUntilExit(timeout: 10))
+        runtime.disableHotReload()
+        XCTAssertNil(runtime.hotReloadSnapshot, "关闭未启用的热更新不应产生会话")
+    }
+
     func testStopTerminatesRuntime() throws {
         let runtime = try makeRuntime("/bin/sleep", ["100"])
         runtime.start()

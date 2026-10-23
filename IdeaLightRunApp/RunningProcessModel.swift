@@ -189,6 +189,16 @@ final class RunningProcessModel: LogViewModel, Identifiable {
         }
     }
 
+    /// 运行中关闭热更新：只停监听与 Agent 通道，Java 进程继续运行。
+    func disableHotReload(memberID: String? = nil) {
+        if let memberID,
+           let index = compoundMembers.firstIndex(where: { $0.id == memberID }) {
+            runtime?.members[index].disableHotReload()
+        } else {
+            runtime?.disableHotReload()
+        }
+    }
+
     /// 成员控制台：Compound 每个成员一份独立日志缓冲。
     func consoleModel(for memberID: String) -> LogViewModel? {
         memberConsoles[memberID]

@@ -213,6 +213,14 @@ public final class ExecutionRuntime: @unchecked Sendable {
         session?.retryWatcher()
     }
 
+    /// 运行中关闭热更新：停止监听、待处理编译与 Agent 控制通道，不改动 Java 进程。
+    public func disableHotReload() {
+        hotReloadLock.lock()
+        let session = hotReloadSession
+        hotReloadLock.unlock()
+        session?.disable()
+    }
+
     private func startHotReload() {
         hotReloadLock.lock()
         let session = hotReloadSession

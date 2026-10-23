@@ -97,10 +97,11 @@ Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准�
 
 ### 使用
 
-1. 选中 **Application** 或 **Spring Boot** 配置 → 「信息」→「热更新」→ 勾选启用
-2. 按需选择后端、自动编译、监听外部编译输出 / 资源、回退策略、去抖与忽略路径；设置在下一次启动生效
+1. 选中 **Application** 或 **Spring Boot** 配置，直接点顶栏 **Restart 后面的「热更新」开关**；完整选项在「信息」→「热更新」
+2. 按需选择后端、自动编译、监听外部编译输出 / 资源、回退策略、去抖与忽略路径；启用与参数改动在下一次启动生效
 3. Run 之后保存源码，或在外部（IDEA / 命令行）构建产出 class；状态面板会显示 `监听中 → 编译中 → 应用中 → 热更新成功 / 部分更新 / 编译失败 / 需要重启`
-4. 「立即编译并热更新」用于自动编译关闭或只想手动触发时；需要重启时可「立即重启」或「暂不重启」
+4. 运行中关闭开关会立即停止监听与 Agent 控制通道，Java 进程继续运行；运行中打开会提示立即重启，因为 Agent 只能随 JVM 启动注入
+5. 「立即编译并热更新」用于自动编译关闭或只想手动触发时；需要重启时可「立即重启」或「暂不重启」
 
 监听范围是各模块的 `src/main/{java,kotlin,groovy,scala}`、`src/main/resources`，以及 runtime classpath 中位于项目内的输出目录。文件事件只作为「可能有变化」的信号，会话重新做 SHA-256 指纹 diff，因此自己编译的产物、IDEA/命令行外部构建、编辑器原子保存都不会重复触发同一批变更；编译期间的新事件排队处理，编译期间再次保存的源码会保留旧指纹并进入下一轮，不会丢改动。多模块项目只编译变更所属模块，共享模块的变更会应用到每个受影响的服务；同一项目的构建由 BuildGate 串行化。
 
@@ -110,6 +111,8 @@ Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准�
 - **初始化窗口不丢事件**：先建立基准快照，启动监听成功后再做一次对账快照；两者之间的保存会被发现并排队处理，不会因为 FSEvents 从「现在」开始而永久漏掉。
 - **同名类不按名字猜**：工作区 diff 用「输出目录 + 全限定类名」区分同名类；内置 Agent 用 `CodeSource` 匹配实际 ClassLoader。存在多份副本且无法唯一确认时返回歧义错误并拒绝替换，不会「取第一个」。
 - **多类整组原子**：一次变更涉及的所有类放在同一个控制请求里，Agent 只调用一次 `Instrumentation.redefineClasses`。JVM 保证整组原子：任何一个类被拒绝，所有类都保持旧定义；界面显示「整组未应用（组内类被拒绝）」，不会出现前几个类已替换、后一个失败的部分成功。
+- **运行中关闭有明确终态**：关闭开关后先显示「正在关闭」，停止文件监听、取消待执行去抖与编译、关闭 Agent 控制通道并清理临时凭据，最后显示「热更新已关闭」；Java 进程继续运行。已注入的 Agent 无法从 JVM 卸载，但不会再收到替换请求。编译过程中关闭也会终止构建，不会把在途结果报成成功。
+- **运行中开启不伪造生效**：Agent 只能随 JVM 启动注入。对已运行实例打开开关会保存设置并提示「重新启动后生效」，提供立即重启入口；Compound 成员需要重启整个组合。
 
 ### 后端与能力边界
 
@@ -245,7 +248,7 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 
 ## 当前进度
 
-已完成：Core 解析与宏、Maven / Gradle 编译与 classpath、启动流水线、统一 `PreparedExecution` / `ExecutionRuntime` 执行器、JAR Application 启动、Compound 多配置编排（独立进程 / 日志 / 端口、分组控制、嵌套展开与部分失败清理）、Maven 配置直接运行、JUnit 测试运行（Maven Surefire / Gradle Test、目标展开、测试结果判定与日志展示）、进程与日志、GUI 三栏、Build/Rebuild/Clean（Maven 与 Gradle）、运行端口检测、扫描诊断与统一配置能力计算、在线更新、按配置启用的热更新（内置 HotSwap / DevTools / 外部 Agent、手动触发、回退重启、Compound 成员独立状态）。
+已完成：Core 解析与宏、Maven / Gradle 编译与 classpath、启动流水线、统一 `PreparedExecution` / `ExecutionRuntime` 执行器、JAR Application 启动、Compound 多配置编排（独立进程 / 日志 / 端口、分组控制、嵌套展开与部分失败清理）、Maven 配置直接运行、JUnit 测试运行（Maven Surefire / Gradle Test、目标展开、测试结果判定与日志展示）、进程与日志、GUI 三栏、Build/Rebuild/Clean（Maven 与 Gradle）、运行端口检测、扫描诊断与统一配置能力计算、在线更新、按配置启用的热更新（内置 HotSwap / DevTools / 外部 Agent、手动触发、回退重启、Compound 成员独立状态、运行中关闭立即停止监听与重新启用需重启）。
 
 待做：
 
@@ -281,8 +284,8 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 ## 测试
 
 ```bash
-swift test                                        # 本地全量：486 用例
-swift test --skip MavenClasspathIntegrationTests  # CI 集合：483 用例（跳过那 3 个要真实下载依赖的）
+swift test                                        # 本地全量：492 用例
+swift test --skip MavenClasspathIntegrationTests  # CI 集合：489 用例（跳过那 3 个要真实下载依赖的）
 ```
 
 覆盖范围：
@@ -291,7 +294,7 @@ swift test --skip MavenClasspathIntegrationTests  # CI 集合：483 用例（跳
 - **构建与启动** — JavaRunPlanner（§26–§29）、JarRunPlanner（`java -jar` 参数顺序、默认工作目录、缺失/不可读 JAR）、ExecutionRuntime（日志/PID/终态转发、Stop、Before Launch 同步执行与取消、测试终态：失败/无测试/无汇总/用户停止）、MavenRunExecution（直接运行参数顺序与 `-nsu` 缺失、Project JDK / `MAVEN_OPTS`、pom 与不支持选项的 fail-closed、宏与 `$Prompt$`、Surefire 模块范围/筛选/工作目录限制）、TestTargetResolver（类/方法/包/目录/模式展开与无匹配拒绝）、TestOutcomeMonitor（Surefire `Results:` 汇总与逐类行、旧版 `Results :`、Gradle SUMMARY、无测试检测）、Compound（成员按引用顺序准备、嵌套展开、缺失/类型不匹配/成环拦截、独立 PID 与日志、分组 Stop/Force Kill、部分失败清理）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator / GradleLocator（Dock 启动无 PATH 时的绝对路径枚举与 wrapper 发行版兜底）、GradleBuildService（project path 任务、合并编译与 classpath 解析、provided 变体、缓存失效、失败与取消、JUnit `:test` 与 `--tests`/init script）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
 - **诊断与能力** — ScanDiagnostic（读失败 / XML 损坏 / 配置目录不可读 / 重复配置 / 缺 Main Class / 不支持的 Before Launch 任务都带严重程度与建议，不静默丢配置）、ConfigurationCapabilityResolver（类型 + 构建系统 + 字段 + Module 解析 + Before Launch 统一裁决）、BuildSystemSelector（Maven/Gradle 共存时的确定性选择）、Gradle settings/projectDir 解析、Maven `$MODULE_DIR$` POM 路径、ProcessHandle 启动前取消与 SIGTERM→SIGKILL 升级
 - **进程与日志** — ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、LogRingBuffer（§37 上限）、LogScrollFollow（停在底部才跟随新日志，向上回看不抢滚动）
-- **热更新** — HotReloadConfiguration（默认关闭、外部 Agent 参数分词、忽略路径、回退策略）、HotReloadWorkspace（源/输出快照与 SHA-256 指纹、同名类按输出目录区分、外部构建产物识别、编译期事件合并、不把半成品推给 JVM）、HotReloadWatcher（FSEventStream 创建/启动失败上报、停止释放、失败后重试、初始化基准与监听之间的保存对账）、HotReloadAgent 控制协议（loopback + 随机 token、帧上限、状态/重载/关闭、整组原子重定义）、失败分类（结构变更 / 整组未应用 / 同名类歧义 / 来源不匹配 / 类未加载 / 字节码拒绝）、真实 JVM 集成（javac 编译 + Agent 附加 + 方法体替换生效、两方法体同组成功、结构失败时整组不应用且进程保持存活、同一 FQCN 的两个 ClassLoader 按 CodeSource 只替换匹配副本、来源不匹配与歧义拒绝、JDK 8 / JDK 17 构建脚本）、自动重启走既有停止→准备链路，CLI 侧 `--hot-reload` 冒烟（编译、替换、Ctrl-C 退出码 130、无孤儿 JVM）
+- **热更新** — HotReloadConfiguration（默认关闭、外部 Agent 参数分词、忽略路径、回退策略）、HotReloadWorkspace（源/输出快照与 SHA-256 指纹、同名类按输出目录区分、外部构建产物识别、编译期事件合并、不把半成品推给 JVM）、HotReloadWatcher（FSEventStream 创建/启动失败上报、停止释放、失败后重试、初始化基准与监听之间的保存对账）、HotReloadAgent 控制协议（loopback + 随机 token、帧上限、状态/重载/关闭、整组原子重定义）、失败分类（结构变更 / 整组未应用 / 同名类歧义 / 来源不匹配 / 类未加载 / 字节码拒绝）、运行中开关生命周期（启动开/启动关、运行中关先「正在关闭」再「热更新已关闭」并停监听/取消去抖与编译/关 Agent 通道、编译中关闭不发布成功、Compound 单成员关闭不影响其它成员、关闭后不会自行复活）、真实 JVM 集成（javac 编译 + Agent 附加 + 方法体替换生效、两方法体同组成功、结构失败时整组不应用且进程保持存活、同一 FQCN 的两个 ClassLoader 按 CodeSource 只替换匹配副本、来源不匹配与歧义拒绝、JDK 8 / JDK 17 构建脚本）、自动重启走既有停止→准备链路，CLI 侧 `--hot-reload` 冒烟（编译、替换、Ctrl-C 退出码 130、无孤儿 JVM）
 - **在线更新** — 版本比较与 fail-closed、发布元数据解析（JSON 与 expanded_assets 两条路径）、镜像链顺序与回退/取消/坏文件删除、更新助手参数契约与重启路径、designated requirement 解析与语义判定，以及把产物名 / bundle id / Team / 助手落点钉到 `scripts/` 与 `release.yml` **原文**的防漂移断言
 
 ## 打包与发布

@@ -741,6 +741,8 @@ struct ConfigurationDetailView: View {
     @State private var consoleSessionInstanceID: String?
     /// Compound 控制台显示哪个成员；nil = 合并的全部日志。
     @State private var consoleMemberKey: String?
+    /// 运行中打开热更新：Agent 只能启动时注入，确认是否立即重启生效。
+    @State private var pendingHotReloadRestart = false
 
     enum DetailTab: String, CaseIterable {
         case info = "信息"
@@ -768,6 +770,17 @@ struct ConfigurationDetailView: View {
             } else {
                 emptyPane(icon: "doc.text.magnifyingglass", text: "选择一个项目查看配置")
             }
+        }
+        .alert("启用热更新需要重启", isPresented: $pendingHotReloadRestart) {
+            Button("立即重启") {
+                if let project = store.selectedProject, let config = store.selectedConfiguration {
+                    store.restart(configKey: config.uniqueKey, projectID: project.id)
+                    detailTab = .console
+                }
+            }
+            Button("稍后", role: .cancel) {}
+        } message: {
+            Text("Agent 只能在 JVM 启动时注入，当前实例启动时未启用热更新。设置已保存，下一次启动生效。")
         }
     }
 
@@ -1022,9 +1035,43 @@ struct ConfigurationDetailView: View {
             .help("停止旧进程后重新编译启动")
             .disabled(model == nil || model?.isBuilding == true)
             .disabled(model?.state == .stopping)
+
+            if config.type == .application || config.type == .springBoot {
+                hotReloadHeaderToggle(config: config, project: project)
+            }
         }
         // 不撑满宽度：按钮组左对齐，右侧留给标签页选择器（见 `header`）。
         .fixedSize()
+    }
+
+    /// 顶栏热更新开关：运行中关闭会立即停止监听；打开需要重新注入 Agent，
+    /// 因此运行中启用时询问是否立即重启（设置本身已经保存）。
+    private func hotReloadHeaderToggle(config: RunConfiguration, project: ProjectEntry) -> some View {
+        let projectID = project.id
+        let configKey = config.uniqueKey
+        return Toggle("热更新", isOn: Binding(
+            get: {
+                store.hotReloadConfiguration(projectID: projectID, configKey: configKey).enabled
+            },
+            set: { enabled in
+                var settings = store.hotReloadConfiguration(projectID: projectID, configKey: configKey)
+                guard settings.enabled != enabled else { return }
+                settings.enabled = enabled
+                store.updateHotReloadConfiguration(settings, projectID: projectID, configKey: configKey)
+                let active = store.activeSessions(projectID: projectID, configKey: configKey)
+                if enabled {
+                    if !active.isEmpty {
+                        pendingHotReloadRestart = true
+                    }
+                } else {
+                    for session in active {
+                        session.disableHotReload()
+                    }
+                }
+            }
+        ))
+        .toggleStyle(.checkbox)
+        .help("保存源码后自动编译并替换类；关闭会立即停止监听，启用需重启当前实例")
     }
 
     // MARK: 信息页
@@ -1230,10 +1277,16 @@ struct ConfigurationDetailView: View {
         let canRestart = model.map { !$0.isBuilding && $0.state != .stopping } ?? false
 
         return section("热更新") {
-            Toggle("启用热更新（保存源码后自动编译并替换类）", isOn: binding.enabled)
+            HStack(spacing: 6) {
+                Text(settings.enabled ? "热更新已启用" : "热更新未启用")
+                    .font(.callout.weight(.medium))
+                Text("在顶栏 Restart 后切换")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
             if settings.enabled {
-                Text("设置在下一次启动生效；只注入当前配置，不修改 IDEA 的 .run.xml。")
+                Text("启用与参数改动在下一次启动生效；关闭会立即停止监听。只注入当前配置，不修改 IDEA 的 .run.xml。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HotReloadSettingsForm(configuration: binding)
@@ -1247,8 +1300,12 @@ struct ConfigurationDetailView: View {
 
             if let snapshot {
                 Divider()
-                if settingsChanged {
-                    Text("当前运行实例使用启动时的设置；下方状态与新设置可能不一致，改动在下次启动生效。")
+                if settings.enabled && snapshot.state == .closed {
+                    Text("当前实例不会重新开始监听；再次启用需要重启应用。")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if settingsChanged {
+                    Text("当前运行实例使用启动时的设置；启用类改动需下次启动生效，关闭已立即停止监听。")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -1263,9 +1320,25 @@ struct ConfigurationDetailView: View {
                 )
             } else if settings.enabled {
                 Divider()
-                Text(model == nil ? "尚未启动；点击 Run 后开始监听。" : "正在准备热更新会话…")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                if model?.state.isActive == true {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text("当前实例启动时未启用热更新；重新启动后才会注入 Agent。")
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("立即重启") {
+                            store.restart(configKey: config.uniqueKey, projectID: project.id)
+                        }
+                        .controlSize(.small)
+                        .disabled(!canRestart)
+                    }
+                } else {
+                    Text(model == nil
+                        ? "尚未启动；点击 Run 后开始监听。"
+                        : "当前实例已结束；下一次 Run 时开始监听。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -1323,10 +1396,12 @@ struct ConfigurationDetailView: View {
                     configuration: hotReloadBinding(projectID: project.id, configKey: memberConfig.uniqueKey),
                     snapshot: snapshot?.hotReload,
                     memberRunning: snapshot != nil,
+                    memberActive: snapshot.map { !$0.state.isTerminal } ?? false,
                     onManual: { session?.requestHotReload(memberID: memberID) },
                     onRestart: { store.restart(configKey: parentConfig.uniqueKey, projectID: project.id) },
                     onDismiss: { session?.dismissHotReloadRestartPrompt(memberID: memberID) },
-                    onRetryWatcher: { session?.retryHotReloadWatcher(memberID: memberID) }
+                    onRetryWatcher: { session?.retryHotReloadWatcher(memberID: memberID) },
+                    onDisableRuntime: { session?.disableHotReload(memberID: memberID) }
                 )
             } else {
                 Text("\(member.name)（\(memberConfig.type.displayName)）：该类型不启动可热更新的 JVM。")
@@ -1602,10 +1677,13 @@ private struct CompoundMemberHotReloadView: View {
     @Binding var configuration: HotReloadConfiguration
     let snapshot: HotReloadSnapshot?
     let memberRunning: Bool
+    let memberActive: Bool
     let onManual: () -> Void
     let onRestart: () -> Void
     let onDismiss: () -> Void
     let onRetryWatcher: () -> Void
+    let onDisableRuntime: () -> Void
+    @State private var pendingRestart = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1618,8 +1696,20 @@ private struct CompoundMemberHotReloadView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 8)
-                Toggle("热更新", isOn: $configuration.enabled)
-                    .toggleStyle(.checkbox)
+                Toggle("热更新", isOn: Binding(
+                    get: { configuration.enabled },
+                    set: { enabled in
+                        guard configuration.enabled != enabled else { return }
+                        configuration.enabled = enabled
+                        if enabled {
+                            if memberActive { pendingRestart = true }
+                        } else {
+                            onDisableRuntime()
+                        }
+                    }
+                ))
+                .toggleStyle(.checkbox)
+                .help("关闭会立即停止该成员的监听；启用需重启整个组合")
             }
 
             if configuration.enabled {
@@ -1630,7 +1720,11 @@ private struct CompoundMemberHotReloadView: View {
             }
 
             if let snapshot {
-                if snapshot.configuration != configuration {
+                if configuration.enabled && snapshot.state == .closed {
+                    Text("该成员不会重新开始监听；再次启用需要重启整个组合。")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                } else if snapshot.configuration != configuration {
                     Text("当前实例使用启动时的设置；下方状态与新设置可能不一致。")
                         .font(.caption)
                         .foregroundStyle(.orange)
@@ -1645,8 +1739,8 @@ private struct CompoundMemberHotReloadView: View {
                     onRetryWatcher: onRetryWatcher
                 )
             } else if configuration.enabled {
-                Text(memberRunning
-                    ? "当前实例启动时未启用热更新；新设置下一次启动生效。"
+                Text(memberActive
+                    ? "当前成员启动时未启用热更新；重启整个组合后生效。"
                     : "成员尚未启动；启用后下一次启动生效。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1654,6 +1748,12 @@ private struct CompoundMemberHotReloadView: View {
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+        .alert("启用热更新需要重启", isPresented: $pendingRestart) {
+            Button("重启整个组合") { onRestart() }
+            Button("稍后", role: .cancel) {}
+        } message: {
+            Text("Agent 只能在成员 JVM 启动时注入；设置已保存，重启整个组合后生效。")
+        }
     }
 }
 
@@ -1855,11 +1955,11 @@ private func hotReloadStateColor(_ state: HotReloadState) -> Color {
     switch state {
     case .succeeded: return .green
     case .listening, .compiling, .applying, .restarted: return .blue
-    case .partial, .attention, .delegated: return .orange
+    case .partial, .attention, .delegated, .disabling: return .orange
     case .compileFailed, .failed, .unsupported, .requiresRestart, .agentUnavailable,
          .watcherUnavailable:
         return .red
-    case .disabled, .stopped: return .gray
+    case .disabled, .closed, .stopped: return .gray
     }
 }
 

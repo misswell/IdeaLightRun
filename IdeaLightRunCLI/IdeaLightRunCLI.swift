@@ -429,7 +429,7 @@ struct IdeaLightRunCLI {
 
         // §22: CLI 不自己判断类型，交给 ExecutionCoordinator；不支持的配置会明确报错。
         let logLock = NSLock()
-        let emit: (String) -> Void = { text in
+        let emit: @Sendable (String) -> Void = { text in
             logLock.lock()
             print(text)
             logLock.unlock()
@@ -454,7 +454,7 @@ struct IdeaLightRunCLI {
         // 独立的监听会话与状态。未加该选项时 provider 恒为 nil，绝不注入 Agent。
         let hotReloadConfigurationFor: HotReloadConfigurationProvider = { _ in hotReloadConfiguration }
 
-        func emitSnapshot(_ label: String, _ snapshot: HotReloadSnapshot) {
+        let emitSnapshot: @Sendable (String, HotReloadSnapshot) -> Void = { label, snapshot in
             let providerName = snapshot.provider?.displayName ?? "-"
             emit("[HotReload]\(label) \(snapshot.state.displayText) · \(providerName)：\(snapshot.detail)")
             guard let summary = snapshot.summary else { return }
@@ -621,7 +621,7 @@ struct IdeaLightRunCLI {
         }
 
         let logLock = NSLock()
-        let emit: (String) -> Void = { text in
+        let emit: @Sendable (String) -> Void = { text in
             logLock.lock()
             print(text)
             logLock.unlock()

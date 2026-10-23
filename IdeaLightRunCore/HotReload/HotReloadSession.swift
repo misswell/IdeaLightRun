@@ -107,38 +107,18 @@ public final class HotReloadSession: @unchecked Sendable {
             await self.startInternal()
         }
         lock.lock()
+        if stopped {
+            lock.unlock()
+            task.cancel()
+            return
+        }
         startTask = task
         lock.unlock()
     }
 
     public func stop() {
-        lock.lock()
-        guard !stopped else {
-            lock.unlock()
-            return
-        }
-        stopped = true
-        let watcher = self.watcher
-        self.watcher = nil
-        watcherActive = false
-        watcherIssue = nil
-        watcherStarting = false
-        let client = agentClient
-        agentClient = nil
-        let handle = compileHandle
-        compileHandle = nil
-        let debounce = debounceTask
-        debounceTask = nil
-        let start = startTask
-        startTask = nil
-        lock.unlock()
-
-        watcher?.stop()
-        handle?.terminate()
-        client?.shutdown()
-        debounce?.cancel()
-        start?.cancel()
-        plan.agentLaunch?.cleanup()
+        guard let teardown = beginTeardown() else { return }
+        performTeardown(teardown)
 
         lock.lock()
         state = .stopped
@@ -147,6 +127,81 @@ public final class HotReloadSession: @unchecked Sendable {
         let snapshot = makeSnapshotLocked()
         lock.unlock()
         onSnapshot(snapshot)
+    }
+
+    /// 用户关闭运行中的热更新：进程继续运行，但监听、待执行编译与
+    /// Agent 控制通道全部失效。已经注入的 Agent 无法卸载，不会收到新请求。
+    public func disable() {
+        guard let teardown = beginTeardown() else { return }
+
+        lock.lock()
+        state = .disabling
+        detail = "正在关闭热更新：停止文件监听、取消待执行编译并关闭 Agent 控制通道…"
+        summary = nil
+        let closing = makeSnapshotLocked()
+        lock.unlock()
+        onSnapshot(closing)
+
+        performTeardown(teardown)
+
+        lock.lock()
+        state = .closed
+        detail = "热更新已关闭；Java 进程继续运行。已注入的 Agent 仍驻留在 JVM 中，但控制通道已关闭，不会再应用变更。"
+        awaitingRestart = false
+        pendingRestartReason = nil
+        pendingCompileTargets.removeAll()
+        manualRequested = false
+        pendingCycle = false
+        restartRequested = false
+        let snapshot = makeSnapshotLocked()
+        lock.unlock()
+        onSnapshot(snapshot)
+        log("[HotReload] 已关闭；监听与 Agent 控制通道已停止，Java 进程保持运行。")
+    }
+
+    private struct Teardown {
+        var watcher: (any HotReloadFileWatching)?
+        var client: HotReloadAgentClient?
+        var handle: ProcessHandle?
+        var debounce: Task<Void, Never>?
+        var start: Task<Void, Never>?
+    }
+
+    /// 先置 stopped 再取走资源：之后任何在途任务都不能再发布监听/成功状态。
+    private func beginTeardown() -> Teardown? {
+        lock.lock()
+        guard !stopped else {
+            lock.unlock()
+            return nil
+        }
+        stopped = true
+        watcherActive = false
+        watcherIssue = nil
+        watcherStarting = false
+        backendReady = false
+        let teardown = Teardown(
+            watcher: watcher,
+            client: agentClient,
+            handle: compileHandle,
+            debounce: debounceTask,
+            start: startTask
+        )
+        watcher = nil
+        agentClient = nil
+        compileHandle = nil
+        debounceTask = nil
+        startTask = nil
+        lock.unlock()
+        return teardown
+    }
+
+    private func performTeardown(_ teardown: Teardown) {
+        teardown.watcher?.stop()
+        teardown.handle?.terminate()
+        teardown.client?.shutdown()
+        teardown.debounce?.cancel()
+        teardown.start?.cancel()
+        plan.agentLaunch?.cleanup()
     }
 
     /// 界面上的“立即编译并热更新”。自动编译关闭时也走这里。
@@ -214,6 +269,7 @@ public final class HotReloadSession: @unchecked Sendable {
     }
 
     private func startInternal() async {
+        guard !isStopped else { return }
         for note in plan.notes {
             log("[HotReload] \(note)")
         }

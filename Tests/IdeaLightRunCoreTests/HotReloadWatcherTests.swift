@@ -125,21 +125,207 @@ final class HotReloadWatcherTests: XCTestCase {
         XCTAssertTrue(recorder.logs.contains { $0.contains("对账发现") })
     }
 
+    func testRuntimeDisableStopsWatcherAndPublishesClosed() throws {
+        let watcher = FakeWatcher(result: .started)
+        let recorder = SessionRecorder()
+        let session = makeSession(recorder: recorder) { _, _ in watcher }
+        defer { session.stop() }
+        session.start()
+        XCTAssertNotNil(recorder.waitFor(timeout: 10) { $0.isWatching && $0.state == .listening })
+
+        session.disable()
+
+        let closed = recorder.waitFor(timeout: 10) { $0.state == .closed }
+        XCTAssertNotNil(closed, "关闭后必须发布“热更新已关闭”：\(recorder.logs)")
+        XCTAssertEqual(closed?.isWatching, false)
+        XCTAssertFalse(closed?.canManualTrigger ?? true)
+        XCTAssertNil(closed?.summary, "关闭后不能继续展示上一次“热更新成功”")
+        XCTAssertEqual(watcher.stops, 1)
+        XCTAssertTrue(closed?.detail.contains("Java 进程继续运行") == true)
+        let states = recorder.all.map(\.state)
+        XCTAssertTrue(states.contains(.disabling), "关闭过程必须先显示“正在关闭”：\(states)")
+        XCTAssertEqual(states.last, .closed)
+
+        // 关闭后不能在同一个运行实例上重新注入；必须重启应用。
+        session.start()
+        Thread.sleep(forTimeInterval: 0.2)
+        XCTAssertEqual(recorder.latest?.state, .closed)
+        XCTAssertEqual(watcher.stops, 1)
+    }
+
+    func testRuntimeDisableDuringCompileAbortsBuildWithoutPublishingResult() throws {
+        let watcher = FakeWatcher(result: .started)
+        let adapter = BlockingBuildAdapter()
+        let recorder = SessionRecorder()
+        let session = makeSession(
+            recorder: recorder,
+            autoCompile: true,
+            adapter: adapter
+        ) { _, _ in watcher }
+        defer { session.stop() }
+        session.start()
+        XCTAssertNotNil(recorder.waitFor(timeout: 10) { $0.isWatching && $0.state == .listening })
+
+        try writeSource("class App { int compiling; }")
+        session.requestManualReload()
+        wait(for: [adapter.started], timeout: 10)
+        XCTAssertEqual(recorder.latest?.state, .compiling)
+
+        session.disable()
+        wait(for: [adapter.cancelled], timeout: 10)
+
+        let closed = recorder.waitFor(timeout: 10) { $0.state == .closed }
+        XCTAssertNotNil(closed, "编译期间关闭也必须收敛到已关闭：\(recorder.logs)")
+        XCTAssertEqual(adapter.buildCount, 1, "关闭后不得再发起新的编译")
+        XCTAssertTrue(adapter.sawCancellation, "关闭必须终止正在进行的构建")
+        XCTAssertFalse(
+            recorder.all.contains { $0.state == .succeeded },
+            "关闭期间不能把在途编译报成热更新成功：\(recorder.all.map(\.state))"
+        )
+        XCTAssertEqual(recorder.latest?.state, .closed)
+    }
+
+    func testCompoundMemberDisableOnlyClosesThatMember() throws {
+        let workspace = makeWorkspace()
+
+        func memberPlan(_ name: String) -> ExecutableLaunchPlan {
+            let configuration = HotReloadConfiguration(
+                enabled: true,
+                provider: .springBootDevTools,
+                autoCompileOnChange: false,
+                watchCompiledOutputs: true,
+                debounceMilliseconds: 200
+            )
+            let hotReload = HotReloadLaunchPlan(
+                configuration: configuration,
+                configName: name,
+                provider: .springBootDevTools,
+                capability: HotReloadProviderKind.springBootDevTools.staticCapability,
+                workspace: workspace,
+                adapter: StubBuildAdapter(),
+                projectKey: projectRoot.path
+            )
+            return ExecutableLaunchPlan(
+                executable: URL(fileURLWithPath: "/bin/cat"),
+                arguments: [],
+                environment: [:],
+                workingDirectory: projectRoot,
+                hotReload: hotReload
+            )
+        }
+
+        let runtime = try ExecutionRuntime(
+            configKey: "compound::All",
+            configName: "All",
+            execution: .compound(CompoundExecutionPlan(name: "All", members: [
+                CompoundMemberPlan(
+                    name: "Alpha",
+                    configurationKey: "springBoot::Alpha",
+                    execution: .process(memberPlan("Alpha"))
+                ),
+                CompoundMemberPlan(
+                    name: "Beta",
+                    configurationKey: "springBoot::Beta",
+                    execution: .process(memberPlan("Beta"))
+                ),
+            ]))
+        )
+        let lock = NSLock()
+        var events: [(String, HotReloadState)] = []
+        runtime.setHandlers(onCompoundMember: { event in
+            if case .hotReload(let snapshot) = event.kind {
+                lock.lock()
+                events.append((event.memberName, snapshot.state))
+                lock.unlock()
+            }
+        })
+
+        runtime.members[0].disableHotReload()
+
+        XCTAssertEqual(runtime.members[0].hotReloadSnapshot?.state, .closed)
+        XCTAssertEqual(runtime.members[1].hotReloadSnapshot?.state, .listening,
+                       "关闭一个成员不能影响其它成员")
+
+        lock.lock()
+        let recorded = events
+        lock.unlock()
+        XCTAssertTrue(recorded.contains { $0.0 == "Alpha" && $0.1 == .closed }, "\(recorded)")
+        XCTAssertFalse(recorded.contains { $0.0 == "Beta" }, "\(recorded)")
+    }
+
+    func testExecutionRuntimeStartsWithEnabledPlanAndDisableKeepsProcessAlive() throws {
+        let configuration = HotReloadConfiguration(
+            enabled: true,
+            provider: .springBootDevTools,
+            autoCompileOnChange: false,
+            watchCompiledOutputs: false,
+            debounceMilliseconds: 200
+        )
+        let hotReload = HotReloadLaunchPlan(
+            configuration: configuration,
+            configName: "Sleepy",
+            provider: .springBootDevTools,
+            capability: HotReloadProviderKind.springBootDevTools.staticCapability,
+            workspace: makeWorkspace(),
+            adapter: StubBuildAdapter(),
+            projectKey: projectRoot.path
+        )
+        let runtime = try ExecutionRuntime(
+            configKey: "springBoot::Sleepy",
+            configName: "Sleepy",
+            execution: .process(ExecutableLaunchPlan(
+                executable: URL(fileURLWithPath: "/bin/sleep"),
+                arguments: ["100"],
+                environment: [:],
+                workingDirectory: projectRoot,
+                hotReload: hotReload
+            ))
+        )
+        let recorder = SessionRecorder()
+        runtime.setHandlers(onHotReload: { recorder.record($0) })
+
+        runtime.start()
+        XCTAssertNotNil(recorder.waitFor(timeout: 10) { $0.state == .listening })
+        XCTAssertTrue(runtime.isRunning)
+
+        runtime.disableHotReload()
+        XCTAssertNotNil(recorder.waitFor(timeout: 10) { $0.state == .closed })
+        XCTAssertEqual(runtime.hotReloadSnapshot?.state, .closed)
+        XCTAssertTrue(runtime.isRunning, "关闭热更新不能终止 Java 进程")
+
+        runtime.stop()
+        XCTAssertTrue(runtime.waitUntilExit(timeout: 5))
+    }
+
+    func testNewSessionCanListenAfterPreviousWasClosed() throws {
+        let firstRecorder = SessionRecorder()
+        let first = makeSession(recorder: firstRecorder) { _, _ in FakeWatcher(result: .started) }
+        first.start()
+        XCTAssertNotNil(firstRecorder.waitFor(timeout: 10) { $0.isWatching && $0.state == .listening })
+        first.disable()
+        XCTAssertEqual(first.currentSnapshot.state, .closed)
+        first.stop()
+
+        // 关闭只对当前 JVM 生效；重启后的新会话必须能重新监听。
+        let recorder = SessionRecorder()
+        let second = makeSession(recorder: recorder) { _, _ in FakeWatcher(result: .started) }
+        defer { second.stop() }
+        second.start()
+        XCTAssertNotNil(
+            recorder.waitFor(timeout: 10) { $0.isWatching && $0.state == .listening },
+            "重启后的新实例应能重新建立监听：\(recorder.logs)"
+        )
+    }
+
     // MARK: - 脚手架
 
-    private func makeSession(
-        recorder: SessionRecorder,
-        makeWatcher: @escaping @Sendable (
-            HotReloadWorkspace,
-            @escaping @Sendable ([String]) -> Void
-        ) -> any HotReloadFileWatching
-    ) -> HotReloadSession {
+    private func makeWorkspace() -> HotReloadWorkspace {
         let module = ProjectModule(name: "demo", directory: projectRoot)
         let target = BuildTarget(
             module: module,
             variant: .maven(module: "demo", includeProvided: false)
         )
-        let workspace = HotReloadWorkspace(
+        return HotReloadWorkspace(
             projectRoot: projectRoot.standardizedFileURL,
             primaryModule: module,
             primaryTarget: target,
@@ -153,10 +339,22 @@ final class HotReloadWatcherTests: XCTestCase {
             ],
             outputRoots: [classesRoot]
         )
+    }
+
+    private func makeSession(
+        recorder: SessionRecorder,
+        autoCompile: Bool = false,
+        adapter: any BuildSystemAdapter = StubBuildAdapter(),
+        makeWatcher: @escaping @Sendable (
+            HotReloadWorkspace,
+            @escaping @Sendable ([String]) -> Void
+        ) -> any HotReloadFileWatching
+    ) -> HotReloadSession {
+        let workspace = makeWorkspace()
         let configuration = HotReloadConfiguration(
             enabled: true,
             provider: .springBootDevTools,
-            autoCompileOnChange: false,
+            autoCompileOnChange: autoCompile,
             watchCompiledOutputs: true,
             debounceMilliseconds: 200
         )
@@ -166,7 +364,7 @@ final class HotReloadWatcherTests: XCTestCase {
             provider: .springBootDevTools,
             capability: HotReloadProviderKind.springBootDevTools.staticCapability,
             workspace: workspace,
-            adapter: StubBuildAdapter(),
+            adapter: adapter,
             projectKey: projectRoot.path
         )
         return HotReloadSession(
@@ -244,13 +442,26 @@ private final class BackendProbe: @unchecked Sendable {
 
 private final class FakeWatcher: HotReloadFileWatching, @unchecked Sendable {
     private let result: HotReloadWatcherStartResult
+    private let lock = NSLock()
+    private var stopCount = 0
 
     init(result: HotReloadWatcherStartResult) {
         self.result = result
     }
 
+    var stops: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopCount
+    }
+
     func start() -> HotReloadWatcherStartResult { result }
-    func stop() {}
+
+    func stop() {
+        lock.lock()
+        stopCount += 1
+        lock.unlock()
+    }
 }
 
 private final class Counter: @unchecked Sendable {
@@ -288,6 +499,12 @@ private final class SessionRecorder: @unchecked Sendable {
         return snapshots.last
     }
 
+    var all: [HotReloadSnapshot] {
+        lock.lock()
+        defer { lock.unlock() }
+        return snapshots
+    }
+
     var logs: [String] {
         lock.lock()
         defer { lock.unlock() }
@@ -305,6 +522,90 @@ private final class SessionRecorder: @unchecked Sendable {
         }
         guard let latest, predicate(latest) else { return nil }
         return latest
+    }
+}
+
+/// 只用于“编译过程中关闭”的测试：构建会一直阻塞到 ProcessHandle 被取消。
+private final class BlockingBuildAdapter: BuildSystemAdapter, @unchecked Sendable {
+    let started = XCTestExpectation(description: "开始编译")
+    let cancelled = XCTestExpectation(description: "构建收到取消")
+    private let lock = NSLock()
+    private var count = 0
+    private var cancellation = false
+
+    var buildCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+
+    var sawCancellation: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellation
+    }
+
+    func classpathVariant(for module: ProjectModule, includeProvided: Bool) -> ClasspathVariant {
+        .maven(module: module.name, includeProvided: includeProvided)
+    }
+
+    func buildModule(
+        _ target: BuildTarget,
+        handle: ProcessHandle?,
+        log: @escaping LogCallback
+    ) throws {
+        lock.lock()
+        count += 1
+        let isFirst = count == 1
+        lock.unlock()
+        if isFirst { started.fulfill() }
+
+        while handle?.isCancelled != true {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        lock.lock()
+        cancellation = true
+        lock.unlock()
+        cancelled.fulfill()
+        throw IdeaLightRunError.launchCancelled(detail: "热更新已关闭。")
+    }
+
+    func buildProject(
+        kind: ProjectBuildKind,
+        handle: ProcessHandle?,
+        log: @escaping LogCallback
+    ) throws {
+        throw IdeaLightRunError.unsupportedConfiguration(detail: "测试不构建项目")
+    }
+
+    func runTasks(
+        _ tasks: [String],
+        pomFile: String?,
+        moduleDirectory: URL,
+        handle: ProcessHandle?,
+        log: @escaping LogCallback
+    ) throws {
+        throw IdeaLightRunError.unsupportedConfiguration(detail: "测试不运行构建任务")
+    }
+
+    func hasFreshClasspathCache(for target: BuildTarget) -> Bool { true }
+
+    func runtimeClasspath(
+        _ target: BuildTarget,
+        withBuild: Bool,
+        handle: ProcessHandle?,
+        log: @escaping LogCallback
+    ) throws -> [String] {
+        []
+    }
+
+    func testExecution(
+        _ config: RunConfiguration,
+        module: ProjectModule,
+        context: BuildInvocationContext,
+        log: @escaping LogCallback
+    ) throws -> TestExecutionPlan {
+        throw IdeaLightRunError.unsupportedConfiguration(detail: "测试不支持 JUnit")
     }
 }
 
