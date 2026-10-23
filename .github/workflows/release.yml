@@ -29,6 +29,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # build-app.sh 会用 javac 编译内置 HotReloadAgent.jar（--release 8）
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - run: swift --version
 
       # Maven 集成测试会真实下载依赖，CI 网络与耗时不可控，只在本地跑

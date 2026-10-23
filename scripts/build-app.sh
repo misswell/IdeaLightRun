@@ -47,6 +47,11 @@ cp "$BINARY" "$APP/Contents/MacOS/IdeaLightRun"
 cp "$UPDATER_BINARY" "$APP/Contents/MacOS/IdeaLightRunUpdater"
 chmod 755 "$APP/Contents/MacOS/IdeaLightRunUpdater"
 
+# 内置热更新 Agent：随 App 打包，运行期由 Core 通过 -javaagent 注入。
+# 缺了它时热更新会明确报“找不到 HotReloadAgent.jar”，不会静默降级成假成功。
+./scripts/build-hot-reload-agent.sh build/HotReloadAgent.jar
+cp build/HotReloadAgent.jar "$APP/Contents/Resources/HotReloadAgent.jar"
+
 # 应用图标（icns 缺失时从源图重新生成）
 if [ ! -f scripts/AppIcon.icns ]; then
     swift scripts/make-icon.swift scripts/AppIconSource.png scripts/AppIcon.icns

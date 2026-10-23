@@ -93,7 +93,7 @@ final class ExecutionRuntimeTests: XCTestCase {
                     pids[event.memberName] = pid
                 case .logLines(let lines):
                     memberLogs[event.memberName, default: []] += lines.map(\.text)
-                case .state:
+                case .state, .hotReload, .hotReloadRestartRequested:
                     break
                 }
                 lock.unlock()

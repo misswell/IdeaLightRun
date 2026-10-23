@@ -15,6 +15,7 @@ public struct ExecutionCoordinator: Sendable {
     public func prepare(
         config: RunConfiguration,
         projectRoot: URL,
+        hotReloadConfigurationFor: @escaping HotReloadConfigurationProvider = { _ in nil },
         log: @escaping LogCallback,
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle? = nil
@@ -28,6 +29,7 @@ public struct ExecutionCoordinator: Sendable {
             config: config,
             projectRoot: projectRoot,
             scan: scan,
+            hotReloadConfigurationFor: hotReloadConfigurationFor,
             log: log,
             progress: progress,
             processHandle: processHandle,
@@ -45,6 +47,7 @@ public struct ExecutionCoordinator: Sendable {
         config: RunConfiguration,
         projectRoot: URL,
         scan: ScanResult,
+        hotReloadConfigurationFor: @escaping HotReloadConfigurationProvider,
         log: @escaping LogCallback,
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle?,
@@ -60,6 +63,7 @@ public struct ExecutionCoordinator: Sendable {
                 config: config,
                 projectRoot: projectRoot,
                 scan: scan,
+                hotReloadConfigurationFor: hotReloadConfigurationFor,
                 log: log,
                 progress: progress,
                 processHandle: processHandle,
@@ -71,6 +75,7 @@ public struct ExecutionCoordinator: Sendable {
                 config: config,
                 projectRoot: projectRoot,
                 scan: scan,
+                hotReloadConfigurationFor: hotReloadConfigurationFor,
                 log: log,
                 progress: progress,
                 processHandle: processHandle,
@@ -82,6 +87,7 @@ public struct ExecutionCoordinator: Sendable {
                 config: config,
                 projectRoot: projectRoot,
                 scan: scan,
+                hotReloadConfigurationFor: hotReloadConfigurationFor,
                 log: log,
                 progress: progress,
                 processHandle: processHandle,
@@ -93,6 +99,7 @@ public struct ExecutionCoordinator: Sendable {
                 config: config,
                 projectRoot: projectRoot,
                 scan: scan,
+                hotReloadConfigurationFor: hotReloadConfigurationFor,
                 log: log,
                 progress: progress,
                 processHandle: processHandle,
@@ -104,6 +111,7 @@ public struct ExecutionCoordinator: Sendable {
                 config: config,
                 projectRoot: projectRoot,
                 scan: scan,
+                hotReloadConfigurationFor: hotReloadConfigurationFor,
                 log: log,
                 progress: progress,
                 processHandle: processHandle,
@@ -124,6 +132,7 @@ public struct ExecutionCoordinator: Sendable {
         config: RunConfiguration,
         projectRoot: URL,
         scan: ScanResult,
+        hotReloadConfigurationFor: @escaping HotReloadConfigurationProvider,
         log: @escaping LogCallback,
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle?,
@@ -201,6 +210,7 @@ public struct ExecutionCoordinator: Sendable {
                             config: referenced,
                             projectRoot: projectRoot,
                             scan: scan,
+                            hotReloadConfigurationFor: hotReloadConfigurationFor,
                             log: log,
                             progress: progress,
                             processHandle: processHandle,
@@ -240,7 +250,26 @@ public struct ExecutionCoordinator: Sendable {
 
             // ⑦ 启动计划（§26/§7）
             progress(.starting)
-            return .process(try JavaRunPlanner.plan(resolved: resolved, classpath: classpath, jdk: build.jdk))
+            // §HotReload: 只在显式启用的开发配置上注入 Agent；默认返回 nil。
+            let hotReloadPlan = hotReloadConfigurationFor(config).flatMap { configuration in
+                HotReloadPlanner.makePlan(
+                    configuration: configuration,
+                    config: config,
+                    projectRoot: projectRoot,
+                    scan: scan,
+                    module: module,
+                    classpath: classpath,
+                    adapter: adapter,
+                    includeProvided: config.includeProvidedDependencies,
+                    log: { text in log(LogLine(stream: .system, text: text)) }
+                )
+            }
+            return .process(try JavaRunPlanner.plan(
+                resolved: resolved,
+                classpath: classpath,
+                jdk: build.jdk,
+                hotReload: hotReloadPlan
+            ))
         }
     }
 
@@ -253,6 +282,7 @@ public struct ExecutionCoordinator: Sendable {
         config: RunConfiguration,
         projectRoot: URL,
         scan: ScanResult,
+        hotReloadConfigurationFor: @escaping HotReloadConfigurationProvider,
         log: @escaping LogCallback,
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle?,
@@ -309,6 +339,7 @@ public struct ExecutionCoordinator: Sendable {
                 config: referenced,
                 projectRoot: projectRoot,
                 scan: scan,
+                hotReloadConfigurationFor: hotReloadConfigurationFor,
                 log: log,
                 progress: progress,
                 processHandle: processHandle,
@@ -356,6 +387,7 @@ public struct ExecutionCoordinator: Sendable {
         config: RunConfiguration,
         projectRoot: URL,
         scan: ScanResult,
+        hotReloadConfigurationFor: @escaping HotReloadConfigurationProvider,
         log: @escaping LogCallback,
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle?,
@@ -470,6 +502,7 @@ public struct ExecutionCoordinator: Sendable {
                             config: referenced,
                             projectRoot: projectRoot,
                             scan: scan,
+                            hotReloadConfigurationFor: hotReloadConfigurationFor,
                             log: log,
                             progress: progress,
                             processHandle: processHandle,
@@ -511,6 +544,7 @@ public struct ExecutionCoordinator: Sendable {
         config: RunConfiguration,
         projectRoot: URL,
         scan: ScanResult,
+        hotReloadConfigurationFor: @escaping HotReloadConfigurationProvider,
         log: @escaping LogCallback,
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle?,
@@ -545,6 +579,7 @@ public struct ExecutionCoordinator: Sendable {
                 config: config,
                 projectRoot: projectRoot,
                 scan: scan,
+                hotReloadConfigurationFor: hotReloadConfigurationFor,
                 toolchain: toolchain,
                 module: module,
                 target: target,
@@ -585,6 +620,7 @@ public struct ExecutionCoordinator: Sendable {
         config: RunConfiguration,
         projectRoot: URL,
         scan: ScanResult,
+        hotReloadConfigurationFor: @escaping HotReloadConfigurationProvider,
         log: @escaping LogCallback,
         progress: @escaping (ProcessState) -> Void,
         processHandle: ProcessHandle?,
@@ -622,6 +658,7 @@ public struct ExecutionCoordinator: Sendable {
                 config: config,
                 projectRoot: projectRoot,
                 scan: scan,
+                hotReloadConfigurationFor: hotReloadConfigurationFor,
                 toolchain: toolchain,
                 module: module,
                 target: target,
@@ -660,6 +697,7 @@ public struct ExecutionCoordinator: Sendable {
         config: RunConfiguration,
         projectRoot: URL,
         scan: ScanResult,
+        hotReloadConfigurationFor: @escaping HotReloadConfigurationProvider,
         toolchain: ProjectToolchain,
         module: ProjectModule?,
         target: BuildTarget?,
@@ -724,6 +762,7 @@ public struct ExecutionCoordinator: Sendable {
                         config: referenced,
                         projectRoot: projectRoot,
                         scan: scan,
+                        hotReloadConfigurationFor: hotReloadConfigurationFor,
                         log: log,
                         progress: progress,
                         processHandle: processHandle,

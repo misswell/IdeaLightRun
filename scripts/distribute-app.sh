@@ -50,6 +50,9 @@ codesign --verify --deep --strict "$APP"
 # 留在「只能手动升级」的版本上，而这一点要在这里拦住，不能等用户点「下载并安装」。
 [ -x "$APP/Contents/MacOS/IdeaLightRunUpdater" ] \
     || { echo "❌ 正式包缺更新助手 IdeaLightRunUpdater" >&2; exit 1; }
+# 热更新 Agent 是 App 资源的一部分，缺了包仍能启动，但热更新会永久不可用。
+[ -s "$APP/Contents/Resources/HotReloadAgent.jar" ] \
+    || { echo "❌ 正式包缺热更新 Agent（Contents/Resources/HotReloadAgent.jar）" >&2; exit 1; }
 codesign --verify --strict "$APP/Contents/MacOS/IdeaLightRunUpdater"
 spctl --assess --type execute --verbose "$APP"
 for arch in arm64 x86_64; do

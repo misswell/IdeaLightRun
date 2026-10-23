@@ -13,6 +13,9 @@ public struct ExecutableLaunchPlan: Sendable {
     /// 计划自带的临时文件（@argfile、classpath manifest jar）。
     /// 进程进入终态后由 `ManagedProcessSession` 删除，调用方不需要自己收尾。
     public var temporaryArtifacts: [URL]
+    /// 热更新所需的 Agent 参数与监听范围；nil 表示该配置没有启用热更新
+    /// （或配置类型不支持）。执行器在进程启动后据此建立会话。
+    public var hotReload: HotReloadLaunchPlan?
 
     public init(
         executable: URL,
@@ -20,7 +23,8 @@ public struct ExecutableLaunchPlan: Sendable {
         environment: [String: String],
         workingDirectory: URL,
         displayCommand: String? = nil,
-        temporaryArtifacts: [URL] = []
+        temporaryArtifacts: [URL] = [],
+        hotReload: HotReloadLaunchPlan? = nil
     ) {
         self.executable = executable
         self.arguments = arguments
@@ -29,6 +33,7 @@ public struct ExecutableLaunchPlan: Sendable {
         self.displayCommand = displayCommand
             ?? Self.quote([executable.path] + arguments)
         self.temporaryArtifacts = temporaryArtifacts
+        self.hotReload = hotReload
     }
 
     /// 每个参数是一个整体，含空格的只在两端加引号——不做 shell 转义，因为它只用于展示。

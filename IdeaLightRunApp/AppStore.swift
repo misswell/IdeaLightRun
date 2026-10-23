@@ -43,12 +43,18 @@ final class AppStore: ObservableObject {
     @Published private(set) var builds: [String: ProjectBuildModel] = [:]
     /// 每次开始构建自增，UI 据此切到"构建"页看输出
     @Published private(set) var buildRevision = 0
+    /// 每配置的热更新设置，键 = `项目路径|配置 uniqueKey`。
+    /// 单独存文件，不改 IDEA 的 .run.xml，也不把开发 Agent 带到别的项目里。
+    @Published private(set) var hotReloadSettings: [String: HotReloadConfiguration] = [:]
     /// 在线更新（§64 例外：仅用户主动点「检查更新…」时联网）
     let updater: SoftwareUpdater
 
     private static let persistenceURL = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("IdeaLightRun/projects.json")
+    private static let hotReloadURL = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("IdeaLightRun/hot-reload.json")
 
     private var cancellables: Set<AnyCancellable> = []
 
@@ -59,6 +65,7 @@ final class AppStore: ObservableObject {
             .sink { [weak self] in self?.objectWillChange.send() }
             .store(in: &cancellables)
         loadProjects()
+        loadHotReloadSettings()
     }
 
     var selectedProject: ProjectEntry? {
@@ -264,11 +271,18 @@ final class AppStore: ObservableObject {
         let coordinator = ExecutionCoordinator()
         let handle = ProcessHandle()
         model.buildHandle = handle
+        // 配置快照在启动那一刻固化：运行中改设置不注入半边参数，下次启动才生效。
+        let hotReloadSnapshot = hotReloadSettings
+        let projectID = project.id
         Task.detached(priority: .userInitiated) {
             do {
                 let execution = try await coordinator.prepare(
                     config: config,
                     projectRoot: projectRoot,
+                    hotReloadConfigurationFor: { config in
+                        let key = "\(projectID)|\(config.uniqueKey)"
+                        return hotReloadSnapshot[key].flatMap { $0.isActive ? $0 : nil }
+                    },
                     log: { line in
                         Task { @MainActor in model.appendLog(line) }
                     },
@@ -531,6 +545,25 @@ final class AppStore: ObservableObject {
         projects[index].errorText = message
     }
 
+    // MARK: - 热更新设置
+
+    /// 未保存过的配置一律视为关闭：默认不向任何 JVM 注入开发 Agent。
+    func hotReloadConfiguration(projectID: String, configKey: String) -> HotReloadConfiguration {
+        hotReloadSettings["\(projectID)|\(configKey)"] ?? .disabled
+    }
+
+    func updateHotReloadConfiguration(
+        _ configuration: HotReloadConfiguration,
+        projectID: String,
+        configKey: String
+    ) {
+        let key = "\(projectID)|\(configKey)"
+        let normalized = configuration.normalized
+        guard hotReloadSettings[key] != normalized else { return }
+        hotReloadSettings[key] = normalized
+        persistHotReloadSettings()
+    }
+
     // MARK: - 持久化
 
     private func loadProjects() {
@@ -553,5 +586,20 @@ final class AppStore: ObservableObject {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         guard let data = try? JSONEncoder().encode(projects.map { $0.id }) else { return }
         try? data.write(to: Self.persistenceURL, options: .atomic)
+    }
+
+    private func loadHotReloadSettings() {
+        guard let data = try? Data(contentsOf: Self.hotReloadURL),
+              let decoded = try? JSONDecoder().decode([String: HotReloadConfiguration].self, from: data) else {
+            return
+        }
+        hotReloadSettings = decoded
+    }
+
+    private func persistHotReloadSettings() {
+        let directory = Self.hotReloadURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let data = try? JSONEncoder().encode(hotReloadSettings) else { return }
+        try? data.write(to: Self.hotReloadURL, options: .atomic)
     }
 }

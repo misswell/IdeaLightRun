@@ -1,6 +1,6 @@
 # IdeaLightRun
 
-独立 macOS Java 项目启动器：读取 IntelliJ IDEA 的 Run Configuration，不打开 IDEA 就能编译并启动 Java / Spring Boot 项目，直接运行 Maven 配置与 JUnit 测试，也能直接启动已构建的 JAR。
+独立 macOS Java 项目启动器：读取 IntelliJ IDEA 的 Run Configuration，不打开 IDEA 就能编译并启动 Java / Spring Boot 项目，直接运行 Maven 配置与 JUnit 测试，也能直接启动已构建的 JAR；保存源码后还能把方法体热更新到运行中的 JVM。
 
 - **环境**：macOS 13 及以上（Apple Silicon / Intel 通用二进制）；本机 JDK；Application / Spring Boot / Maven / JUnit 配置需项目是 Maven（`pom.xml` / `mvnw`）或 Gradle（`settings.gradle(.kts)` / `build.gradle(.kts)` / `gradlew`），JAR Application 只要求 JAR 已构建
 - **隐私**：除用户主动点「检查更新…」外，全程 100% 本地——不联网、无后台常驻、不上传任何项目或本机信息（§64）
@@ -91,6 +91,50 @@ Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准�
 - 三者都不跑测试、Maven 不带 `-pl`，构建期可 **停止构建**（SIGTERM）或 **强制结束构建**（SIGKILL）
 - Gradle classpath 由临时 init script 读取 `sourceSets.main.runtimeClasspath`（勾选 Provided 时并入 `compileClasspath`），不重写项目依赖；缓存指纹覆盖 settings / 各项目构建脚本 / version catalog / wrapper / `GRADLE_USER_HOME` 全局配置 / JDK major
 
+## 热更新（默认关闭）
+
+保存 Java 源码后，自动编译变更模块，并通过内置 Java Agent 把已加载类的方法体替换到运行中的 JVM——不打开 IDEA、不使用 JDWP。热更新按 Run Configuration 独立开关，设置存在本机，不修改项目的 `.run.xml`；默认关闭，不会向任何 JVM 注入 Agent。
+
+### 使用
+
+1. 选中 **Application** 或 **Spring Boot** 配置 → 「信息」→「热更新」→ 勾选启用
+2. 按需选择后端、自动编译、监听外部编译输出 / 资源、回退策略、去抖与忽略路径；设置在下一次启动生效
+3. Run 之后保存源码，或在外部（IDEA / 命令行）构建产出 class；状态面板会显示 `监听中 → 编译中 → 应用中 → 热更新成功 / 部分更新 / 编译失败 / 需要重启`
+4. 「立即编译并热更新」用于自动编译关闭或只想手动触发时；需要重启时可「立即重启」或「暂不重启」
+
+监听范围是各模块的 `src/main/{java,kotlin,groovy,scala}`、`src/main/resources`，以及 runtime classpath 中位于项目内的输出目录。文件事件只作为「可能有变化」的信号，会话重新做 SHA-256 指纹 diff，因此自己编译的产物、IDEA/命令行外部构建、编辑器原子保存都不会重复触发同一批变更；编译期间的新事件排队处理，编译期间再次保存的源码会保留旧指纹并进入下一轮，不会丢改动。多模块项目只编译变更所属模块，共享模块的变更会应用到每个受影响的服务；同一项目的构建由 BuildGate 串行化。
+
+### 后端与能力边界
+
+| 后端 | 方法体 | 字段 / 方法 / 继承结构 | 新增 / 删除类 | Spring Bean 定义 | 资源文件 |
+| --- | --- | --- | --- | --- | --- |
+| 内置 HotSwap（默认） | 支持 | 不支持，需重启 | 新增类在首次引用时由 JVM 加载（不会自动注册为 Bean）；删除类无法卸载 | 不支持，需重启 | 写入输出目录；框架是否刷新不受控 |
+| Spring Boot DevTools | 快速重启 | 快速重启 | 快速重启 | 上下文重建后重新注册 | classpath 变化触发快速重启 |
+| 外部 HotswapAgent | 由外部后端决定 | 由外部后端决定 | 由外部后端决定 | 由外部后端决定 | 由外部后端决定 |
+| 外部 JRebel | 由外部后端决定 | 由外部后端决定 | 由外部后端决定 | 由外部后端决定 | 由外部后端决定 |
+
+「自动选择」在启动时决定：runtime classpath 含 `spring-boot-devtools` 时交给 DevTools，否则使用内置 HotSwap。DevTools 是**快速重启**，不是方法体热替换；内置 HotSwap 基于标准 `Instrumentation.redefineClasses`，只承诺方法体替换。字段 / 方法 / 继承结构变更、删除类会被 JVM 拒绝，界面与日志会如实标为「需要重启」，不会把部分写入当成成功。外部 Agent 的能力、版本与授权由它自己决定，IdeaLightRun 只负责编译并交给它，不宣称替换结果。
+
+### 回退与重启
+
+需要重启时按配置的策略处理：**仅提示**、**询问后重启**（默认）或**自动重启**。自动重启复用现有执行链路：停止旧进程 → 等它真正退出 → 重新走 BuildGate 与完整启动流水线，不会另起一套启动逻辑。Compound 成员不支持单独自动重启，需要时重启整个组合；部分类失败或只有资源变化时状态标为「部分更新」，不会显示成功。
+
+### 安全与许可
+
+- 只有显式启用的 Application / Spring Boot 配置会注入 Agent；Maven / JUnit / JAR Application 与 Compound 本身不会注入
+- 控制通道只绑定 `127.0.0.1` 的随机端口，凭据放在 0600 文件、不出现在进程参数或日志里；停止时关闭通道并删除控制目录；不使用 JDWP
+- 不记录敏感环境变量或 JVM 参数；监听文件数有上限（20 万），忽略路径只接受项目根内路径，不会因输出变化无限编译
+- 内置 Agent 是本项目自带的 Java 8 字节码，只使用标准 Instrumentation；不捆绑、不下载 JRebel / HotswapAgent 等商业或 GPL 组件。选择外部后端时，请自行确认其许可证与 JVM 兼容性
+
+### 已知限制
+
+- 标准 HotSwap 不能修改字段、方法签名、继承关系或删除类；Spring Bean 定义、ORM 映射等框架级变化同样需要重启或增强 Agent
+- 资源文件会写入输出目录，但框架缓存（模板、静态资源、配置）是否重新加载不由 IdeaLightRun 控制
+- Kotlin / Groovy / Scala 源码会被监听并触发项目的增量编译，但能否替换仍取决于编译产物与当前后端的 JVM 能力
+- 外部构建只处理输出目录中的 class / 资源差异；IDEA 的编译是否正确产出由外部工具负责
+- Compound 每个成员有独立的监听、编译与状态，但成员级自动重启不可用；共享模块变更会在每个成员上分别编译并应用
+- 热更新不改变「Do not build before run」的语义：关闭自动编译时不会偷偷编译，只响应手动触发或外部输出变化
+
 ## Git 分支与拉取
 
 摘要条上有当前分支（git 图标 + 分支名），点开可切换本地分支；旁边是拉取按钮。项目不是 git 仓库时该区块自动隐藏。
@@ -134,6 +178,7 @@ Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准�
 ## 数据放在哪
 
 - `~/Library/Application Support/IdeaLightRun/projects.json` — 添加过的项目路径
+- `~/Library/Application Support/IdeaLightRun/hot-reload.json` — 各 Run Configuration 的热更新设置（默认关闭）
 - `~/Library/Caches/IdeaLightRun/` — Maven classpath 缓存
 - `~/Library/Logs/IdeaLightRun/update.log` — 更新日志
 - **不写用户项目的任何文件**；`target/` 里的构建产物由 Maven 自己生成
@@ -150,6 +195,16 @@ swift run IdeaLightRunCLI build /path/to/project --rebuild # Rebuild Project（c
 swift run IdeaLightRunCLI clean /path/to/project          # Maven clean / Gradle clean（只删产物，不编译）
 swift run IdeaLightRunCLI scan /path/to/project --json     # JSON 输出
 swift run IdeaLightRunCLI scan /path/to/project --show-secrets  # 环境变量明文（默认掩码）
+swift run IdeaLightRunCLI run --hot-reload /path/to/project UserApp  # 启用内置 HotSwap
+
+# 热更新选项（均隐含 --hot-reload）
+#   --hot-reload-provider automatic|standard|devtools|hotswap-agent|jrebel
+#   --hot-reload-no-auto-compile / --hot-reload-no-watch-outputs / --hot-reload-no-watch-resources
+#   --hot-reload-restart notify|ask|automatic
+#   --hot-reload-debounce <200–10000 毫秒>
+#   --hot-reload-ignore <路径前缀，可重复>
+#   --hot-reload-agent-path <外部 Agent jar / 安装目录>
+#   --hot-reload-agent-args <追加参数原文，按空白分词，不经过 shell>
 ```
 
 退出码：`0` 成功、`1` 解析/运行失败或 Java 进程非 0 退出、`2` 参数或命令有误、`130` 构建被 Ctrl-C 取消。
@@ -164,10 +219,12 @@ IdeaLightRunCore/    核心库（GUI 与 CLI 共用，禁止另起一套启动�
   IntelliJ/          ProjectScanner、RunConfiguration 解析（宽松 + alias）、MacroResolver、ModuleResolver
   BuildSystem/       Maven 与 Gradle 的定位/编译/classpath 解析/缓存；ProjectToolchain + ProjectBuilder（启动与构建共用一条管线）；BuildSystemSelector（Maven/Gradle 共存时确定性选择）
   Execution/         ExecutionCoordinator、BeforeLaunchExecutor、ExecutionRuntime（GUI/CLI 统一执行器）、ConfigurationCapabilityResolver
+  HotReload/         热更新配置/能力矩阵、工作区快照与指纹 diff、编译与 Agent 会话、loopback 控制协议、内置 Agent 启动器
   Java/              JDKResolver、JavaRunPlanner、JarRunPlanner
   Process/           ProcessSession（进程生命周期 + 日志捕获）
   Logging/           LogRingBuffer（环形日志缓冲）
   Utilities/         CommandLineTokenizer（禁用 /bin/sh -c）、XML 子树捕获
+HotReloadAgent/      内置 Java Agent 源码与 Manifest（标准 Instrumentation，无 JDWP）
 IdeaLightRunUpdate/  在线更新内核（版本比较、发布解析、镜像下载、产物与签名校验、助手参数契约）
 IdeaLightRunUpdater/ 进程外安装助手（主 app 退出后替换 bundle 并重启，失败回滚）
 IdeaLightRunCLI/     开发期验证工具（scan / run / build / clean）
@@ -177,7 +234,7 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 
 ## 当前进度
 
-已完成：Core 解析与宏、Maven / Gradle 编译与 classpath、启动流水线、统一 `PreparedExecution` / `ExecutionRuntime` 执行器、JAR Application 启动、Compound 多配置编排（独立进程 / 日志 / 端口、分组控制、嵌套展开与部分失败清理）、Maven 配置直接运行、JUnit 测试运行（Maven Surefire / Gradle Test、目标展开、测试结果判定与日志展示）、进程与日志、GUI 三栏、Build/Rebuild/Clean（Maven 与 Gradle）、运行端口检测、扫描诊断与统一配置能力计算、在线更新。
+已完成：Core 解析与宏、Maven / Gradle 编译与 classpath、启动流水线、统一 `PreparedExecution` / `ExecutionRuntime` 执行器、JAR Application 启动、Compound 多配置编排（独立进程 / 日志 / 端口、分组控制、嵌套展开与部分失败清理）、Maven 配置直接运行、JUnit 测试运行（Maven Surefire / Gradle Test、目标展开、测试结果判定与日志展示）、进程与日志、GUI 三栏、Build/Rebuild/Clean（Maven 与 Gradle）、运行端口检测、扫描诊断与统一配置能力计算、在线更新、按配置启用的热更新（内置 HotSwap / DevTools / 外部 Agent、手动触发、回退重启、Compound 成员独立状态）。
 
 待做：
 
@@ -213,8 +270,8 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 ## 测试
 
 ```bash
-swift test                                        # 本地全量：455 用例
-swift test --skip MavenClasspathIntegrationTests  # CI 集合：452 用例（跳过那 3 个要真实下载依赖的）
+swift test                                        # 本地全量：475 用例
+swift test --skip MavenClasspathIntegrationTests  # CI 集合：472 用例（跳过那 3 个要真实下载依赖的）
 ```
 
 覆盖范围：
@@ -223,16 +280,18 @@ swift test --skip MavenClasspathIntegrationTests  # CI 集合：452 用例（跳
 - **构建与启动** — JavaRunPlanner（§26–§29）、JarRunPlanner（`java -jar` 参数顺序、默认工作目录、缺失/不可读 JAR）、ExecutionRuntime（日志/PID/终态转发、Stop、Before Launch 同步执行与取消、测试终态：失败/无测试/无汇总/用户停止）、MavenRunExecution（直接运行参数顺序与 `-nsu` 缺失、Project JDK / `MAVEN_OPTS`、pom 与不支持选项的 fail-closed、宏与 `$Prompt$`、Surefire 模块范围/筛选/工作目录限制）、TestTargetResolver（类/方法/包/目录/模式展开与无匹配拒绝）、TestOutcomeMonitor（Surefire `Results:` 汇总与逐类行、旧版 `Results :`、Gradle SUMMARY、无测试检测）、Compound（成员按引用顺序准备、嵌套展开、缺失/类型不匹配/成环拦截、独立 PID 与日志、分组 Stop/Force Kill、部分失败清理）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator / GradleLocator（Dock 启动无 PATH 时的绝对路径枚举与 wrapper 发行版兜底）、GradleBuildService（project path 任务、合并编译与 classpath 解析、provided 变体、缓存失效、失败与取消、JUnit `:test` 与 `--tests`/init script）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
 - **诊断与能力** — ScanDiagnostic（读失败 / XML 损坏 / 配置目录不可读 / 重复配置 / 缺 Main Class / 不支持的 Before Launch 任务都带严重程度与建议，不静默丢配置）、ConfigurationCapabilityResolver（类型 + 构建系统 + 字段 + Module 解析 + Before Launch 统一裁决）、BuildSystemSelector（Maven/Gradle 共存时的确定性选择）、Gradle settings/projectDir 解析、Maven `$MODULE_DIR$` POM 路径、ProcessHandle 启动前取消与 SIGTERM→SIGKILL 升级
 - **进程与日志** — ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、LogRingBuffer（§37 上限）、LogScrollFollow（停在底部才跟随新日志，向上回看不抢滚动）
+- **热更新** — HotReloadConfiguration（默认关闭、外部 Agent 参数分词、忽略路径、回退策略）、HotReloadWorkspace（源/输出快照与 SHA-256 指纹、外部构建产物识别、编译期事件合并、不把半成品推给 JVM）、HotReloadAgent 控制协议（loopback + 随机 token、帧上限、状态/重载/关闭）、失败分类（结构变更 / 类未加载 / 字节码拒绝）、真实 JVM 集成（javac 编译 + Agent 附加 + 方法体替换生效、字段结构变更被拒绝并报「需要重启」、进程保持存活）、自动重启走既有停止→准备链路，CLI 侧 `--hot-reload` 冒烟（编译、替换、Ctrl-C 退出码 130、无孤儿 JVM）
 - **在线更新** — 版本比较与 fail-closed、发布元数据解析（JSON 与 expanded_assets 两条路径）、镜像链顺序与回退/取消/坏文件删除、更新助手参数契约与重启路径、designated requirement 解析与语义判定，以及把产物名 / bundle id / Team / 助手落点钉到 `scripts/` 与 `release.yml` **原文**的防漂移断言
 
 ## 打包与发布
 
 ```bash
-./scripts/build-app.sh release      # 本机包：Developer ID 签名 + hardened runtime，产物 build/IdeaLightRun.app
-./scripts/distribute-app.sh         # 正式包：通用二进制 + 签名 + 公证 + staple + 校验，产物 dist/
+./scripts/build-hot-reload-agent.sh  # 构建内置 Agent（任意 JDK 8+，产物 build/HotReloadAgent.jar）
+./scripts/build-app.sh release       # 本机包：Developer ID 签名 + hardened runtime，产物 build/IdeaLightRun.app
+./scripts/distribute-app.sh          # 正式包：通用二进制 + 签名 + 公证 + staple + 校验，产物 dist/
 ```
 
-正式发布走 GitHub Actions：推 `v*` tag 即自动 `swift test` → Developer ID 签名 → Apple 公证 → staple → 创建 Release（附件 `IdeaLightRun-<ver>-universal.zip` 与 `SHA256SUMS.txt`）。
+`build-app.sh` 会先调用 Agent 构建脚本，并把 `HotReloadAgent.jar` 放进 `Contents/Resources/` 后再签名；`distribute-app.sh` 缺这个 jar 会拒绝打包。正式发布走 GitHub Actions：推 `v*` tag 即自动安装 Temurin 17（`actions/setup-java`，提供 javac）→ `swift test` → 构建 Agent → Developer ID 签名 → Apple 公证 → staple → 创建 Release（附件 `IdeaLightRun-<ver>-universal.zip` 与 `SHA256SUMS.txt`）。
 
 **打 tag 前必须先等 `Compile check`（push 到 main 自动跑）绿灯**：它用发布同款工具链 `swift build` 全量编译，覆盖 `swift test` 不构建的 GUI target——CI runner 是旧的 Xcode 15 / Swift 5.10，本机 Xcode 26 能过的写法在它上面是编译错误，而 tag 推上去就作废不了。
 

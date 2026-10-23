@@ -8,6 +8,7 @@ struct CompoundMemberSnapshot: Identifiable, Equatable {
     var state: ProcessState
     var pid: Int32?
     var ports: [Int]
+    var hotReload: HotReloadSnapshot? = nil
 }
 
 /// GUI 侧的单次运行模型：包装 Core 的 ExecutionRuntime，回调统一切回主线程。
@@ -32,6 +33,8 @@ final class RunningProcessModel: LogViewModel, Identifiable {
     @Published private(set) var listeningPorts: [Int] = []
     /// Compound 成员快照；单进程配置为空。
     @Published private(set) var compoundMembers: [CompoundMemberSnapshot] = []
+    /// 单进程配置的热更新状态；Compound 成员的状态在 `compoundMembers` 里。
+    @Published private(set) var hotReload: HotReloadSnapshot?
 
     /// 构建期（classpath 解析/编译）进程句柄，Stop 用它终止 Maven。
     var buildHandle: ProcessHandle?
@@ -131,8 +134,49 @@ final class RunningProcessModel: LogViewModel, Identifiable {
                 Task { @MainActor [weak self] in
                     self?.applyCompoundEvent(event)
                 }
+            },
+            onHotReload: { [weak self] snapshot in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.hotReload = snapshot
+                    self.onChange?()
+                }
+            },
+            onHotReloadRestart: { [weak self] reason in
+                // 自动重启复用现有“停止 → 等旧进程退出 → 重新走完整流水线”的链路；
+                // 返回 true 表示这次请求已被接管。
+                Task { @MainActor [weak self] in
+                    guard let self, let runtime = self.runtime else { return }
+                    self.appendLog(LogLine(
+                        stream: .system,
+                        text: "[IdeaLightRun] 热更新需要重启：\(reason)；正在等待旧进程退出后重新启动。"
+                    ))
+                    self.pendingRestart = true
+                    runtime.stop()
+                }
+                return true
             }
         )
+    }
+
+    /// 单进程的“立即编译并热更新”；Compound 传成员 id。
+    func requestHotReload(memberID: String? = nil) {
+        if let memberID,
+           let index = compoundMembers.firstIndex(where: { $0.id == memberID }) {
+            runtime?.members[index].requestHotReload()
+        } else {
+            runtime?.requestHotReload()
+        }
+    }
+
+    /// “需要重启”提示里的“暂不重启”。
+    func dismissHotReloadRestartPrompt(memberID: String? = nil) {
+        if let memberID,
+           let index = compoundMembers.firstIndex(where: { $0.id == memberID }) {
+            runtime?.members[index].dismissHotReloadRestartPrompt()
+        } else {
+            runtime?.dismissHotReloadRestartPrompt()
+        }
     }
 
     /// 成员控制台：Compound 每个成员一份独立日志缓冲。
@@ -178,6 +222,14 @@ final class RunningProcessModel: LogViewModel, Identifiable {
             onChange?()
         case .logLines(let lines):
             memberConsoles[event.configurationKey]?.appendLog(lines)
+        case .hotReload(let snapshot):
+            compoundMembers[index].hotReload = snapshot
+            onChange?()
+        case .hotReloadRestartRequested(let reason):
+            let text = "[IdeaLightRun] 热更新需要重启：\(reason)"
+            memberConsoles[event.configurationKey]?.appendLog(LogLine(stream: .system, text: text))
+            appendLog(LogLine(stream: .system, text: text + "（Compound 成员请手动重启整个组合）"))
+            onChange?()
         }
     }
 

@@ -1,0 +1,4 @@
+Premain-Class: com.misswell.idealightrun.agent.HotReloadAgent
+Agent-Class: com.misswell.idealightrun.agent.HotReloadAgent
+Can-Redefine-Classes: true
+Can-Retransform-Classes: false

@@ -1055,6 +1055,8 @@ struct ConfigurationDetailView: View {
                     }
                 }
 
+                hotReloadSection(project: project, config: config, result: result)
+
                 if !result.diagnostics.isEmpty {
                     section("扫描诊断 · \(scanDiagnosticSummary(result.diagnostics))") {
                         ForEach(result.diagnostics) { diagnostic in
@@ -1192,6 +1194,151 @@ struct ConfigurationDetailView: View {
             }
             .padding(22)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // MARK: 热更新
+
+    private func hotReloadBinding(projectID: String, configKey: String) -> Binding<HotReloadConfiguration> {
+        Binding(
+            get: { store.hotReloadConfiguration(projectID: projectID, configKey: configKey) },
+            set: { store.updateHotReloadConfiguration($0, projectID: projectID, configKey: configKey) }
+        )
+    }
+
+    @ViewBuilder
+    private func hotReloadSection(project: ProjectEntry, config: RunConfiguration, result: ScanResult) -> some View {
+        if config.type == .compound {
+            compoundHotReloadSection(project: project, config: config, result: result)
+        } else if config.type == .application || config.type == .springBoot {
+            singleHotReloadSection(project: project, config: config)
+        } else {
+            section("热更新") {
+                Text("热更新只支持直接启动 JVM 的 Application / Spring Boot 配置；\(config.type.displayName) 配置不会注入开发 Agent。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func singleHotReloadSection(project: ProjectEntry, config: RunConfiguration) -> some View {
+        let binding = hotReloadBinding(projectID: project.id, configKey: config.uniqueKey)
+        let settings = binding.wrappedValue
+        let model = store.displaySession(projectID: project.id, configKey: config.uniqueKey)
+        let snapshot = model?.hotReload
+        let settingsChanged = snapshot.map { $0.configuration != settings } ?? false
+        let canRestart = model.map { !$0.isBuilding && $0.state != .stopping } ?? false
+
+        return section("热更新") {
+            Toggle("启用热更新（保存源码后自动编译并替换类）", isOn: binding.enabled)
+
+            if settings.enabled {
+                Text("设置在下一次启动生效；只注入当前配置，不修改 IDEA 的 .run.xml。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HotReloadSettingsForm(configuration: binding)
+            } else {
+                Text("默认关闭，不会向任何 JVM 注入 Agent。内置 HotSwap 只保证已加载类的方法体替换；"
+                    + "结构变更、Spring Bean 变化会明确标为需要重启，不会报成成功。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let snapshot {
+                Divider()
+                if settingsChanged {
+                    Text("当前运行实例使用启动时的设置；下方状态与新设置可能不一致，改动在下次启动生效。")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                HotReloadStatusView(
+                    snapshot: snapshot,
+                    canRestart: canRestart,
+                    restartTitle: "重启应用",
+                    onManual: { model?.requestHotReload() },
+                    onRestart: { store.restart(configKey: config.uniqueKey, projectID: project.id) },
+                    onDismiss: { model?.dismissHotReloadRestartPrompt() }
+                )
+            } else if settings.enabled {
+                Divider()
+                Text(model == nil ? "尚未启动；点击 Run 后开始监听。" : "正在准备热更新会话…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func compoundHotReloadSection(
+        project: ProjectEntry,
+        config: RunConfiguration,
+        result: ScanResult
+    ) -> some View {
+        let session = store.displaySession(projectID: project.id, configKey: config.uniqueKey)
+        return section("热更新") {
+            Text("Compound 本身不启动 JVM。每个成员独立启用、独立监听与编译；共享模块的变化会分别应用到受影响的成员，"
+                + "某个成员失败不影响其他成员。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("成员级自动重启不可用：需要重启时请重启整个组合，界面不会假装成员已被单独重启。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ForEach(config.compoundMembers, id: \.self) { member in
+                compoundMemberHotReload(
+                    member: member,
+                    project: project,
+                    result: result,
+                    session: session,
+                    parentConfig: config
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func compoundMemberHotReload(
+        member: CompoundMember,
+        project: ProjectEntry,
+        result: ScanResult,
+        session: RunningProcessModel?,
+        parentConfig: RunConfiguration
+    ) -> some View {
+        switch ConfigurationReferenceResolver.resolve(
+            name: member.name,
+            type: member.type.isEmpty ? nil : member.type,
+            in: result.configurations,
+            allowNameFallback: true
+        ) {
+        case .found(let memberConfig):
+            if memberConfig.type == .application || memberConfig.type == .springBoot {
+                let snapshot = session?.compoundMembers.first { $0.id == memberConfig.uniqueKey }
+                    ?? session?.compoundMembers.first { $0.name == member.name }
+                let memberID = snapshot?.id ?? memberConfig.uniqueKey
+                CompoundMemberHotReloadView(
+                    name: member.name,
+                    typeTitle: memberConfig.type.displayName,
+                    configuration: hotReloadBinding(projectID: project.id, configKey: memberConfig.uniqueKey),
+                    snapshot: snapshot?.hotReload,
+                    memberRunning: snapshot != nil,
+                    onManual: { session?.requestHotReload(memberID: memberID) },
+                    onRestart: { store.restart(configKey: parentConfig.uniqueKey, projectID: project.id) },
+                    onDismiss: { session?.dismissHotReloadRestartPrompt(memberID: memberID) }
+                )
+            } else {
+                Text("\(member.name)（\(memberConfig.type.displayName)）：该类型不启动可热更新的 JVM。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        case .notFound:
+            Text("\(member.name)：当前项目里找不到这个配置，热更新设置不可用。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        case .typeMismatch:
+            Text("\(member.name)：同名配置的类型与 Compound 引用不一致，热更新设置不可用。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -1335,6 +1482,366 @@ struct ConfigurationDetailView: View {
                     .textSelection(.enabled)
             }
         }
+    }
+}
+
+// MARK: - 热更新设置与状态
+
+private struct HotReloadSettingsForm: View {
+    @Binding var configuration: HotReloadConfiguration
+
+    private var externalAgentPath: Binding<String> {
+        Binding(
+            get: { configuration.externalAgentPath ?? "" },
+            set: { newValue in
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                configuration.externalAgentPath = trimmed.isEmpty ? nil : trimmed
+            }
+        )
+    }
+
+    private var ignoredPaths: Binding<String> {
+        Binding(
+            get: { configuration.ignoredPaths.joined(separator: "\n") },
+            set: { newValue in
+                configuration.ignoredPaths = newValue
+                    .split(whereSeparator: \.isNewline)
+                    .map(String.init)
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("后端", selection: $configuration.provider) {
+                ForEach(HotReloadProviderKind.allCases, id: \.self) { kind in
+                    Text(kind.displayName).tag(kind)
+                }
+            }
+            .frame(maxWidth: 400, alignment: .leading)
+
+            HStack(spacing: 16) {
+                Toggle("保存后自动编译", isOn: $configuration.autoCompileOnChange)
+                Toggle("监听外部编译输出", isOn: $configuration.watchCompiledOutputs)
+                Toggle("监听资源", isOn: $configuration.watchResources)
+            }
+            .toggleStyle(.checkbox)
+            .font(.callout)
+
+            Picker("需要重启时", selection: $configuration.restartPolicy) {
+                ForEach(HotReloadRestartPolicy.allCases, id: \.self) { policy in
+                    Text(policy.displayName).tag(policy)
+                }
+            }
+            .frame(maxWidth: 400, alignment: .leading)
+
+            Stepper(value: $configuration.debounceMilliseconds, in: 200...10_000, step: 100) {
+                Text("去抖 \(configuration.debounceMilliseconds) ms")
+                    .monospacedDigit()
+            }
+
+            TextField("忽略路径（每行一个，绝对路径或相对项目根）", text: ignoredPaths, axis: .vertical)
+                .lineLimit(2...4)
+                .textFieldStyle(.roundedBorder)
+
+            if configuration.provider.isExternalAgent {
+                TextField("Agent Jar / 安装目录（绝对路径或相对项目根）", text: externalAgentPath)
+                    .textFieldStyle(.roundedBorder)
+                TextField(
+                    "追加参数（例如 -javaagent:/path/agent.jar，按空白分词，不经过 shell）",
+                    text: $configuration.externalAgentArguments,
+                    axis: .vertical
+                )
+                .lineLimit(1...3)
+                .textFieldStyle(.roundedBorder)
+                Text("IdeaLightRun 不捆绑、不下载商业或 GPL Agent；请自行确认许可与版本兼容性。外部后端是否真正替换了类，由它自己决定。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            capabilityMatrix
+        }
+    }
+
+    private var capabilityMatrix: some View {
+        let capability = configuration.provider.staticCapability
+        return VStack(alignment: .leading, spacing: 4) {
+            Text("能力边界（Core 声明）")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            ForEach(capability.rows) { row in
+                HStack(alignment: .top, spacing: 8) {
+                    Text(row.name)
+                        .font(.caption)
+                        .frame(width: 180, alignment: .leading)
+                    Text(row.level.displayText)
+                        .font(.caption)
+                        .foregroundStyle(hotReloadLevelColor(row.level))
+                }
+            }
+            Text(capability.note)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if configuration.provider == .automatic {
+                Text("自动选择在启动时决定：runtime classpath 含 spring-boot-devtools 时交给 DevTools，否则使用内置 HotSwap。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+private struct CompoundMemberHotReloadView: View {
+    let name: String
+    let typeTitle: String
+    @Binding var configuration: HotReloadConfiguration
+    let snapshot: HotReloadSnapshot?
+    let memberRunning: Bool
+    let onManual: () -> Void
+    let onRestart: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "rectangle.stack")
+                    .foregroundStyle(.secondary)
+                Text(name)
+                    .fontWeight(.medium)
+                Text(typeTitle)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Toggle("热更新", isOn: $configuration.enabled)
+                    .toggleStyle(.checkbox)
+            }
+
+            if configuration.enabled {
+                DisclosureGroup("成员设置") {
+                    HotReloadSettingsForm(configuration: $configuration)
+                        .padding(.top, 6)
+                }
+            }
+
+            if let snapshot {
+                if snapshot.configuration != configuration {
+                    Text("当前实例使用启动时的设置；下方状态与新设置可能不一致。")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                HotReloadStatusView(
+                    snapshot: snapshot,
+                    canRestart: memberRunning,
+                    restartTitle: "重启整个组合",
+                    onManual: onManual,
+                    onRestart: onRestart,
+                    onDismiss: onDismiss
+                )
+            } else if configuration.enabled {
+                Text(memberRunning
+                    ? "当前实例启动时未启用热更新；新设置下一次启动生效。"
+                    : "成员尚未启动；启用后下一次启动生效。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .controlBackgroundColor)))
+    }
+}
+
+private struct HotReloadStatusView: View {
+    let snapshot: HotReloadSnapshot
+    let canRestart: Bool
+    let restartTitle: String
+    let onManual: () -> Void
+    let onRestart: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                if snapshot.state.isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+                Circle()
+                    .fill(hotReloadStateColor(snapshot.state))
+                    .frame(width: 8, height: 8)
+                Text(snapshot.state.displayText)
+                    .font(.callout.weight(.semibold))
+                if let provider = snapshot.provider {
+                    Text(provider.displayName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if snapshot.isWatching {
+                    Label("监听中", systemImage: "eye")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                Text(snapshot.lastUpdated.formatted(date: .omitted, time: .standard))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+            }
+
+            if !snapshot.detail.isEmpty {
+                Text(snapshot.detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: 8) {
+                Button("立即编译并热更新", action: onManual)
+                    .controlSize(.small)
+                    .disabled(!snapshot.canManualTrigger)
+                if snapshot.awaitingRestartConfirmation {
+                    Button("立即重启", action: onRestart)
+                        .controlSize(.small)
+                        .disabled(!canRestart)
+                    Button("暂不重启", action: onDismiss)
+                        .controlSize(.small)
+                } else {
+                    Button(restartTitle, action: onRestart)
+                        .controlSize(.small)
+                        .disabled(!canRestart)
+                }
+            }
+
+            if let summary = snapshot.summary {
+                summaryView(summary)
+            }
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .windowBackgroundColor)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color(nsColor: .separatorColor))
+        )
+    }
+
+    @ViewBuilder
+    private func summaryView(_ summary: HotReloadSummary) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Divider()
+            HStack(spacing: 8) {
+                Text("最近一次处理")
+                    .font(.caption.weight(.semibold))
+                Text(summary.consoleLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Text(String(format: "%.2f s", summary.duration))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .monospacedDigit()
+            }
+            if !summary.sourceChanges.isEmpty {
+                summaryList("源文件", summary.sourceChanges)
+            }
+            if !summary.resourceChanges.isEmpty {
+                summaryList("资源", summary.resourceChanges)
+            }
+            if !summary.compiledModules.isEmpty {
+                summaryList("编译模块", summary.compiledModules)
+            }
+            if !summary.classChanges.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("class 变更")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    ForEach(Array(summary.classChanges.prefix(10).enumerated()), id: \.offset) { _, change in
+                        Text("\(change.kind.displayText)  \(change.className)")
+                            .font(.system(.caption2, design: .monospaced))
+                    }
+                    if summary.classChanges.count > 10 {
+                        Text("另有 \(summary.classChanges.count - 10) 个")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            if !summary.appliedClasses.isEmpty {
+                summaryList("已替换", summary.appliedClasses)
+            }
+            if !summary.failedClasses.isEmpty {
+                failureList("失败", summary.failedClasses, color: .red)
+            }
+            if !summary.skippedClasses.isEmpty {
+                failureList("跳过", summary.skippedClasses, color: .orange)
+            }
+            ForEach(Array(summary.notes.prefix(6).enumerated()), id: \.offset) { _, note in
+                Label(note, systemImage: "info.circle")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if summary.didCompile, summary.appliedClasses.isEmpty,
+               summary.failedClasses.isEmpty, summary.skippedClasses.isEmpty {
+                Text("本次没有类被替换。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func summaryList(_ title: String, _ values: [String]) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(width: 64, alignment: .leading)
+            Text(values.prefix(8).joined(separator: "、") + (values.count > 8 ? " 等 \(values.count) 个" : ""))
+                .font(.system(.caption2, design: .monospaced))
+                .textSelection(.enabled)
+                .lineLimit(2)
+        }
+    }
+
+    private func failureList(_ title: String, _ failures: [HotReloadClassFailure], color: Color) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            ForEach(Array(failures.prefix(8).enumerated()), id: \.offset) { _, failure in
+                Text("\(failure.className) · \(failure.kind.displayText) — \(failure.message)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(color)
+                    .lineLimit(2)
+                    .help(failure.message)
+            }
+            if failures.count > 8 {
+                Text("另有 \(failures.count - 8) 个")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private func hotReloadLevelColor(_ level: HotReloadSupportLevel) -> Color {
+    switch level {
+    case .supported: return .green
+    case .limited: return .yellow
+    case .restart: return .orange
+    case .delegated: return .blue
+    case .unsupported: return .red
+    }
+}
+
+private func hotReloadStateColor(_ state: HotReloadState) -> Color {
+    switch state {
+    case .succeeded: return .green
+    case .listening, .compiling, .applying, .restarted: return .blue
+    case .partial, .attention, .delegated: return .orange
+    case .compileFailed, .failed, .unsupported, .requiresRestart, .agentUnavailable: return .red
+    case .disabled, .stopped: return .gray
     }
 }
 

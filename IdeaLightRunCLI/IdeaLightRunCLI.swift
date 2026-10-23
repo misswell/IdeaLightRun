@@ -259,28 +259,158 @@ struct IdeaLightRunCLI {
 
     // MARK: - run
 
-    final class LaunchBox: @unchecked Sendable {
+    final class RunControl: @unchecked Sendable {
         private let lock = NSLock()
         private var _runtime: ExecutionRuntime?
+        private var _buildHandle: ProcessHandle?
+        private var _restartRequested = false
+        private var _interrupted = false
+
         var runtime: ExecutionRuntime? {
             get { lock.lock(); defer { lock.unlock() }; return _runtime }
             set { lock.lock(); _runtime = newValue; lock.unlock() }
+        }
+
+        var buildHandle: ProcessHandle? {
+            get { lock.lock(); defer { lock.unlock() }; return _buildHandle }
+            set { lock.lock(); _buildHandle = newValue; lock.unlock() }
+        }
+
+        func requestRestart() {
+            lock.lock()
+            _restartRequested = true
+            lock.unlock()
+        }
+
+        /// 取出并清除重启请求：一次停止只对应一次重启。
+        func takeRestartRequest() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            let value = _restartRequested
+            _restartRequested = false
+            return value
+        }
+
+        var isInterrupted: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return _interrupted
+        }
+
+        /// Ctrl-C：构建期终止编译器，运行期停止 JVM；绝不触发自动重启。
+        func interrupt() {
+            lock.lock()
+            _interrupted = true
+            _restartRequested = false
+            let handle = _buildHandle
+            let runtime = _runtime
+            lock.unlock()
+            handle?.terminate()
+            runtime?.stop()
         }
     }
 
     static func runLaunch(arguments: [String]) throws {
         var path: String?
         var name: String?
-        for argument in arguments {
-            if argument.hasPrefix("-") {
-                FileHandle.standardError.write("未知选项：\(argument)\n".data(using: .utf8)!)
-                printUsage()
+        var hotReloadEnabled = false
+        var provider: HotReloadProviderKind = .automatic
+        var autoCompile = true
+        var watchCompiledOutputs = true
+        var watchResources = true
+        var restartPolicy: HotReloadRestartPolicy = .ask
+        var debounceMilliseconds = 800
+        var ignoredPaths: [String] = []
+        var externalAgentPath: String?
+        var externalAgentArguments = ""
+
+        var index = 0
+        func requireValue(_ flag: String) -> String {
+            index += 1
+            guard index < arguments.count else {
+                FileHandle.standardError.write("选项 \(flag) 缺少取值\n".data(using: .utf8)!)
                 exit(2)
             }
-            if path == nil { path = argument } else if name == nil { name = argument }
+            return arguments[index]
         }
+
+        while index < arguments.count {
+            let argument = arguments[index]
+            switch argument {
+            case "--hot-reload":
+                hotReloadEnabled = true
+            case "--hot-reload-provider":
+                let value = requireValue(argument)
+                guard let parsed = Self.hotReloadProvider(from: value) else {
+                    FileHandle.standardError.write(
+                        "未知热更新后端：\(value)（可选 automatic / standard / devtools / hotswap-agent / jrebel）\n"
+                            .data(using: .utf8)!
+                    )
+                    exit(2)
+                }
+                provider = parsed
+                hotReloadEnabled = true
+            case "--hot-reload-no-auto-compile":
+                autoCompile = false
+                hotReloadEnabled = true
+            case "--hot-reload-no-watch-outputs":
+                watchCompiledOutputs = false
+                hotReloadEnabled = true
+            case "--hot-reload-no-watch-resources":
+                watchResources = false
+                hotReloadEnabled = true
+            case "--hot-reload-restart":
+                let value = requireValue(argument)
+                guard let parsed = Self.hotReloadRestartPolicy(from: value) else {
+                    FileHandle.standardError.write(
+                        "未知回退策略：\(value)（可选 notify / ask / automatic）\n".data(using: .utf8)!
+                    )
+                    exit(2)
+                }
+                restartPolicy = parsed
+                hotReloadEnabled = true
+            case "--hot-reload-debounce":
+                let value = requireValue(argument)
+                guard let parsed = Int(value), (200...10_000).contains(parsed) else {
+                    FileHandle.standardError.write("去抖必须是 200–10000 毫秒的整数：\(value)\n".data(using: .utf8)!)
+                    exit(2)
+                }
+                debounceMilliseconds = parsed
+                hotReloadEnabled = true
+            case "--hot-reload-ignore":
+                ignoredPaths.append(requireValue(argument))
+                hotReloadEnabled = true
+            case "--hot-reload-agent-path":
+                externalAgentPath = requireValue(argument)
+                hotReloadEnabled = true
+            case "--hot-reload-agent-args":
+                externalAgentArguments = requireValue(argument)
+                hotReloadEnabled = true
+            case "-h", "--help":
+                printUsage()
+                exit(0)
+            default:
+                if argument.hasPrefix("-") {
+                    FileHandle.standardError.write("未知选项：\(argument)\n".data(using: .utf8)!)
+                    printUsage()
+                    exit(2)
+                }
+                if path == nil {
+                    path = argument
+                } else if name == nil {
+                    name = argument
+                } else {
+                    FileHandle.standardError.write("多余的参数：\(argument)\n".data(using: .utf8)!)
+                    exit(2)
+                }
+            }
+            index += 1
+        }
+
         guard let path, let name else {
-            FileHandle.standardError.write("用法：idealightrun run <project> <configuration-name>\n".data(using: .utf8)!)
+            FileHandle.standardError.write(
+                "用法：idealightrun run [--hot-reload] <project> <configuration-name>\n".data(using: .utf8)!
+            )
             exit(2)
         }
 
@@ -296,6 +426,7 @@ struct IdeaLightRunCLI {
             FileHandle.standardError.write("找不到配置 “\(name)”。可用：\(names)\n".data(using: .utf8)!)
             exit(2)
         }
+
         // §22: CLI 不自己判断类型，交给 ExecutionCoordinator；不支持的配置会明确报错。
         let logLock = NSLock()
         let emit: (String) -> Void = { text in
@@ -304,57 +435,145 @@ struct IdeaLightRunCLI {
             logLock.unlock()
         }
 
-        let coordinator = ExecutionCoordinator()
-        let box = LaunchBox()
-        let pipelineSemaphore = DispatchSemaphore(value: 0)
+        let hotReloadConfiguration = hotReloadEnabled
+            ? HotReloadConfiguration(
+                enabled: true,
+                provider: provider,
+                autoCompileOnChange: autoCompile,
+                watchCompiledOutputs: watchCompiledOutputs,
+                watchResources: watchResources,
+                restartPolicy: restartPolicy,
+                debounceMilliseconds: debounceMilliseconds,
+                ignoredPaths: ignoredPaths,
+                externalAgentPath: externalAgentPath,
+                externalAgentArguments: externalAgentArguments
+            )
+            : nil
 
-        Task.detached(priority: .userInitiated) {
-            do {
-                let execution = try await coordinator.prepare(
-                    config: config,
-                    projectRoot: projectRoot,
-                    log: { line in emit(line.text) },
-                    progress: { state in emit("[IdeaLightRun] \(state.displayText)…") }
-                )
-                let runtime = try ExecutionRuntime(
-                    configKey: config.uniqueKey,
-                    configName: config.name,
-                    execution: execution
-                )
-                runtime.setHandlers(
-                    onState: { state in
-                        emit("[IdeaLightRun] \(state.displayText)")
-                    },
-                    onLogLines: { batch in
-                        for line in batch { emit(line.text) }
-                    }
-                )
-                box.runtime = runtime
-                runtime.start()
-            } catch {
-                emit("[IdeaLightRun] 错误：\((error as? IdeaLightRunError)?.localizedDescription ?? error.localizedDescription)")
+        // 显式 `--hot-reload` 对本次启动的所有 JVM 生效；Compound 成员因此各自拥有
+        // 独立的监听会话与状态。未加该选项时 provider 恒为 nil，绝不注入 Agent。
+        let hotReloadConfigurationFor: HotReloadConfigurationProvider = { _ in hotReloadConfiguration }
+
+        func emitSnapshot(_ label: String, _ snapshot: HotReloadSnapshot) {
+            let providerName = snapshot.provider?.displayName ?? "-"
+            emit("[HotReload]\(label) \(snapshot.state.displayText) · \(providerName)：\(snapshot.detail)")
+            guard let summary = snapshot.summary else { return }
+            emit("[HotReload]\(label) \(summary.consoleLine)")
+            for failure in summary.failedClasses.prefix(10) {
+                emit("[HotReload]\(label) 失败 \(failure.className)（\(failure.kind.displayText)）：\(failure.message)")
             }
-            pipelineSemaphore.signal()
+            for skipped in summary.skippedClasses.prefix(10) {
+                emit("[HotReload]\(label) 跳过 \(skipped.className)：\(skipped.message)")
+            }
+            for note in summary.notes.prefix(6) {
+                emit("[HotReload]\(label) 说明：\(note)")
+            }
         }
-        pipelineSemaphore.wait()
 
-        guard let runtime = box.runtime else {
-            exit(1)
-        }
+        let control = RunControl()
+        let coordinator = ExecutionCoordinator()
+        let exitCode = ExitCodeBox()
+        let finished = DispatchSemaphore(value: 0)
 
-        // Ctrl-C → SIGTERM（§33）
+        // Ctrl-C → 终止构建或停止 JVM（§33）；同时清掉自动重启请求。
+        // 信号源不能挂在 main：下面的 finished.wait() 会阻塞主线程，Ctrl-C 将永远不生效。
         signal(SIGINT, SIG_IGN)
-        let interruptSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        interruptSource.setEventHandler { runtime.stop() }
+        let interruptSource = DispatchSource.makeSignalSource(
+            signal: SIGINT,
+            queue: DispatchQueue(label: "com.misswell.IdeaLightRun.cli-interrupt", qos: .userInitiated)
+        )
+        interruptSource.setEventHandler { control.interrupt() }
         interruptSource.resume()
 
-        while runtime.isRunning {
-            Thread.sleep(forTimeInterval: 0.2)
+        Task.detached(priority: .userInitiated) {
+            var code: Int32 = 1
+            while true {
+                let handle = ProcessHandle()
+                control.buildHandle = handle
+                do {
+                    let execution = try await coordinator.prepare(
+                        config: config,
+                        projectRoot: projectRoot,
+                        hotReloadConfigurationFor: hotReloadConfigurationFor,
+                        log: { line in emit(line.text) },
+                        progress: { state in emit("[IdeaLightRun] \(state.displayText)…") },
+                        processHandle: handle
+                    )
+                    if control.isInterrupted {
+                        code = 130
+                        break
+                    }
+                    let runtime = try ExecutionRuntime(
+                        configKey: config.uniqueKey,
+                        configName: config.name,
+                        execution: execution
+                    )
+                    runtime.setHandlers(
+                        onState: { state in
+                            emit("[IdeaLightRun] \(state.displayText)")
+                        },
+                        onLogLines: { batch in
+                            for line in batch { emit(line.text) }
+                        },
+                        onCompoundMember: { event in
+                            switch event.kind {
+                            case .started(let pid):
+                                emit("[IdeaLightRun] 成员 “\(event.memberName)” 已启动（PID \(pid)）")
+                            case .state(let state):
+                                emit("[IdeaLightRun] 成员 “\(event.memberName)”：\(state.displayText)")
+                            case .logLines(let lines):
+                                for line in lines { emit("[\(event.memberName)] \(line.text)") }
+                            case .hotReload(let snapshot):
+                                emitSnapshot(" [\(event.memberName)]", snapshot)
+                            case .hotReloadRestartRequested(let reason):
+                                emit("[IdeaLightRun] 成员 “\(event.memberName)” 热更新需要重启：\(reason)")
+                            }
+                        },
+                        onHotReload: { snapshot in
+                            emitSnapshot("", snapshot)
+                        },
+                        onHotReloadRestart: { reason in
+                            emit("[IdeaLightRun] 热更新需要重启：\(reason)；按自动重启策略重新准备。")
+                            control.requestRestart()
+                            control.runtime?.stop()
+                            return true
+                        }
+                    )
+                    control.runtime = runtime
+                    runtime.start()
+                    while runtime.isRunning {
+                        Thread.sleep(forTimeInterval: 0.2)
+                    }
+                    control.runtime = nil
+                    if control.isInterrupted {
+                        code = 130
+                        break
+                    }
+                    if control.takeRestartRequest() {
+                        emit("[IdeaLightRun] 旧进程已退出，重新编译并启动…")
+                        continue
+                    }
+                    if case .exited(let status) = runtime.state {
+                        code = status == 0 ? 0 : 1
+                    } else {
+                        code = 1
+                    }
+                    break
+                } catch {
+                    let message = (error as? IdeaLightRunError)?.localizedDescription
+                        ?? error.localizedDescription
+                    emit("[IdeaLightRun] 错误：\(message)")
+                    code = (error as? IdeaLightRunError).map(isCancelled) == true ? 130 : 1
+                    break
+                }
+            }
+            control.buildHandle = nil
+            exitCode.value = code
+            finished.signal()
         }
-        if case .exited(let code) = runtime.state {
-            exit(code == 0 ? 0 : 1)
-        }
-        exit(1)
+        finished.wait()
+        interruptSource.cancel()
+        exit(exitCode.value)
     }
 
     // MARK: - build（IDEA 的 Build Project / Rebuild Project）
@@ -446,6 +665,26 @@ struct IdeaLightRunCLI {
         return false
     }
 
+    private static func hotReloadProvider(from value: String) -> HotReloadProviderKind? {
+        switch value.lowercased() {
+        case "auto", "automatic": return .automatic
+        case "standard", "hotswap": return .standard
+        case "devtools", "spring-boot-devtools", "springbootdevtools": return .springBootDevTools
+        case "hotswap-agent", "hotswapagent": return .hotswapAgent
+        case "jrebel": return .jrebel
+        default: return nil
+        }
+    }
+
+    private static func hotReloadRestartPolicy(from value: String) -> HotReloadRestartPolicy? {
+        switch value.lowercased() {
+        case "notify": return .notify
+        case "ask": return .ask
+        case "auto", "automatic": return .automatic
+        default: return nil
+        }
+    }
+
     // MARK: - Usage / Error
 
     static func printUsage() {
@@ -465,6 +704,19 @@ struct IdeaLightRunCLI {
               --json                     以 JSON 输出（scan）
               --show-secrets             显示环境变量明文（默认掩码）
               --rebuild                  先清空产物再全量编译（build，IDEA 的 Rebuild Project）
+
+            HOT RELOAD（run，仅 Application / Spring Boot 配置会真正注入 Agent）:
+              --hot-reload               为本次启动启用热更新
+              --hot-reload-provider       automatic（默认）/ standard / devtools / hotswap-agent / jrebel
+              --hot-reload-no-auto-compile      保存源码后不自动编译，仅响应外部构建输出
+              --hot-reload-no-watch-outputs     不监听编译输出目录
+              --hot-reload-no-watch-resources   不监听资源目录
+              --hot-reload-restart        notify / ask（默认）/ automatic
+              --hot-reload-debounce       <毫秒，200–10000，默认 800>
+              --hot-reload-ignore         <路径前缀，可重复>
+              --hot-reload-agent-path     <外部 Agent jar / 安装目录>
+              --hot-reload-agent-args     <追加参数原文，按空白分词，不经过 shell>
+
               -h, --help                 显示帮助
             """
         )

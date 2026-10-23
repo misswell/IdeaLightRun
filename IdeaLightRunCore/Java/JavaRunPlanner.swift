@@ -9,7 +9,8 @@ public enum JavaRunPlanner {
     public static func plan(
         resolved: ResolvedRunConfiguration,
         classpath: [String],
-        jdk: JDKInstallation
+        jdk: JDKInstallation,
+        hotReload: HotReloadLaunchPlan? = nil
     ) throws -> ExecutableLaunchPlan {
         guard let mainClass = resolved.mainClass, !mainClass.isEmpty else {
             throw IdeaLightRunError.mainClassNotFound(detail: "配置 “\(resolved.source.name)” 没有可用的 Main Class。")
@@ -24,6 +25,10 @@ public enum JavaRunPlanner {
             throw IdeaLightRunError.classpathResolveFailed(detail: "runtime classpath 为空，无法启动。")
         }
 
+        // §HotReload: Agent / 外部后端参数排在用户 VM 参数之前，
+        // 保证 `-javaagent` 在被替换类加载前生效。
+        let vmArguments = (hotReload?.extraJVMArguments ?? []) + resolved.vmArguments
+
         // §P0-10: 超长 classpath 会被 execve 的 E2BIG 拒掉。按配置声明的
         // SHORTEN_COMMAND_LINE（未设置按 AUTO）选载体，产物登记进 temporaryArtifacts，
         // 进程进入终态后由会话删除。
@@ -34,26 +39,38 @@ public enum JavaRunPlanner {
         case .jarManifest:
             return try manifestJarPlan(
                 resolved: resolved, classpath: classpath, joined: joinedClasspath,
-                mainClass: mainClass, javaExecutable: javaExecutable
+                mainClass: mainClass, javaExecutable: javaExecutable,
+                vmArguments: vmArguments, hotReload: hotReload
             )
         case .classpathFile:
             return try argfilePlan(
                 resolved: resolved, joined: joinedClasspath,
-                mainClass: mainClass, javaExecutable: javaExecutable
+                mainClass: mainClass, javaExecutable: javaExecutable,
+                vmArguments: vmArguments, hotReload: hotReload
             )
         case .none:
-            return plainPlan(resolved: resolved, joined: joinedClasspath, mainClass: mainClass, javaExecutable: javaExecutable)
+            return plainPlan(
+                resolved: resolved, joined: joinedClasspath, mainClass: mainClass,
+                javaExecutable: javaExecutable, vmArguments: vmArguments, hotReload: hotReload
+            )
         case .auto:
             if joinedClasspath.count <= ShortenCommandLineMode.autoThreshold {
-                return plainPlan(resolved: resolved, joined: joinedClasspath, mainClass: mainClass, javaExecutable: javaExecutable)
+                return plainPlan(
+                    resolved: resolved, joined: joinedClasspath, mainClass: mainClass,
+                    javaExecutable: javaExecutable, vmArguments: vmArguments, hotReload: hotReload
+                )
             }
             // JDK 9+ 走 @argfile；JDK 8（或版本未知）没有 @argfile，退到 manifest jar。
             if let major = jdk.majorVersion, major >= 9 {
-                return try argfilePlan(resolved: resolved, joined: joinedClasspath, mainClass: mainClass, javaExecutable: javaExecutable)
+                return try argfilePlan(
+                    resolved: resolved, joined: joinedClasspath, mainClass: mainClass,
+                    javaExecutable: javaExecutable, vmArguments: vmArguments, hotReload: hotReload
+                )
             }
             return try manifestJarPlan(
                 resolved: resolved, classpath: classpath, joined: joinedClasspath,
-                mainClass: mainClass, javaExecutable: javaExecutable
+                mainClass: mainClass, javaExecutable: javaExecutable,
+                vmArguments: vmArguments, hotReload: hotReload
             )
         }
     }
@@ -64,13 +81,16 @@ public enum JavaRunPlanner {
         resolved: ResolvedRunConfiguration,
         joined: String,
         mainClass: String,
-        javaExecutable: URL
+        javaExecutable: URL,
+        vmArguments: [String],
+        hotReload: HotReloadLaunchPlan?
     ) -> ExecutableLaunchPlan {
         ExecutableLaunchPlan(
             executable: javaExecutable,
-            arguments: resolved.vmArguments + ["-cp", joined, mainClass] + resolved.programArguments,
+            arguments: vmArguments + ["-cp", joined, mainClass] + resolved.programArguments,
             environment: resolved.environment,
-            workingDirectory: resolved.workingDirectory
+            workingDirectory: resolved.workingDirectory,
+            hotReload: hotReload
         )
     }
 
@@ -80,16 +100,19 @@ public enum JavaRunPlanner {
         resolved: ResolvedRunConfiguration,
         joined: String,
         mainClass: String,
-        javaExecutable: URL
+        javaExecutable: URL,
+        vmArguments: [String],
+        hotReload: HotReloadLaunchPlan?
     ) throws -> ExecutableLaunchPlan {
         let file = try LaunchArtifactStore.makeArtifactURL(suffix: ".argfile")
         try Data("-cp \"\(joined)\"".utf8).write(to: file, options: .atomic)
         return ExecutableLaunchPlan(
             executable: javaExecutable,
-            arguments: resolved.vmArguments + ["@\(file.path)", mainClass] + resolved.programArguments,
+            arguments: vmArguments + ["@\(file.path)", mainClass] + resolved.programArguments,
             environment: resolved.environment,
             workingDirectory: resolved.workingDirectory,
-            temporaryArtifacts: [file]
+            temporaryArtifacts: [file],
+            hotReload: hotReload
         )
     }
 
@@ -99,16 +122,19 @@ public enum JavaRunPlanner {
         classpath: [String],
         joined: String,
         mainClass: String,
-        javaExecutable: URL
+        javaExecutable: URL,
+        vmArguments: [String],
+        hotReload: HotReloadLaunchPlan?
     ) throws -> ExecutableLaunchPlan {
         let jar = try LaunchArtifactStore.makeArtifactURL(suffix: ".jar")
         try ManifestClasspathJar.write(classpath: classpath, to: jar)
         return ExecutableLaunchPlan(
             executable: javaExecutable,
-            arguments: resolved.vmArguments + ["-cp", jar.path, mainClass] + resolved.programArguments,
+            arguments: vmArguments + ["-cp", jar.path, mainClass] + resolved.programArguments,
             environment: resolved.environment,
             workingDirectory: resolved.workingDirectory,
-            temporaryArtifacts: [jar]
+            temporaryArtifacts: [jar],
+            hotReload: hotReload
         )
     }
 }

@@ -7,6 +7,10 @@ public struct CompoundMemberEvent: Sendable {
         case started(Int32)
         case state(ProcessState)
         case logLines([LogLine])
+        /// 成员 JVM 的热更新状态（每个成员独立会话）。
+        case hotReload(HotReloadSnapshot)
+        /// 成员按自动重启策略请求重启；由宿主决定如何重启该成员。
+        case hotReloadRestartRequested(String)
     }
 
     public var memberIndex: Int
@@ -49,6 +53,11 @@ public final class ExecutionRuntime: @unchecked Sendable {
     private var logHandler: (([LogLine]) -> Void)?
     private var startedHandler: ((Int32) -> Void)?
     private var compoundEventHandler: ((CompoundMemberEvent) -> Void)?
+    private var hotReloadHandler: ((HotReloadSnapshot) -> Void)?
+    private var hotReloadRestartHandler: ((String) -> Bool)?
+
+    private let hotReloadLock = NSLock()
+    private var hotReloadSession: HotReloadSession?
 
     private let compoundLock = NSLock()
     private var memberStates: [ProcessState] = []
@@ -71,12 +80,17 @@ public final class ExecutionRuntime: @unchecked Sendable {
         switch execution {
         case .process(let plan):
             self.testMonitor = nil
-            self.session = try ManagedProcessSession(
-                configKey: configKey,
-                configName: configName,
-                plan: plan,
-                logBuffer: logBuffer
-            )
+            do {
+                self.session = try ManagedProcessSession(
+                    configKey: configKey,
+                    configName: configName,
+                    plan: plan,
+                    logBuffer: logBuffer
+                )
+            } catch {
+                plan.hotReload?.agentLaunch?.cleanup()
+                throw error
+            }
         case .test(let plan):
             let monitor = TestOutcomeMonitor()
             self.testMonitor = monitor
@@ -109,7 +123,15 @@ public final class ExecutionRuntime: @unchecked Sendable {
                 runtime.setHandlers(
                     onStarted: { [weak self] pid in self?.memberStarted(index: index, pid: pid) },
                     onState: { [weak self] state in self?.memberStateChanged(index: index, state: state) },
-                    onLogLines: { [weak self] lines in self?.memberLogged(index: index, lines: lines) }
+                    onLogLines: { [weak self] lines in self?.memberLogged(index: index, lines: lines) },
+                    onHotReload: { [weak self] snapshot in
+                        self?.memberHotReloadChanged(index: index, snapshot: snapshot)
+                    },
+                    onHotReloadRestart: { [weak self] reason in
+                        // 成员级自动重启需要重建该成员的启动计划；宿主没有这条通路时
+                        // 必须诚实降级为“需要重启”，不能假装已重启。
+                        self?.memberHotReloadRestart(index: index, reason: reason) ?? false
+                    }
                 )
             }
         }
@@ -120,7 +142,22 @@ public final class ExecutionRuntime: @unchecked Sendable {
                 self?.testMonitor?.consume(lines)
                 self?.deliverLogs(lines)
             }
-            session.onStarted = { [weak self] pid in self?.deliverStarted(pid) }
+            session.onStarted = { [weak self] pid in
+                self?.deliverStarted(pid)
+                // Agent 在 premain 中写端口文件，进程启动后即可开始握手。
+                self?.startHotReload()
+            }
+        }
+
+        if case .process(let plan) = execution, let hotReloadPlan = plan.hotReload {
+            hotReloadSession = HotReloadSession(
+                plan: hotReloadPlan,
+                log: { [weak self] text in self?.emitHotReloadLog(text) },
+                onSnapshot: { [weak self] snapshot in self?.deliverHotReload(snapshot) },
+                onRestartRequested: { [weak self] reason in
+                    self?.deliverHotReloadRestart(reason) ?? false
+                }
+            )
         }
     }
 
@@ -129,14 +166,88 @@ public final class ExecutionRuntime: @unchecked Sendable {
         onStarted: ((Int32) -> Void)? = nil,
         onState: ((ProcessState) -> Void)? = nil,
         onLogLines: (([LogLine]) -> Void)? = nil,
-        onCompoundMember: ((CompoundMemberEvent) -> Void)? = nil
+        onCompoundMember: ((CompoundMemberEvent) -> Void)? = nil,
+        onHotReload: ((HotReloadSnapshot) -> Void)? = nil,
+        onHotReloadRestart: ((String) -> Bool)? = nil
     ) {
         handlerLock.lock()
         startedHandler = onStarted
         stateHandler = onState
         logHandler = onLogLines
         compoundEventHandler = onCompoundMember
+        hotReloadHandler = onHotReload
+        hotReloadRestartHandler = onHotReloadRestart
         handlerLock.unlock()
+    }
+
+    // MARK: - 热更新
+
+    public var hotReloadSnapshot: HotReloadSnapshot? {
+        hotReloadLock.lock()
+        let session = hotReloadSession
+        hotReloadLock.unlock()
+        return session?.currentSnapshot
+    }
+
+    /// 界面的“立即编译并热更新”。Compound 请对 `members[index]` 调用。
+    public func requestHotReload() {
+        hotReloadLock.lock()
+        let session = hotReloadSession
+        hotReloadLock.unlock()
+        session?.requestManualReload()
+    }
+
+    /// “需要重启”提示里的“暂不重启”。
+    public func dismissHotReloadRestartPrompt() {
+        hotReloadLock.lock()
+        let session = hotReloadSession
+        hotReloadLock.unlock()
+        session?.dismissRestartPrompt()
+    }
+
+    private func startHotReload() {
+        hotReloadLock.lock()
+        let session = hotReloadSession
+        hotReloadLock.unlock()
+        session?.start()
+    }
+
+    private func stopHotReload() {
+        hotReloadLock.lock()
+        let session = hotReloadSession
+        hotReloadLock.unlock()
+        session?.stop()
+    }
+
+    private func emitHotReloadLog(_ text: String) {
+        let line = LogLine(stream: .system, text: text)
+        logBuffer.record([line])
+        deliverLogs([line])
+    }
+
+    private func deliverHotReload(_ snapshot: HotReloadSnapshot) {
+        handlerLock.lock()
+        let handler = hotReloadHandler
+        handlerLock.unlock()
+        handler?(snapshot)
+    }
+
+    private func deliverHotReloadRestart(_ reason: String) -> Bool {
+        handlerLock.lock()
+        let handler = hotReloadRestartHandler
+        handlerLock.unlock()
+        return handler?(reason) ?? false
+    }
+
+    /// 成员级自动重启需要宿主重建该成员的启动计划；当前 Compound 运行时没有
+    /// 单独重建成员的入口，因此只把请求转给界面并诚实降级为“需要重启”。
+    private func memberHotReloadRestart(index: Int, reason: String) -> Bool {
+        deliverMemberEvent(index: index, kind: .hotReloadRestartRequested(reason))
+        return false
+    }
+
+    private func memberHotReloadChanged(index: Int, snapshot: HotReloadSnapshot) {
+        deliverMemberEvent(index: index, kind: .hotReload(snapshot))
     }
 
     public var state: ProcessState {
@@ -180,6 +291,7 @@ public final class ExecutionRuntime: @unchecked Sendable {
     }
 
     public func stop() {
+        stopHotReload()
         // 先登记再终止：测试终态分类要区分“用户停止”和“测试失败”。
         compoundLock.lock()
         stopRequested = true
@@ -194,6 +306,7 @@ public final class ExecutionRuntime: @unchecked Sendable {
     }
 
     public func forceKill() {
+        stopHotReload()
         compoundLock.lock()
         stopRequested = true
         compoundLock.unlock()
@@ -407,6 +520,10 @@ public final class ExecutionRuntime: @unchecked Sendable {
     /// - 一个测试都没跑 → failed，不能把“没找到测试”当成成功
     /// - 用户停止 → cancelled，不能报成测试失败
     private func handleSessionState(_ state: ProcessState) {
+        if state.isTerminal {
+            // 进程已结束：先停止监听并清理 Agent 控制目录，再向外发布终态。
+            stopHotReload()
+        }
         guard let testMonitor, case .test(let plan) = execution else {
             deliverState(state)
             return
