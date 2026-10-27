@@ -2164,6 +2164,66 @@ struct LogConsoleView: View {
     }
 }
 
+/// 日志文本的滚动容器。`NSTextView` 的 `maxSize.width` 会被 NSScrollView 钉在视口宽度上，
+/// 不换行时长行永远撑不出横向滚动条；这里在每次布局时把文档视图按内容宽度撑开，
+/// 换行模式下交还给文本视图自己跟随视口。
+private final class ConsoleScrollView: NSScrollView {
+    var managesDocumentWidth = false
+    var documentWidth: CGFloat = 0
+    private var isAdjustingDocumentWidth = false
+
+    override func tile() {
+        super.tile()
+        guard !isAdjustingDocumentWidth, managesDocumentWidth, let documentView else { return }
+        let target = max(documentWidth, contentSize.width)
+        guard abs(documentView.frame.width - target) > 0.5 else { return }
+        isAdjustingDocumentWidth = true
+        documentView.setFrameSize(NSSize(width: target, height: documentView.frame.height))
+        isAdjustingDocumentWidth = false
+    }
+}
+
+/// 回看历史时的阅读锚点：视口顶部那一行的行首字符 + 该行顶部到视口顶部的距离。
+/// 头部回收会把前面的字符整块删掉，只还原滚动点内容仍会上移；按字符找回才能让同一行留在原处。
+private struct LogScrollAnchor {
+    var characterIndex: Int
+    var offset: CGFloat
+
+    static func capture(textView: NSTextView, visibleTop: CGFloat) -> LogScrollAnchor? {
+        guard let layoutManager = textView.layoutManager,
+              let container = textView.textContainer,
+              let storage = textView.textStorage,
+              storage.length > 0 else { return nil }
+        let inset = textView.textContainerOrigin
+        let point = NSPoint(x: 1, y: visibleTop + 2 - inset.y)
+        let glyph = layoutManager.glyphIndex(for: point, in: container)
+        var fragmentRange = NSRange()
+        let fragment = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: &fragmentRange)
+        let characters = layoutManager.characterRange(forGlyphRange: fragmentRange, actualGlyphRange: nil)
+        return LogScrollAnchor(
+            characterIndex: min(characters.location, storage.length - 1),
+            offset: visibleTop - (fragment.origin.y + inset.y)
+        )
+    }
+
+    func restore(textView: NSTextView, scrollView: ConsoleScrollView, headDeleted: Int) {
+        guard let layoutManager = textView.layoutManager,
+              let storage = textView.textStorage,
+              storage.length > 0 else { return }
+        // 锚点所在的行也被回收掉了，没有可对齐的内容，留在原处就是最好的
+        let shifted = characterIndex - headDeleted
+        guard shifted >= 0 else { return }
+        let glyph = layoutManager.glyphIndexForCharacter(at: min(shifted, storage.length - 1))
+        var fragmentRange = NSRange()
+        let fragment = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: &fragmentRange)
+        let inset = textView.textContainerOrigin
+        let clipView = scrollView.contentView
+        let target = max(fragment.origin.y + inset.y + offset, 0)
+        clipView.scroll(to: NSPoint(x: clipView.bounds.origin.x, y: target))
+        scrollView.reflectScrolledClipView(clipView)
+    }
+}
+
 private struct LogTextView: NSViewRepresentable {
     @ObservedObject var model: LogViewModel
     var wrapText: Bool
@@ -2177,7 +2237,7 @@ private struct LogTextView: NSViewRepresentable {
         Coordinator()
     }
 
-    func makeNSView(context: Context) -> NSScrollView {
+    func makeNSView(context: Context) -> ConsoleScrollView {
         let textView = NSTextView()
         textView.isEditable = false
         textView.isRichText = false
@@ -2192,16 +2252,15 @@ private struct LogTextView: NSViewRepresentable {
         // 打开后只排可见区域（懒排版），与前面的分块回收配合，十万行级别才谈得上流畅。
         textView.layoutManager?.allowsNonContiguousLayout = true
 
-        let scrollView = NSScrollView()
+        let scrollView = ConsoleScrollView()
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
         context.coordinator.wrap = wrapText
         Self.configureWrap(wrapText, textView: textView, scrollView: scrollView)
         return scrollView
     }
 
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+    func updateNSView(_ scrollView: ConsoleScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView,
               let storage = textView.textStorage else { return }
         let coordinator = context.coordinator
@@ -2212,18 +2271,30 @@ private struct LogTextView: NSViewRepresentable {
         // 新日志到达时只有原本停在底部才继续跟随；向上回看历史时不打断阅读。
         // 在写入新内容之前判断，避免追加导致的文档变高把自己误判成“已离开底部”。
         // 页签不可见时视图可能还没有有效高度，此时保留上一次的跟随状态。
-        if scrollView.contentView.bounds.height > 0 {
+        let clipView = scrollView.contentView
+        if clipView.bounds.height > 0 {
             coordinator.follow = LogScrollFollow.isAtBottom(
-                originY: Double(scrollView.contentView.bounds.origin.y),
-                visibleHeight: Double(scrollView.contentView.bounds.height),
+                originY: Double(clipView.bounds.origin.y),
+                visibleHeight: Double(clipView.bounds.height),
                 documentHeight: Double(textView.frame.height)
             )
         }
+        // 回看历史时记下阅读位置：原滚动点 + 顶部行的字符锚点。
+        // 头部回收会整块删字符，只有滚动点还原不够——内容整体上移，
+        // 看上去就是“页面自己跳了”，所以还要按字符把同一行找回原处。
+        let savedOrigin = clipView.bounds.origin
+        let anchor = coordinator.follow
+            ? nil
+            : LogScrollAnchor.capture(textView: textView, visibleTop: savedOrigin.y)
+        var headDeleted = 0
+        var contentChanged = false
+
         let filter = model.displayFilter
         let searchChanged = coordinator.appliedSearchText != model.searchText
 
         if coordinator.generation != model.clearGeneration || coordinator.filter != filter {
             // 清空或筛选条件变化：从当前缓冲按筛选全量重渲染
+            let cleared = coordinator.generation != model.clearGeneration
             coordinator.generation = model.clearGeneration
             coordinator.filter = filter
             coordinator.nextAbsolute = model.firstLineIndex + model.lines.count
@@ -2232,23 +2303,18 @@ private struct LogTextView: NSViewRepresentable {
                 attributed.append(Self.attributed(line))
             }
             storage.setAttributedString(attributed)
+            contentChanged = true
+            if cleared {
+                // 内容清光了，文档宽度从视口重新起算
+                scrollView.documentWidth = 0
+                scrollView.needsLayout = true
+            }
             // 渲染内容整个换掉了，搜索高亮从头重扫
             coordinator.searchRanges = []
             coordinator.scannedLength = 0
             coordinator.appliedCurrentIndex = -1
             coordinator.needsHighlightScan = true
             textView.needsDisplay = true
-            if coordinator.follow {
-                let previousOrigin = scrollView.contentView.bounds.origin
-                textView.scrollToEndOfDocument(nil)
-                if !wrapText {
-                    // 纵向跟到底；不换行时横向留在原地，不跳到最长行的末尾
-                    scrollView.contentView.scroll(
-                        to: NSPoint(x: previousOrigin.x, y: scrollView.contentView.bounds.origin.y)
-                    )
-                    scrollView.reflectScrolledClipView(scrollView.contentView)
-                }
-            }
         } else {
             // 增量渲染：用绝对行号对齐（model.lines 有环形截断，firstLineIndex 会前移）。
             // 不匹配筛选的行只跳过渲染，绝对行号照常推进；筛选条件一变就走上面的全量重渲染。
@@ -2268,6 +2334,15 @@ private struct LogTextView: NSViewRepresentable {
                     attributed.append(Self.attributed(line))
                 }
                 if attributed.length > 0 {
+                    // 不换行时文档宽度跟着最长行长——NSTextView 的 maxSize 默认被钉在
+                    // 视口宽度上，不主动撑开就永远撑不出横向滚动条，长行直接被裁掉。
+                    if scrollView.managesDocumentWidth {
+                        scrollView.documentWidth = max(
+                            scrollView.documentWidth,
+                            Self.requiredWidth(of: attributed, textView: textView)
+                        )
+                        scrollView.needsLayout = true
+                    }
                     storage.append(attributed)
                     // TextStorage 自身也设上限，防止无限膨胀。
                     // 分块回收：越过上限时一次删到下水位，而不是「删到刚好等于上限」。
@@ -2275,24 +2350,31 @@ private struct LogTextView: NSViewRepresentable {
                     // 头部删除 + 全量重排，十万行级别的日志足以把主线程压死；
                     // 分块后这笔代价按「每新增约 40 万字符付一次」摊薄一百倍。
                     if storage.length > Self.storageHighWaterMark {
-                        let deleted = storage.length - Self.storageLowWaterMark
-                        storage.deleteCharacters(in: NSRange(location: 0, length: deleted))
-                        coordinator.noteFrontDeletion(deleted)
+                        headDeleted = storage.length - Self.storageLowWaterMark
+                        storage.deleteCharacters(in: NSRange(location: 0, length: headDeleted))
+                        coordinator.noteFrontDeletion(headDeleted)
                     }
                     coordinator.needsHighlightScan = true
                     textView.needsDisplay = true
-                    if coordinator.follow {
-                        let previousOrigin = scrollView.contentView.bounds.origin
-                        textView.scrollToEndOfDocument(nil)
-                        if !wrapText {
-                            // 纵向跟到底；不换行时横向留在原地，不跳到最长行的末尾
-                            scrollView.contentView.scroll(
-                                to: NSPoint(x: previousOrigin.x, y: scrollView.contentView.bounds.origin.y)
-                            )
-                            scrollView.reflectScrolledClipView(scrollView.contentView)
-                        }
-                    }
+                    contentChanged = true
                 }
+            }
+        }
+
+        // —— 滚动位置：跟随时贴底，回看时原样留在原处（任何写入都不许抢滚动） ——
+        if contentChanged {
+            if coordinator.follow {
+                textView.scrollToEndOfDocument(nil)
+                if !wrapText {
+                    // 纵向跟到底；不换行时横向留在原地，不跳到最长行的末尾
+                    clipView.scroll(to: NSPoint(x: savedOrigin.x, y: clipView.bounds.origin.y))
+                    scrollView.reflectScrolledClipView(clipView)
+                }
+            } else if headDeleted > 0, let anchor {
+                anchor.restore(textView: textView, scrollView: scrollView, headDeleted: headDeleted)
+            } else {
+                clipView.scroll(to: savedOrigin)
+                scrollView.reflectScrolledClipView(clipView)
             }
         }
 
@@ -2308,10 +2390,13 @@ private struct LogTextView: NSViewRepresentable {
     }
 
     /// 自动换行开关：换行时文本视图宽度跟随容器；不换行时容器宽度无限、
-    /// 文本视图随内容横向生长，靠水平滚动条查看长行。
-    private static func configureWrap(_ wrap: Bool, textView: NSTextView, scrollView: NSScrollView) {
-        scrollView.hasHorizontalScroller = !wrap
+    /// 文本视图按内容宽度撑开（见 `ConsoleScrollView`），靠水平滚动条查看长行。
+    private static func configureWrap(_ wrap: Bool, textView: NSTextView, scrollView: ConsoleScrollView) {
         if wrap {
+            scrollView.hasHorizontalScroller = false
+            scrollView.autohidesScrollers = true
+            scrollView.managesDocumentWidth = false
+            scrollView.documentWidth = 0
             textView.isHorizontallyResizable = false
             textView.autoresizingMask = [.width]
             textView.textContainer?.widthTracksTextView = true
@@ -2319,7 +2404,20 @@ private struct LogTextView: NSViewRepresentable {
             if scrollView.contentSize.width > 0 {
                 textView.frame.size.width = scrollView.contentSize.width
             }
+            // 折行后横向位置没有意义，回到最左
+            scrollView.contentView.scroll(
+                to: NSPoint(x: 0, y: scrollView.contentView.bounds.origin.y)
+            )
+            scrollView.reflectScrolledClipView(scrollView.contentView)
         } else {
+            scrollView.hasHorizontalScroller = true
+            // 不换行时横向滚动条常驻：长行能不能看全，取决于底部这条滚动条
+            scrollView.autohidesScrollers = false
+            scrollView.managesDocumentWidth = true
+            scrollView.documentWidth = max(
+                scrollView.documentWidth,
+                requiredWidth(of: textView.attributedString(), textView: textView)
+            )
             textView.isHorizontallyResizable = true
             textView.autoresizingMask = []
             textView.textContainer?.widthTracksTextView = false
@@ -2327,9 +2425,31 @@ private struct LogTextView: NSViewRepresentable {
                 width: CGFloat.greatestFiniteMagnitude,
                 height: CGFloat.greatestFiniteMagnitude
             )
-            textView.sizeToFit()
+            // 默认 maxSize 被钉在视口宽度，放开才能横向生长
+            textView.maxSize = NSSize(
+                width: CGFloat.greatestFiniteMagnitude,
+                height: CGFloat.greatestFiniteMagnitude
+            )
         }
         textView.layoutManager?.ensureLayout(for: textView.textContainer!)
+        scrollView.needsLayout = true
+    }
+
+    /// 这批内容需要的文档宽度：按等宽字体实际量一遍（懒排版下 `usedRect` 只反映已排区域，
+    /// 拿不到整批的宽度），再加上文本容器两侧留白。
+    private static func requiredWidth(of text: NSAttributedString, textView: NSTextView) -> CGFloat {
+        guard text.length > 0 else { return 0 }
+        let measured = NSMutableAttributedString(attributedString: text)
+        measured.addAttribute(
+            .font,
+            value: textView.font ?? NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+            range: NSRange(location: 0, length: measured.length)
+        )
+        let bounds = measured.boundingRect(
+            with: NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin]
+        )
+        return bounds.width + textView.textContainerInset.width * 2
     }
 
     /// 每行都新建 NSMutableParagraphStyle / Date.FormatStyle 在大流量下是纯浪费：

@@ -163,10 +163,10 @@ Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准�
 
 ## 日志与环境变量
 
-- 控制台与构建页：等宽字体，每行前缀短时间（`时:分`，随系统区域设置），stdout 常态、stderr 红、系统消息灰；停在底部时新输出自动跟随到最新一行，向上回看历史时保持当前位置、不抢滚动，滚回底部后恢复跟随；「清空日志」只清显示，不影响进程
+- 控制台与构建页：等宽字体，每行前缀短时间（`时:分`，随系统区域设置），stdout 常态、stderr 红、系统消息灰；停在底部时新输出自动跟随到最新一行，向上回看历史时保持当前位置、不抢滚动（新日志与超量回收都不会让页面跳动），滚回底部后恢复跟随；「清空日志」只清显示，不影响进程
 - Compound 运行中，控制台顶部提供「全部 / 各成员」切换：「全部」是带 `[成员名]` 前缀的合并日志，单个成员页只显示它自己的输出
 - 控制台与构建页顶部的查找分两套语义：「搜索」只把匹配内容高亮（忽略大小写），▲▼ 在上一个/下一个匹配之间跳转并显示「当前/总数」，不改变显示的行；「筛选」（漏斗）按关键词把未匹配的行从显示中过滤掉，可与来源筛选（全部 / 输出 / 错误 / 系统）叠加，激活时显示「匹配行数 / 总行数」。两者都只影响显示，不影响日志保留上限（§37），页签切换后条件保持
-- 「换行」勾选框控制长行显示：**默认不换行**，长行用横向滚动条查看（新日志跟到底时横向位置保持不动，不跳到最长行末尾）；勾选后自动折行。偏好全局生效并跨启动记忆
+- 「换行」勾选框控制长行显示：**默认不换行**，文档宽度按最长行撑开，底部常驻横向滚动条（新日志跟到底时横向位置保持不动，不跳到最长行末尾）；勾选后自动折行、横向滚动条隐藏。偏好全局生效并跨启动记忆
 - 长跑服务不会吃满内存：日志在内存中保留最近 20000 行 / 10MB，超出丢弃最旧行（§37）。需要完整历史请用项目自己的日志文件
 - 大流量日志按「批量 + 分块」设计，十万行级别不卡界面：读线程按当前到达字节流式读取并批量入环形缓冲；缓冲满后按批次一次性裁剪（不是逐行搬移）；文本视图开启懒排版（只排可见区域），字符数涨过 200 万后整块回收到 160 万，把重排代价按「每新增约 40 万字符一次」摊薄。控制台因此永远只渲染最近的内容，滚轮回看更早的历史会落在丢弃区之外
 - 环境变量默认掩码 `••••••••`，勾选「显示明文」才展示取值（§28）；切换配置时自动回到掩码。CLI 对应 `--show-secrets`
@@ -293,7 +293,7 @@ swift test --skip MavenClasspathIntegrationTests  # CI 集合：489 用例（跳
 - **解析层** — RunConfigurationParser（alias / rawOptions / Before Launch / JAR 字段）、WorkspaceParser（流式、只取 RunManager、跳过模板）、ProjectScanner（§7 来源优先级去重、§6 深度上限 4、忽略目录）、MacroResolver（§11 全部宏与 IDEA 上下文变量，运行配置与 IML 路径共用）、ModuleResolver（§13 五种方式）、JDKResolver（§23–25 优先级与 major version 模糊匹配）
 - **构建与启动** — JavaRunPlanner（§26–§29）、JarRunPlanner（`java -jar` 参数顺序、默认工作目录、缺失/不可读 JAR）、ExecutionRuntime（日志/PID/终态转发、Stop、Before Launch 同步执行与取消、测试终态：失败/无测试/无汇总/用户停止）、MavenRunExecution（直接运行参数顺序与 `-nsu` 缺失、Project JDK / `MAVEN_OPTS`、pom 与不支持选项的 fail-closed、宏与 `$Prompt$`、Surefire 模块范围/筛选/工作目录限制）、TestTargetResolver（类/方法/包/目录/模式展开与无匹配拒绝）、TestOutcomeMonitor（Surefire `Results:` 汇总与逐类行、旧版 `Results :`、Gradle SUMMARY、无测试检测）、Compound（成员按引用顺序准备、嵌套展开、缺失/类型不匹配/成环拦截、独立 PID 与日志、分组 Stop/Force Kill、部分失败清理）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator / GradleLocator（Dock 启动无 PATH 时的绝对路径枚举与 wrapper 发行版兜底）、GradleBuildService（project path 任务、合并编译与 classpath 解析、provided 变体、缓存失效、失败与取消、JUnit `:test` 与 `--tests`/init script）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
 - **诊断与能力** — ScanDiagnostic（读失败 / XML 损坏 / 配置目录不可读 / 重复配置 / 缺 Main Class / 不支持的 Before Launch 任务都带严重程度与建议，不静默丢配置）、ConfigurationCapabilityResolver（类型 + 构建系统 + 字段 + Module 解析 + Before Launch 统一裁决）、BuildSystemSelector（Maven/Gradle 共存时的确定性选择）、Gradle settings/projectDir 解析、Maven `$MODULE_DIR$` POM 路径、ProcessHandle 启动前取消与 SIGTERM→SIGKILL 升级
-- **进程与日志** — ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、LogRingBuffer（§37 上限）、LogScrollFollow（停在底部才跟随新日志，向上回看不抢滚动）
+- **进程与日志** — ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、LogRingBuffer（§37 上限）、LogScrollFollow（停在底部才跟随新日志，向上回看不抢滚动；回收头部时按字符锚点把阅读位置留在原处）
 - **热更新** — HotReloadConfiguration（默认关闭、外部 Agent 参数分词、忽略路径、回退策略）、HotReloadWorkspace（源/输出快照与 SHA-256 指纹、同名类按输出目录区分、外部构建产物识别、编译期事件合并、不把半成品推给 JVM）、HotReloadWatcher（FSEventStream 创建/启动失败上报、停止释放、失败后重试、初始化基准与监听之间的保存对账）、HotReloadAgent 控制协议（loopback + 随机 token、帧上限、状态/重载/关闭、整组原子重定义）、失败分类（结构变更 / 整组未应用 / 同名类歧义 / 来源不匹配 / 类未加载 / 字节码拒绝）、运行中开关生命周期（启动开/启动关、运行中关先「正在关闭」再「热更新已关闭」并停监听/取消去抖与编译/关 Agent 通道、编译中关闭不发布成功、Compound 单成员关闭不影响其它成员、关闭后不会自行复活）、真实 JVM 集成（javac 编译 + Agent 附加 + 方法体替换生效、两方法体同组成功、结构失败时整组不应用且进程保持存活、同一 FQCN 的两个 ClassLoader 按 CodeSource 只替换匹配副本、来源不匹配与歧义拒绝、JDK 8 / JDK 17 构建脚本）、自动重启走既有停止→准备链路，CLI 侧 `--hot-reload` 冒烟（编译、替换、Ctrl-C 退出码 130、无孤儿 JVM）
 - **在线更新** — 版本比较与 fail-closed、发布元数据解析（JSON 与 expanded_assets 两条路径）、镜像链顺序与回退/取消/坏文件删除、更新助手参数契约与重启路径、designated requirement 解析与语义判定，以及把产物名 / bundle id / Team / 助手落点钉到 `scripts/` 与 `release.yml` **原文**的防漂移断言
 
