@@ -15,7 +15,7 @@ concurrency:
 jobs:
   release:
     name: Sign, notarize, and publish
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
       APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}

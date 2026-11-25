@@ -309,7 +309,7 @@ swift test --skip MavenClasspathIntegrationTests  # CI 集合：489 用例（跳
 
 `build-app.sh` 会先调用 Agent 构建脚本，并把 `HotReloadAgent.jar` 放进 `Contents/Resources/` 后再签名；`distribute-app.sh` 缺这个 jar 会拒绝打包。正式发布走 GitHub Actions：推 `v*` tag 即自动安装 Temurin 17（`actions/setup-java`，提供 javac）→ `swift test` → 构建 Agent → Developer ID 签名 → Apple 公证 → staple → 创建 Release（附件 `IdeaLightRun-<ver>-universal.zip` 与 `SHA256SUMS.txt`）。
 
-**打 tag 前必须先等 `Compile check`（push 到 main 自动跑）绿灯**：它用发布同款工具链 `swift build` 全量编译，覆盖 `swift test` 不构建的 GUI target——CI runner 是旧的 Xcode 15 / Swift 5.10，本机 Xcode 26 能过的写法在它上面是编译错误，而 tag 推上去就作废不了。
+**打 tag 前必须先等 `Compile check`（push 到 main 自动跑）绿灯**：它用发布同款工具链 `swift build` 全量编译，覆盖 `swift test` 不构建的 GUI target。GitHub 已于 2026-11-02 退役 macOS 14（连同其 Xcode 15 / Swift 5.10），因此 CI 改用仍受支持的 macOS 15；tag 推上去就作废不了，失败不能靠重打覆盖。
 
 ```bash
 git tag -a v<下一个版本号> -m "v<下一个版本号>" && git push git@github.com:misswell/IdeaLightRun.git v<下一个版本号>
