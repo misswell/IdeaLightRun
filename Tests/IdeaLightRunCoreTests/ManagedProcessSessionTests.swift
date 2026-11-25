@@ -172,6 +172,67 @@ final class ManagedProcessSessionTests: XCTestCase {
         XCTAssertGreaterThan(session.logBuffer.count, 0)
     }
 
+    /// 回归：读线程必须逐轮排空 autorelease pool。旧实现里 availableData 返回的
+    /// 16 KB NSData 缓冲会挂在线程的池里，直到进程退出才释放；长跑服务下
+    /// 表现为内存一路涨到几百 MB。
+    func testLongRunningOutputDoesNotAccumulateReadBuffers() throws {
+        let baseline = Self.mallocInUseBytes()
+        let session = try ManagedProcessSession(
+            configKey: "test", configName: "test",
+            plan: makePlan(
+                executable: "/usr/bin/python3",
+                arguments: [
+                    "-c",
+                    "import time\n"
+                        + "for i in range(4000):\n"
+                        + "    print(f'read-buffer-{i}', flush=True)\n"
+                        + "    time.sleep(0.002)\n"
+                        + "time.sleep(60)\n"
+                ]
+            )
+        )
+        defer {
+            session.stop()
+            _ = session.waitUntilExit(timeout: 5)
+        }
+
+        var delivered = 0
+        let lock = NSLock()
+        session.onLogLines = { batch in
+            lock.lock()
+            delivered += batch.count
+            lock.unlock()
+        }
+        session.start()
+
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            lock.lock()
+            let count = delivered
+            lock.unlock()
+            if count >= 4000 { break }
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        Thread.sleep(forTimeInterval: 0.3)
+
+        let growth = Self.mallocInUseBytes() - baseline
+        lock.lock()
+        let received = delivered
+        lock.unlock()
+        XCTAssertGreaterThanOrEqual(received, 4000, "测试进程应先把日志全部送达")
+        XCTAssertLessThan(
+            growth,
+            40 * 1024 * 1024,
+            "长跑进程的读缓冲不得累积；实际增长 \(growth / 1024) KB"
+        )
+    }
+
+    private static func mallocInUseBytes() -> Int {
+        var stats = malloc_statistics_t()
+        malloc_zone_statistics(malloc_default_zone(), &stats)
+        return Int(stats.size_in_use)
+    }
+
     /// 回归：readerGroup.notify 原先在 enter() 之前注册，计数为 0 时它会立即投递，
     /// 于是进程刚起来就被判成 .exited(0)——服务在跑，列表却显示"已退出"。
     func testLongRunningProcessIsNotReportedExited() throws {

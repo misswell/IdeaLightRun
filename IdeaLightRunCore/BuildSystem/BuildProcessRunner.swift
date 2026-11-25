@@ -47,11 +47,17 @@ enum BuildProcessRunner {
             DispatchQueue.global(qos: .utility).async {
                 defer { readerGroup.leave() }
                 while true {
-                    // availableData 而非 readData(ofLength:)：后者要凑满 64KB 或 EOF 才返回，
-                    // 编译日志会成段攒住（和运行期日志一样的症状）。
-                    let data = fileHandle.availableData
-                    if data.isEmpty { return }  // EOF
-                    ingest(data, stream: stream)
+                    // 同上：构建可能跑很久，逐轮排空自动释放对象，避免读缓冲
+                    // 一直堆到进程结束才释放。
+                    let reachedEOF = autoreleasepool { () -> Bool in
+                        // availableData 而非 readData(ofLength:)：后者要凑满 64KB 或 EOF 才返回，
+                        // 编译日志会成段攒住（和运行期日志一样的症状）。
+                        let data = fileHandle.availableData
+                        if data.isEmpty { return true }
+                        ingest(data, stream: stream)
+                        return false
+                    }
+                    if reachedEOF { return }
                 }
             }
         }

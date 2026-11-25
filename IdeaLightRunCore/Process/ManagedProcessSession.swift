@@ -194,20 +194,27 @@ public final class ManagedProcessSession {
             defer { self?.readerGroup.leave() }
             while true {
                 guard let self else { return }
-                // 必须用 availableData：readData(ofLength: 65536) 会一直阻塞到凑满
-                // 64KB 或 EOF，进程边跑边打印时日志全被攒到退出才吐（用户看到的
-                // 「启动日志卡住、点关闭才刷出来」就是这个）。availableData 只取当前
-                // 已到达的字节，立刻返回。
-                let data = fileHandle.availableData
-                if data.isEmpty {
-                    // 管道 EOF ≠ 进程退出：被启动的进程可以自行关闭/重定向 fd 1、2，
-                    // 或读操作被瞬时错误打断。此时必须继续排空（否则对端写满 64KB 会永久阻塞），
-                    // 只有进程真的退出才结束读取。
-                    if self.processHasExited() { return }
-                    Thread.sleep(forTimeInterval: 0.1)
-                    continue
+                // 每轮必须有自己的 autorelease pool：availableData 返回的 NSData
+                // 是自动释放对象，而读线程会活到进程退出。外层 GCD block 的池只在
+                // block 返回时排空，长跑服务下每次读取的 16KB 缓冲会一路累积。
+                let reachedEOF = autoreleasepool { () -> Bool in
+                    // 必须用 availableData：readData(ofLength: 65536) 会一直阻塞到凑满
+                    // 64KB 或 EOF，进程边跑边打印时日志全被攒到退出才吐（用户看到的
+                    // 「启动日志卡住、点关闭才刷出来」就是这个）。availableData 只取当前
+                    // 已到达的字节，立刻返回。
+                    let data = fileHandle.availableData
+                    if data.isEmpty {
+                        // 管道 EOF ≠ 进程退出：被启动的进程可以自行关闭/重定向 fd 1、2，
+                        // 或读操作被瞬时错误打断。此时必须继续排空（否则对端写满 64KB 会永久阻塞），
+                        // 只有进程真的退出才结束读取。
+                        if self.processHasExited() { return true }
+                        Thread.sleep(forTimeInterval: 0.1)
+                        return false
+                    }
+                    self.ingest(data, stream: stream)
+                    return false
                 }
-                self.ingest(data, stream: stream)
+                if reachedEOF { return }
             }
         }
     }
