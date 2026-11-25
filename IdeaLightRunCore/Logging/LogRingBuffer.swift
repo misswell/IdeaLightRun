@@ -11,10 +11,21 @@ public final class LogRingBuffer: @unchecked Sendable {
 
     public let maxLines: Int
     public let maxBytes: Int
+    /// GUI 已经有自己的 LogViewModel 历史，核心缓冲不需要再存一份；
+    /// CLI / 测试仍可用 snapshot() 取完整历史。
+    public let retainsHistory: Bool
+    private let maxPendingLines: Int?
 
-    public init(maxLines: Int = 20_000, maxBytes: Int = 10 * 1024 * 1024) {
+    public init(
+        maxLines: Int = 20_000,
+        maxBytes: Int = 10 * 1024 * 1024,
+        retainsHistory: Bool = true,
+        maxPendingLines: Int? = nil
+    ) {
         self.maxLines = maxLines
         self.maxBytes = maxBytes
+        self.retainsHistory = retainsHistory
+        self.maxPendingLines = maxPendingLines
     }
 
     public func append(_ line: LogLine) {
@@ -24,19 +35,24 @@ public final class LogRingBuffer: @unchecked Sendable {
     public func append(_ newLines: [LogLine]) {
         guard !newLines.isEmpty else { return }
         lock.lock()
-        for line in newLines {
-            lines.append(line)
-            totalBytes += line.text.utf8.count + 1
+        if retainsHistory {
+            for line in newLines {
+                lines.append(line)
+                totalBytes += line.text.utf8.count + 1
+            }
+            trimLocked()
         }
-        trimLocked()
         pending.append(contentsOf: newLines)
+        if let limit = maxPendingLines, pending.count > limit {
+            pending.removeFirst(pending.count - limit)
+        }
         lock.unlock()
     }
 
     /// 只写入环形历史，不进入待推送队列。调用方已经自行完成批量投递
     /// （Compound 根控制台的合并日志）时使用，否则 pending 永远无人取走。
     public func record(_ newLines: [LogLine]) {
-        guard !newLines.isEmpty else { return }
+        guard retainsHistory, !newLines.isEmpty else { return }
         lock.lock()
         for line in newLines {
             lines.append(line)

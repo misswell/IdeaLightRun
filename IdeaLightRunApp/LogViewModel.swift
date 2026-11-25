@@ -52,8 +52,11 @@ struct ConsoleFilter: Equatable {
 /// `LogConsoleView`，因此把"行缓冲 + 清空代数 + 绝对行号"抽成基类。
 @MainActor
 class LogViewModel: ObservableObject {
-    /// 内存上限与 LogRingBuffer 对齐
-    static let maxViewLines = 20_000
+    /// 控制台只需要回看最近的输出；长跑服务下 2 万行会把常驻内存放大到几十 MB。
+    /// 5 千行足够覆盖 Spring Boot 启动与一次异常堆栈，超出丢弃最旧行。
+    static let maxViewLines = 5_000
+    /// GUI 的 LogRingBuffer 只负责 100ms 批量投递，不重复保存历史。
+    static let maxPendingLines = 5_000
 
     @Published private(set) var lines: [LogLine] = []
     @Published private(set) var clearGeneration = 0

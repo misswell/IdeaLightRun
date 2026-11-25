@@ -24,7 +24,14 @@ final class RunningProcessModel: LogViewModel, Identifiable {
     let configName: String
     /// 实例启动时刻；多实例列表按它倒序展示。
     let startedAt = Date()
-    let logBuffer = LogRingBuffer()
+    /// GUI 的 LogViewModel 已保存显示历史，这里的环形缓冲只做批次投递；
+    /// 不再重复存一份 2 万行历史。
+    let logBuffer = LogRingBuffer(
+        maxLines: LogViewModel.maxViewLines,
+        maxBytes: 4 * 1024 * 1024,
+        retainsHistory: false,
+        maxPendingLines: LogViewModel.maxPendingLines
+    )
 
     @Published private(set) var state: ProcessState = .preparing
     /// 进程真正 run() 成功后才有的 PID（onStarted 回调写入，§P0-2）。

@@ -2307,8 +2307,9 @@ private struct LogTextView: NSViewRepresentable {
 
     /// NSTextStorage 的字符水位：涨过上限就一次回收到下水位。
     /// 与 LogViewModel.maxViewLines（行数）互为兜底——超长单行也可能撑爆字符数。
-    static let storageHighWaterMark = 2_000_000
-    static let storageLowWaterMark = 1_600_000
+    /// 600k 字符约等于 5 千行 × 120 字，足够显示启动日志和异常堆栈。
+    static let storageHighWaterMark = 600_000
+    static let storageLowWaterMark = 450_000
 
     func makeCoordinator() -> Coordinator {
         Coordinator()

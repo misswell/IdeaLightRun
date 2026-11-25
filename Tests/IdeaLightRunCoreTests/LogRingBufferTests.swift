@@ -55,6 +55,25 @@ final class LogRingBufferTests: XCTestCase {
         XCTAssertTrue(buffer.drainPending().isEmpty)
     }
 
+    /// GUI 模式不再重复保存显示历史，但批量投递仍必须完整可用；
+    /// pending 也设上限，避免进程在单个 flush 周期内倒出海量日志时内存尖峰。
+    func testNonRetainingBufferOnlyKeepsPendingWindow() {
+        let buffer = LogRingBuffer(maxLines: 5_000, retainsHistory: false, maxPendingLines: 3)
+        buffer.append((0..<5).map { LogLine(stream: .stdout, text: "line-\($0)") })
+
+        XCTAssertEqual(buffer.count, 0, "GUI 模式不应在核心缓冲里再存一份历史")
+        XCTAssertTrue(buffer.snapshot().isEmpty)
+        XCTAssertEqual(
+            buffer.drainPending().map(\.text),
+            ["line-2", "line-3", "line-4"],
+            "pending 超限时保留最新日志，旧行丢弃"
+        )
+
+        buffer.record([LogLine(stream: .stdout, text: "merged")])
+        XCTAssertEqual(buffer.count, 0)
+        XCTAssertTrue(buffer.drainPending().isEmpty, "record 只服务历史，不能污染 pending")
+    }
+
     func testClear() {
         let buffer = LogRingBuffer()
         buffer.append(LogLine(stream: .stdout, text: "x"))
