@@ -526,20 +526,24 @@ struct ProjectSummaryView: View {
     @ObservedObject var store: AppStore
     let project: ProjectEntry
 
+    /// 中栏可拖到 360pt 宽，摘要芯片与三个构建按钮不可能同时保持理想宽度。
+    /// 按可用宽度依次退到更紧凑的一档；最窄的一档只留图标和悬浮说明，
+    /// 而不是让按钮文字被压成「…」。
+    private enum ActionDensity {
+        case iconAndTitle
+        case title
+        case iconOnly
+    }
+
     var body: some View {
         // 两行布局：信息芯片 + 构建按钮一行，git 分支/拉取独占一行。
         // git 的加载状态（进度圈 + 长错误信息）不再挤占信息行，高度也恒定。
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 14) {
-                chip(icon: "wrench.and.screwdriver", text: buildSystemText)
-                if let jdk = project.projectJDK?.installation {
-                    chip(icon: "cpu", text: "JDK \(jdk.majorVersion.map(String.init) ?? "?") · \(jdk.displayName ?? jdk.home.lastPathComponent)")
-                }
-                if let result = project.result {
-                    chip(icon: "square.stack.3d.up", text: "\(result.modules.count) 模块")
-                }
-                Spacer()
-                buildControls
+            ViewThatFits(in: .horizontal) {
+                summaryRow(jdkDetail: true, actionDensity: .iconAndTitle)
+                summaryRow(jdkDetail: true, actionDensity: .title)
+                summaryRow(jdkDetail: false, actionDensity: .title)
+                summaryRow(jdkDetail: false, actionDensity: .iconOnly)
             }
             // .id 让切换项目时重建模型，重新读新项目的分支
             GitControls(project: project)
@@ -549,23 +553,54 @@ struct ProjectSummaryView: View {
         .padding(.vertical, 8)
     }
 
+    private func summaryRow(jdkDetail: Bool, actionDensity: ActionDensity) -> some View {
+        HStack(spacing: 8) {
+            summaryChips(jdkDetail: jdkDetail)
+            Spacer(minLength: 6)
+            buildControls(density: actionDensity)
+        }
+    }
+
+    private func summaryChips(jdkDetail: Bool) -> some View {
+        HStack(spacing: 8) {
+            chip(icon: "wrench.and.screwdriver", text: buildSystemText, help: "构建系统：\(buildSystemText)")
+            if let jdk = project.projectJDK?.installation {
+                let shortText = "JDK \(jdk.majorVersion.map(String.init) ?? "?")"
+                let fullText = "\(shortText) · \(jdk.displayName ?? jdk.home.lastPathComponent)"
+                chip(icon: "cpu", text: jdkDetail ? fullText : shortText, help: "项目 JDK：\(fullText)")
+            }
+            if let result = project.result {
+                let text = "\(result.modules.count) 模块"
+                chip(icon: "square.stack.3d.up", text: text, help: "项目包含 \(result.modules.count) 个模块")
+            }
+        }
+    }
+
     /// IDEA 的 Build Project / Rebuild Project 与 Maven clean：项目级、作用于整个 reactor。
-    private var buildControls: some View {
+    private func buildControls(density: ActionDensity) -> some View {
         let build = store.builds[project.id]
         let busy = build?.phase.isBusy ?? false
         let buildSystemReady = project.hasBuildSystem
         let unavailableHint = "项目根未找到 Maven 或 Gradle 构建文件"
 
-        return HStack(spacing: 8) {
+        return HStack(spacing: 6) {
             if busy {
                 ProgressView()
                     .controlSize(.small)
                 Text(build?.statusText ?? "")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Button("停止构建") { store.stopBuild(projectID: project.id) }
+                    .lineLimit(1)
+                    .help(build?.statusText ?? "")
+                actionButton(
+                    title: "停止构建",
+                    systemImage: "stop.fill",
+                    density: density,
+                    help: "终止构建进程（SIGTERM）"
+                ) {
+                    store.stopBuild(projectID: project.id)
+                }
                     .disabled(build?.phase == .stopping)
-                    .help("终止构建进程（SIGTERM）")
                 if build?.phase == .stopping {
                     Button(role: .destructive) {
                         store.forceKillBuild(projectID: project.id)
@@ -573,20 +608,61 @@ struct ProjectSummaryView: View {
                         Image(systemName: "xmark.octagon.fill")
                     }
                     .help("强制结束（SIGKILL）")
+                    .accessibilityLabel("强制结束构建")
                 }
             } else {
-                Button("构建") { store.build(projectID: project.id, kind: .build) }
+                actionButton(
+                    title: "构建",
+                    systemImage: "hammer.fill",
+                    density: density,
+                    help: buildSystemReady ? "增量编译整个项目（IDEA 的 Build Project，⌘F9）" : unavailableHint
+                ) {
+                    store.build(projectID: project.id, kind: .build)
+                }
                     .disabled(!buildSystemReady)
-                    .help(buildSystemReady ? "增量编译整个项目（IDEA 的 Build Project，⌘F9）" : unavailableHint)
-                Button("重新构建") { store.build(projectID: project.id, kind: .rebuild) }
+                actionButton(
+                    title: "重建",
+                    systemImage: "arrow.triangle.2.circlepath",
+                    density: density,
+                    help: buildSystemReady ? "清空产物后全量编译（IDEA 的 Rebuild Project，⇧⌘F9）" : unavailableHint
+                ) {
+                    store.build(projectID: project.id, kind: .rebuild)
+                }
                     .disabled(!buildSystemReady)
-                    .help(buildSystemReady ? "清空产物后全量编译（IDEA 的 Rebuild Project，⇧⌘F9）" : unavailableHint)
-                Button("清理") { store.build(projectID: project.id, kind: .clean) }
+                actionButton(
+                    title: "清理",
+                    systemImage: "trash",
+                    density: density,
+                    help: buildSystemReady ? "只清空各模块产物，不编译（Maven clean / Gradle clean）" : unavailableHint
+                ) {
+                    store.build(projectID: project.id, kind: .clean)
+                }
                     .disabled(!buildSystemReady)
-                    .help(buildSystemReady ? "只清空各模块产物，不编译（Maven clean / Gradle clean）" : unavailableHint)
             }
         }
         .controlSize(.small)
+    }
+
+    private func actionButton(
+        title: String,
+        systemImage: String,
+        density: ActionDensity,
+        help: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            switch density {
+            case .iconAndTitle:
+                Label(title, systemImage: systemImage)
+                    .labelStyle(.titleAndIcon)
+            case .title:
+                Text(title)
+            case .iconOnly:
+                Image(systemName: systemImage)
+            }
+        }
+        .help(help)
+        .accessibilityLabel(title)
     }
 
     private var buildSystemText: String {
@@ -597,7 +673,7 @@ struct ProjectSummaryView: View {
         return parts.isEmpty ? "未知构建系统" : parts.joined(separator: " + ")
     }
 
-    private func chip(icon: String, text: String) -> some View {
+    private func chip(icon: String, text: String, help: String) -> some View {
         HStack(spacing: 5) {
             Image(systemName: icon)
                 .foregroundStyle(.secondary)
@@ -605,6 +681,7 @@ struct ProjectSummaryView: View {
                 .font(.callout)
                 .lineLimit(1)
         }
+        .help(help)
     }
 }
 
