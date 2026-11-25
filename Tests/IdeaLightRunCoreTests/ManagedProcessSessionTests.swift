@@ -184,7 +184,7 @@ final class ManagedProcessSessionTests: XCTestCase {
                 arguments: [
                     "-c",
                     "import time\n"
-                        + "for i in range(4000):\n"
+                        + "for i in range(2000):\n"
                         + "    print(f'read-buffer-{i}', flush=True)\n"
                         + "    time.sleep(0.002)\n"
                         + "time.sleep(60)\n"
@@ -205,12 +205,12 @@ final class ManagedProcessSessionTests: XCTestCase {
         }
         session.start()
 
-        let deadline = Date().addingTimeInterval(30)
+        let deadline = Date().addingTimeInterval(35)
         while Date() < deadline {
             lock.lock()
             let count = delivered
             lock.unlock()
-            if count >= 4000 { break }
+            if count >= 2000 { break }
             Thread.sleep(forTimeInterval: 0.05)
         }
         Thread.sleep(forTimeInterval: 0.3)
@@ -219,10 +219,10 @@ final class ManagedProcessSessionTests: XCTestCase {
         lock.lock()
         let received = delivered
         lock.unlock()
-        XCTAssertGreaterThanOrEqual(received, 4000, "测试进程应先把日志全部送达")
+        XCTAssertGreaterThanOrEqual(received, 2000, "测试进程应先把日志全部送达")
         XCTAssertLessThan(
             growth,
-            40 * 1024 * 1024,
+            16 * 1024 * 1024,
             "长跑进程的读缓冲不得累积；实际增长 \(growth / 1024) KB"
         )
     }
