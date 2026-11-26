@@ -302,7 +302,7 @@ struct SidebarView: View {
         if project.isScanning {
             Text("扫描中…").font(.caption2)
         } else if let count = project.result?.configurations.count {
-            Text("\(count) 个配置").font(.caption2)
+            Text(count == 0 ? "命令行可用" : "\(count) 个配置").font(.caption2)
         } else if project.errorText != nil {
             Text("扫描失败").font(.caption2).foregroundStyle(.red)
         } else {
@@ -360,7 +360,10 @@ struct ConfigurationListView: View {
                     Divider()
                 }
                 if result.configurations.isEmpty {
-                    emptyState(icon: "tray", text: "未发现 Run Configuration")
+                    emptyState(
+                        icon: "tray",
+                        text: "未发现 Run Configuration\n可在右侧「命令行」页签输入命令启动（Java 与非 Java 项目都支持）"
+                    )
                 } else {
                     List(selection: $store.selectedConfigurationKey) {
                         ForEach(result.configurations) { config in
@@ -670,7 +673,7 @@ struct ProjectSummaryView: View {
         var parts: [String] = []
         if result.buildSystem.maven != nil { parts.append("Maven") }
         if result.buildSystem.gradle != nil { parts.append("Gradle") }
-        return parts.isEmpty ? "未知构建系统" : parts.joined(separator: " + ")
+        return parts.isEmpty ? "无构建系统" : parts.joined(separator: " + ")
     }
 
     private func chip(icon: String, text: String, help: String) -> some View {
@@ -825,6 +828,7 @@ struct ConfigurationDetailView: View {
         case info = "信息"
         case console = "控制台"
         case build = "构建"
+        case commandLine = "命令行"
     }
 
     var body: some View {
@@ -844,6 +848,13 @@ struct ConfigurationDetailView: View {
                 }
                 // 开始构建后自动切到构建页，对齐 IDEA 弹出 Build 窗口的行为
                 .onChange(of: store.buildRevision) { _ in detailTab = .build }
+                // 扫描完成且没有任何 Run Configuration 时（典型是非 Java 项目），
+                // 直接落到「命令行」页，而不是让用户停在“选择一个配置”的空页。
+                .onChange(of: project.result?.configurations.count) { count in
+                    if count == 0 {
+                        detailTab = .commandLine
+                    }
+                }
             } else {
                 emptyPane(icon: "doc.text.magnifyingglass", text: "选择一个项目查看配置")
             }
@@ -868,7 +879,13 @@ struct ConfigurationDetailView: View {
             if let config = store.selectedConfiguration, let result = project.result {
                 infoDetail(project: project, config: config, result: result)
             } else {
-                emptyPane(icon: "doc.text.magnifyingglass", text: "选择一个配置查看详情")
+                let hasConfigurations = !(project.result?.configurations.isEmpty ?? true)
+                emptyPane(
+                    icon: hasConfigurations ? "doc.text.magnifyingglass" : "terminal",
+                    text: hasConfigurations
+                        ? "选择一个配置查看详情"
+                        : "未发现 Run Configuration\n可切到「命令行」页签直接输入命令启动项目"
+                )
             }
         case .console:
             if let config = store.selectedConfiguration {
@@ -878,6 +895,8 @@ struct ConfigurationDetailView: View {
             }
         case .build:
             buildDetail(project: project)
+        case .commandLine:
+            CommandLineView(store: store, project: project)
         }
     }
 
@@ -993,8 +1012,10 @@ struct ConfigurationDetailView: View {
                 }
             } else {
                 emptyPane(
-                    icon: "hammer",
-                    text: "尚未构建。用 ⌘F9 构建项目，或点项目摘要里的「构建」"
+                    icon: project.hasBuildSystem ? "hammer" : "terminal",
+                    text: project.hasBuildSystem
+                        ? "尚未构建。用 ⌘F9 构建项目，或点项目摘要里的「构建」"
+                        : "该项目没有 Maven / Gradle 构建文件，可在「命令行」页签直接启动命令"
                 )
             }
         }
@@ -1026,7 +1047,17 @@ struct ConfigurationDetailView: View {
     private func header(project: ProjectEntry) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                if let config = store.selectedConfiguration {
+                if detailTab == .commandLine {
+                    Text(project.name)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(project.name)
+                    Text("命令行模式")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else if let config = store.selectedConfiguration {
                     Text(config.name)
                         .font(.title3.weight(.semibold))
                         .lineLimit(1)
@@ -1045,7 +1076,7 @@ struct ConfigurationDetailView: View {
             }
 
             HStack(spacing: 10) {
-                if let config = store.selectedConfiguration {
+                if detailTab != .commandLine, let config = store.selectedConfiguration {
                     configActions(config: config, project: project)
                 }
                 Spacer(minLength: 8)

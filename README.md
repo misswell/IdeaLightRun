@@ -17,7 +17,7 @@
 
 ## 快速上手
 
-1. 左侧栏 **添加项目**（或把项目文件夹直接拖进侧栏）。目录需包含 `.idea`、`pom.xml`、`settings.gradle(.kts)` 或 `build.gradle(.kts)` 之一，否则弹窗拒绝
+1. 左侧栏 **添加项目**（或把项目文件夹直接拖进侧栏）。目录可以是任意文件夹：Java 项目会自动读取 IDEA Run Configuration；没有 Java 配置、甚至完全不是 Java 项目，也可以在右侧「命令行」页签手写命令启动
 2. 项目下自动列出 IDEA 里已有的 Run Configuration，无需再配一遍：Main Class 或 JAR Path、Module、JDK、VM Options、Program Arguments、Spring Profiles、环境变量、Working Directory 都从 IDEA 配置读，可在「信息」页签核对
 3. 选中一条 → **Run**（⌘R），界面自动切到「控制台」。Run 按该配置的 Before Launch 执行构建：IDEA 里勾了 Make / Build Project 才会先编译，勾了 "Do not build before run" 则直接启动。Java / Spring Boot 的状态依次显示「解析依赖中 → 编译中（如有）→ 启动中 → 运行中」，JAR Application 直接进入「启动中」
 4. **Stop**（⌘.）发 SIGTERM；进入「停止中」后出现 **Force Kill**（SIGKILL）。**Restart**（⇧⌘R）= 停掉旧进程后按同一配置重新准备并启动
@@ -27,11 +27,11 @@
 
 | 区域 | 内容 |
 | --- | --- |
-| 左栏「项目」 | 项目列表（`扫描中…` / `N 个配置` / `扫描失败` / `待扫描`）、底部 **添加项目**；右键菜单可构建 / 重新构建 / 清理 / 重新扫描 / 移除。有活动时文件夹图标换成状态点：**绿**=有服务运行中、**黄**=正在编译或启动、**红**=最近一次运行失败（悬停看说明；无活动显示文件夹图标） |
+| 左栏「项目」 | 项目列表（`扫描中…` / `N 个配置` / 没有配置时显示 `命令行可用` / `扫描失败` / `待扫描`）、底部 **添加项目**；右键菜单可构建 / 重新构建 / 清理 / 重新扫描 / 移除。有活动时文件夹图标换成状态点：**绿**=有服务运行中、**黄**=正在编译或启动、**红**=最近一次运行失败（悬停看说明；无活动显示文件夹图标） |
 | 中栏 | 配置列表，顶栏为重新扫描 / 打开（图标即动作：默认访达图标，点击直接用访达打开项目目录；从下拉换成其他应用后图标跟着换成该应用并记住，下次点击直接用它打开。下拉列表固定顺序：访达、VS Code、Cursor、Zed、Default app、Terminal、iTerm2、Ghostty、Xcode、IntelliJ IDEA——未安装的置灰，Default app 即用系统默认处理者，访达始终在列表首位）/ 移除；上方摘要条显示构建系统、JDK、模块数、当前 git 分支与三个构建动作。扫描中读不了的文件、损坏的 XML 会在列表上方显示诊断条（数量 + 严重程度，展开可查看文件路径并在访达中定位），不再静默丢配置 |
 
 顶栏垃圾桶（以及侧栏右键菜单的「移除」）都会先弹二次确认，说明「只移除记录、不删磁盘文件」；该项目若有服务在跑，还会提示有几个会被一并停止。确认前不会动任何东西。
-| 右栏 | **信息 / 控制台 / 构建** 三个页签；顶栏分两行——第一行是当前配置名与类型，第二行是 `Run` `Stop` `Force Kill` `Restart` 与页签切换 |
+| 右栏 | **信息 / 控制台 / 构建 / 命令行** 四个页签；顶栏分两行——第一行是当前配置名与类型（命令行页签显示项目名），第二行是 `Run` `Stop` `Force Kill` `Restart` 与页签切换 |
 
 配置行右侧的标记：`READY` 可启动、`WARNING` 可启动但有警告、`PLANNED` 已识别但本版本不接管、`UNSUPPORTED` 不接管（§78）。标记由 Core 统一计算（类型、项目构建系统、缺失字段、Before Launch 任务都会影响结果），GUI 与 CLI 不各自判断。运行状态依次为：准备中 / 解析依赖中 / 编译中 / 启动中 / 运行中 / 停止中 / 已退出 (N) / 已停止 / 失败。运行中探测到监听端口时，状态文字左侧会显示 `:8080 :8081` 这样的端口列表（每 3 秒刷新，进程退出即清空），悬停看完整列表。
 
@@ -43,9 +43,23 @@
 
 快捷键：**Run ⌘R**、**Stop ⌘.**、**Restart ⇧⌘R**、**构建项目 ⌘F9**、**重新构建项目 ⇧⌘F9**。「清理项目 / 停止构建 / 强制结束构建」在顶部 **构建** 菜单里，没有快捷键。顶部 **构建** 菜单的项一律不置灰：项目根既没有 Maven 也没有 Gradle 构建文件时点了会弹窗说明原因，构建进行中再点则被忽略（同项目串行，§42）；摘要条和项目右键菜单里的构建三项会直接置灰，悬停提示写明「项目根未找到 Maven 或 Gradle 构建文件」。
 
+## 命令行模式（GUI）
+
+右侧「命令行」页签不依赖 IDEA Run Configuration，也不要求项目里存在 `pom.xml` / `build.gradle`：
+
+- 输入任意命令（如 `npm run dev`、`python3 app.py`、`./scripts/dev.sh`），回车或点「运行」；输出进入同一套控制台
+- 「工作目录」留空就是项目根，也可以填 `sub`、`$PROJECT_DIR$/sub`、`~` 或绝对路径；「选择…」用文件夹选择器写入绝对路径
+- 可选环境变量：每行一条 `KEY=VALUE`，支持 `# 注释`、`export` 前缀与 `${VAR}` 展开；同名变量覆盖本应用继承的环境
+- 命令交给登录 zsh（`/bin/zsh -ilc`）后台执行，因此支持管道、`&&`、变量、别名，以及 nvm / volta 等写在 shell 启动文件里的 PATH
+- Run / Stop / Restart 与配置运行共用同一条 Core 进程管线：Stop 发 SIGTERM 整棵进程树，3 秒后升级 SIGKILL；退出应用、移除项目时也会一并停掉。运行状态、PID、端口与左栏状态点同样适用
+- 只适合启动服务/脚本，不支持需要终端输入的命令（如 `sudo`、交互式登录）；这类命令请在 Terminal 中运行
+
+命令、工作目录与环境变量按项目保存在 `~/Library/Application Support/IdeaLightRun/command-line.json`，不写用户项目目录。
+
 ## 什么配置能直接启动
 
 **Maven 或 Gradle 项目**里的 **Application**、**Spring Boot**、**Maven**、**JUnit**，**JAR Application**（不要求项目是 Maven / Gradle），以及引用这些配置的 **Compound**。
+不属于这些类型、或者项目本身不是 Java 项目时，改用右侧「命令行」页签手写命令启动；命令行模式不经过 Run Configuration 能力判定。
 
 | 标记 | 覆盖范围 |
 | --- | --- |
@@ -195,6 +209,7 @@ Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准�
 
 - `~/Library/Application Support/IdeaLightRun/projects.json` — 添加过的项目路径
 - `~/Library/Application Support/IdeaLightRun/hot-reload.json` — 各 Run Configuration 的热更新设置（默认关闭）
+- `~/Library/Application Support/IdeaLightRun/command-line.json` — 各项目的命令行模式设置（命令、工作目录、环境变量）
 - `~/Library/Caches/IdeaLightRun/` — Maven classpath 缓存
 - `~/Library/Logs/IdeaLightRun/update.log` — 更新日志
 - **不写用户项目的任何文件**；`target/` 里的构建产物由 Maven 自己生成
@@ -273,6 +288,9 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 - XML 宽松解析：未知字段进 `rawOptions`，未知类型标记 `unknown` 并显示为 `UNSUPPORTED`（§78）
 - `$Prompt$` 等 IDEA 上下文宏不伪造，只产生 warning（§11）
 - Java 启动使用 Process.arguments 数组传参，绝不走 `/bin/sh -c`（§27）
+- 命令行模式的命令是用户显式输入的 shell 语法，交给登录 zsh 执行（`-ilc`，命令本身仍是
+  `Process.arguments` 数组里的一个元素）；它不参与 Java 启动计划的拼装，Java 侧仍严格
+  使用数组传参
 - 读子进程输出一律用 `FileHandle.availableData`，不用 `readData(ofLength:)`：后者要凑满
   请求长度或读到 EOF 才返回，会让日志成段攒住——表现就是「启动日志卡在某一处，
   点了 Stop/关闭才一次性刷出来」（§36/§103 的流式前提）
@@ -286,13 +304,14 @@ Tests/               单元 + Maven 多模块真实集成测试（数量见文�
 ## 测试
 
 ```bash
-swift test                                        # 本地全量：492 用例
-swift test --skip MavenClasspathIntegrationTests  # CI 集合：489 用例（跳过那 3 个要真实下载依赖的）
+swift test                                        # 本地全量：506 用例
+swift test --skip MavenClasspathIntegrationTests  # CI 集合：503 用例（跳过那 3 个要真实下载依赖的）
 ```
 
 覆盖范围：
 
 - **解析层** — RunConfigurationParser（alias / rawOptions / Before Launch / JAR 字段）、WorkspaceParser（流式、只取 RunManager、跳过模板）、ProjectScanner（§7 来源优先级去重、§6 深度上限 4、忽略目录）、MacroResolver（§11 全部宏与 IDEA 上下文变量，运行配置与 IML 路径共用）、ModuleResolver（§13 五种方式）、JDKResolver（§23–25 优先级与 major version 模糊匹配）
+- **命令行模式** — CommandLineLaunchPlanner（任意项目目录、登录 zsh 单参数、工作目录 `~`/`$PROJECT_DIR$`/相对路径、环境变量合并与无效行报错、设置 Codable 往返、真实进程 stdout/工作目录）
 - **构建与启动** — JavaRunPlanner（§26–§29）、JarRunPlanner（`java -jar` 参数顺序、默认工作目录、缺失/不可读 JAR）、ExecutionRuntime（日志/PID/终态转发、Stop、Before Launch 同步执行与取消、测试终态：失败/无测试/无汇总/用户停止）、MavenRunExecution（直接运行参数顺序与 `-nsu` 缺失、Project JDK / `MAVEN_OPTS`、pom 与不支持选项的 fail-closed、宏与 `$Prompt$`、Surefire 模块范围/筛选/工作目录限制）、TestTargetResolver（类/方法/包/目录/模式展开与无匹配拒绝）、TestOutcomeMonitor（Surefire `Results:` 汇总与逐类行、旧版 `Results :`、Gradle SUMMARY、无测试检测）、Compound（成员按引用顺序准备、嵌套展开、缺失/类型不匹配/成环拦截、独立 PID 与日志、分组 Stop/Force Kill、部分失败清理）、CommandLineTokenizer（§72 参数集）、ClasspathCache + reactor 归一化（§18/§19/§57）、MavenLocator / GradleLocator（Dock 启动无 PATH 时的绝对路径枚举与 wrapper 发行版兜底）、GradleBuildService（project path 任务、合并编译与 classpath 解析、provided 变体、缓存失效、失败与取消、JUnit `:test` 与 `--tests`/init script）、项目级 Build/Rebuild/Clean 参数与取消语义、Maven 多模块真实集成（§92/§93）
 - **诊断与能力** — ScanDiagnostic（读失败 / XML 损坏 / 配置目录不可读 / 重复配置 / 缺 Main Class / 不支持的 Before Launch 任务都带严重程度与建议，不静默丢配置）、ConfigurationCapabilityResolver（类型 + 构建系统 + 字段 + Module 解析 + Before Launch 统一裁决）、BuildSystemSelector（Maven/Gradle 共存时的确定性选择）、Gradle settings/projectDir 解析、Maven `$MODULE_DIR$` POM 路径、ProcessHandle 启动前取消与 SIGTERM→SIGKILL 升级
 - **进程与日志** — ProcessSession（启动/停止/日志捕获、退出以进程自身为准）、LogRingBuffer（§37 上限）、LogScrollFollow（停在底部才跟随新日志，向上回看不抢滚动；回收头部时按字符锚点把阅读位置留在原处）

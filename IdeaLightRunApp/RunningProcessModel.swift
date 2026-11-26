@@ -274,7 +274,7 @@ final class RunningProcessModel: LogViewModel, Identifiable {
                     for index in self.compoundMembers.indices {
                         guard let memberPID = self.compoundMembers[index].pid else { continue }
                         let ports = await Task.detached(priority: .utility) {
-                            ListeningPortScanner.listeningPorts(pid: memberPID)
+                            Self.listeningPortsInTree(root: memberPID)
                         }.value
                         guard !Task.isCancelled, !self.state.isTerminal else { return }
                         if ports != self.compoundMembers[index].ports {
@@ -291,7 +291,7 @@ final class RunningProcessModel: LogViewModel, Identifiable {
                     if changed { self.onChange?() }
                 } else if let pid = self.pid {
                     let ports = await Task.detached(priority: .utility) {
-                        ListeningPortScanner.listeningPorts(pid: pid)
+                        Self.listeningPortsInTree(root: pid)
                     }.value
                     guard !Task.isCancelled, !self.state.isTerminal else { return }
                     if ports != self.listeningPorts {
@@ -306,6 +306,16 @@ final class RunningProcessModel: LogViewModel, Identifiable {
                 try? await Task.sleep(for: .seconds(3))
             }
         }
+    }
+
+    /// 命令可能是 shell → npm → node 这样的进程树，只查根 PID 会漏掉真正 bind 的
+    /// 子进程。命令行模式又要靠端口判断服务是否起来，因此按整棵树聚合。
+    private nonisolated static func listeningPortsInTree(root: Int32) -> [Int] {
+        var ports = Set<Int>()
+        for pid in ProcessTree.allPIDs(root: root) {
+            ports.formUnion(ListeningPortScanner.listeningPorts(pid: pid))
+        }
+        return ports.sorted()
     }
 
     private func publish(_ newState: ProcessState) {

@@ -46,6 +46,9 @@ final class AppStore: ObservableObject {
     /// 每配置的热更新设置，键 = `项目路径|配置 uniqueKey`。
     /// 单独存文件，不改 IDEA 的 .run.xml，也不把开发 Agent 带到别的项目里。
     @Published private(set) var hotReloadSettings: [String: HotReloadConfiguration] = [:]
+    /// 命令行模式的项目级设置。它不是 Run Configuration，而是用户手写的命令，
+    /// 因此不进中栏配置列表，只挂在当前项目右侧的「命令行」页签上。
+    private var commandLineSettings: [String: CommandLineSettings] = [:]
     /// 在线更新（§64 例外：仅用户主动点「检查更新…」时联网）
     let updater: SoftwareUpdater
 
@@ -55,6 +58,9 @@ final class AppStore: ObservableObject {
     private static let hotReloadURL = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("IdeaLightRun/hot-reload.json")
+    private static let commandLineURL = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("IdeaLightRun/command-line.json")
 
     private var cancellables: Set<AnyCancellable> = []
 
@@ -66,6 +72,7 @@ final class AppStore: ObservableObject {
             .store(in: &cancellables)
         loadProjects()
         loadHotReloadSettings()
+        loadCommandLineSettings()
     }
 
     var selectedProject: ProjectEntry? {
@@ -364,6 +371,145 @@ final class AppStore: ObservableObject {
         run(configKey: configKey, projectID: id)
     }
 
+    // MARK: - 命令行模式（项目级，手写命令）
+
+    func commandLineSettings(forProject projectID: String) -> CommandLineSettings {
+        commandLineSettings[projectID] ?? .empty
+    }
+
+    func updateCommandLineSettings(_ settings: CommandLineSettings, projectID: String) {
+        guard commandLineSettings[projectID] != settings else { return }
+        if settings.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && settings.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && settings.environmentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            commandLineSettings.removeValue(forKey: projectID)
+        } else {
+            commandLineSettings[projectID] = settings
+        }
+        persistCommandLineSettings()
+    }
+
+    /// 右侧「命令行」页签展示的会话：优先活跃实例，否则显示最近一次结果。
+    func commandLineSession(projectID: String) -> RunningProcessModel? {
+        displaySession(
+            projectID: projectID,
+            configKey: CommandLineSettings.sessionConfigurationKey
+        )
+    }
+
+    func commandLineActiveSessions(projectID: String) -> [RunningProcessModel] {
+        activeSessions(
+            projectID: projectID,
+            configKey: CommandLineSettings.sessionConfigurationKey
+        )
+    }
+
+    /// 命令行模式不依赖 Maven / Gradle / Run Configuration，任何项目目录都能跑；
+    /// 同一项目同时只允许一个活跃命令，避免两条命令抢同一份日志与端口。
+    func canRunCommandLine(projectID: String) -> Bool {
+        commandLineSettings(forProject: projectID).isRunnable
+            && commandLineActiveSessions(projectID: projectID).isEmpty
+    }
+
+    func runCommandLine(projectID: String) {
+        guard let project = projects.first(where: { $0.id == projectID }) else { return }
+        let settings = commandLineSettings(forProject: projectID)
+        guard settings.isRunnable else {
+            alertMessage = "请先在「命令行」页签里输入要执行的命令。"
+            return
+        }
+        guard commandLineActiveSessions(projectID: projectID).isEmpty else { return }
+
+        for (sessionID, model) in sessions
+        where model.projectPath == projectID
+            && model.configKey == CommandLineSettings.sessionConfigurationKey
+            && model.state.isTerminal {
+            sessions.removeValue(forKey: sessionID)
+        }
+
+        let sessionID = RunSessionID(
+            projectID: projectID,
+            configurationID: CommandLineSettings.sessionConfigurationKey
+        )
+        let model = RunningProcessModel(sessionID: sessionID, configName: "命令行")
+        model.onChange = { [weak self] in
+            self?.objectWillChange.send()
+        }
+        model.onRestartNeeded = { [weak self] in
+            self?.runCommandLine(projectID: projectID)
+        }
+        sessions[sessionID] = model
+
+        let plan: ExecutableLaunchPlan
+        do {
+            plan = try CommandLineLaunchPlanner.plan(settings: settings, projectRoot: project.url)
+        } catch let error as IdeaLightRunError {
+            model.pipelineFailed(error.localizedDescription)
+            alertMessage = error.localizedDescription
+            return
+        } catch {
+            model.pipelineFailed(error.localizedDescription)
+            alertMessage = error.localizedDescription
+            return
+        }
+
+        model.appendLog(LogLine(
+            stream: .system,
+            text: "[IdeaLightRun] 在 \(plan.workingDirectory.path) 执行：\(settings.trimmedCommand)"
+        ))
+        model.appendLog(LogLine(
+            stream: .system,
+            text: "[IdeaLightRun] 命令通过登录 zsh 运行，支持管道、&&、变量与别名；不支持需要终端输入的命令。"
+        ))
+        model.setPipelineState(.starting)
+
+        do {
+            let runtime = try ExecutionRuntime(
+                configKey: CommandLineSettings.sessionConfigurationKey,
+                configName: "命令行",
+                execution: .process(plan),
+                logBuffer: model.logBuffer
+            )
+            // model 已放进 sessions；先 attach 再 start，从这一刻起 Stop / 退出收尾
+            // 都能拿到 runtime。
+            // ExecutionRuntime.stop() 在 start() 之前调用也会登记 pending stop，
+            // 进程随后跑起来会立刻终止（§P0-3），不会留下孤儿。
+            model.attach(runtime: runtime)
+            Task.detached(priority: .userInitiated) {
+                runtime.start()
+            }
+        } catch let error as IdeaLightRunError {
+            model.pipelineFailed(error.localizedDescription)
+            alertMessage = error.localizedDescription
+        } catch {
+            model.pipelineFailed(error.localizedDescription)
+            alertMessage = error.localizedDescription
+        }
+    }
+
+    func stopCommandLine(projectID: String) {
+        for model in commandLineActiveSessions(projectID: projectID) {
+            model.runtime?.stop()
+        }
+    }
+
+    func forceKillCommandLine(projectID: String) {
+        for model in commandLineActiveSessions(projectID: projectID) {
+            model.runtime?.forceKill()
+        }
+    }
+
+    func restartCommandLine(projectID: String) {
+        if let model = commandLineActiveSessions(projectID: projectID).first {
+            if model.isRunning {
+                model.pendingRestart = true
+                model.runtime?.stop()
+            }
+            return
+        }
+        runCommandLine(projectID: projectID)
+    }
+
     // MARK: - 项目级构建（IDEA 的 Build / Rebuild Project）
 
     /// Build Project = 增量 `compile`；Rebuild Project = `clean compile` 全量；
@@ -430,8 +576,10 @@ final class AppStore: ObservableObject {
 
     func addProject(url: URL) {
         let standardized = url.standardizedFileURL
-        guard BuildSystemDetector.isValidProjectRoot(standardized) else {
-            alertMessage = "“\(standardized.lastPathComponent)” 不是有效的 Java 项目目录（需要包含 .idea、pom.xml、settings.gradle(.kts) 或 build.gradle(.kts) 之一）。"
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: standardized.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            alertMessage = "“\(standardized.lastPathComponent)” 不是有效文件夹。"
             return
         }
         if projects.contains(where: { $0.id == standardized.path }) {
@@ -491,12 +639,14 @@ final class AppStore: ObservableObject {
             sessions.removeValue(forKey: sessionID)
         }
         builds.removeValue(forKey: id)
+        commandLineSettings.removeValue(forKey: id)
         projects.removeAll { $0.id == id }
         if selectedProjectID == id {
             selectedProjectID = projects.first?.id
             selectedConfigurationKey = nil
         }
         persistProjects()
+        persistCommandLineSettings()
     }
 
     func rescan(entryID: String) {
@@ -601,5 +751,20 @@ final class AppStore: ObservableObject {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         guard let data = try? JSONEncoder().encode(hotReloadSettings) else { return }
         try? data.write(to: Self.hotReloadURL, options: .atomic)
+    }
+
+    private func loadCommandLineSettings() {
+        guard let data = try? Data(contentsOf: Self.commandLineURL),
+              let decoded = try? JSONDecoder().decode([String: CommandLineSettings].self, from: data) else {
+            return
+        }
+        commandLineSettings = decoded
+    }
+
+    private func persistCommandLineSettings() {
+        let directory = Self.commandLineURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let data = try? JSONEncoder().encode(commandLineSettings) else { return }
+        try? data.write(to: Self.commandLineURL, options: .atomic)
     }
 }
