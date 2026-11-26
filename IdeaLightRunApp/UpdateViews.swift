@@ -91,6 +91,13 @@ struct UpdateSheet: View {
             }
         case .downloading:
             busyRow("正在下载新版本…")
+        case .preparing:
+            VStack(alignment: .leading, spacing: 8) {
+                busyRow("正在校验新版本…")
+                Text("校验签名与版本通过后才会替换应用；现在取消不会影响当前版本。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         case .installing:
             VStack(alignment: .leading, spacing: 8) {
                 busyRow("正在安装，应用即将退出并重启…")
@@ -125,7 +132,9 @@ struct UpdateSheet: View {
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
             }
-        case .checking, .downloading(_), .installing(_):
+        case .checking, .downloading(_), .preparing(_):
+            Button("取消") { updater.cancel() }
+        case .installing(_):
             Button("取消") { updater.cancel() }
                 .disabled(updater.phase.isInstalling)
         case .idle, .failed(_):

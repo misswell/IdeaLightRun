@@ -13,12 +13,15 @@ final class SoftwareUpdater: ObservableObject {
         case upToDate(latest: SoftwareRelease, current: String)
         case available(SoftwareRelease)
         case downloading(SoftwareRelease)
+        /// 下载完、正在解压与验签。还没碰磁盘上的 app，可以安全取消。
+        case preparing(SoftwareRelease)
+        /// 更新助手已经接手。此时 app 即将退出，取消已无意义。
         case installing(SoftwareRelease)
         case failed(UpdateFailure)
 
         var isBusy: Bool {
             switch self {
-            case .checking, .downloading, .installing: return true
+            case .checking, .downloading, .preparing, .installing: return true
             default: return false
             }
         }
@@ -108,14 +111,17 @@ final class SoftwareUpdater: ObservableObject {
             }
             defer { try? FileManager.default.removeItem(at: downloadURL) }
             try Task.checkCancellation()
-            phase = .installing(release)
+            phase = .preparing(release)
+            UpdateLog.append("开始校验新版本：\(release.tagName)")
             let package = try await Task.detached(priority: .userInitiated) {
                 try UpdatePackageValidator.prepare(downloadURL: downloadURL, release: release)
             }.value
             // detached 子任务不继承取消：校验期间被取消也要在这里拦住，
             // 否则会绕过一个已取消的意图去真的替换 app。
             try Task.checkCancellation()
+            UpdateLog.append("校验通过：\(release.tagName)")
             try launchInstaller(for: package)
+            phase = .installing(release)
             UpdateLog.append("已移交更新助手：\(release.tagName)")
             quitAfterHandoff()
         } catch {
