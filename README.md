@@ -17,7 +17,7 @@
 
 ## 快速上手
 
-1. 左侧栏 **添加项目**（或把项目文件夹直接拖进侧栏）。目录可以是任意文件夹：Java 项目会自动读取 IDEA Run Configuration；没有 Java 配置、甚至完全不是 Java 项目，也可以在右侧「命令行」页签手写命令启动
+1. 左侧栏 **添加项目**（或把项目文件夹直接拖进侧栏）。目录可以是任意文件夹：Java 项目会自动读取 IDEA Run Configuration；没有 Java 配置、甚至完全不是 Java 项目，也可以点右侧顶栏的 **命令行** 按钮手写命令启动
 2. 项目下自动列出 IDEA 里已有的 Run Configuration，无需再配一遍：Main Class 或 JAR Path、Module、JDK、VM Options、Program Arguments、Spring Profiles、环境变量、Working Directory 都从 IDEA 配置读，可在「信息」页签核对
 3. 选中一条 → **Run**（⌘R），界面自动切到「控制台」。Run 按该配置的 Before Launch 执行构建：IDEA 里勾了 Make / Build Project 才会先编译，勾了 "Do not build before run" 则直接启动。Java / Spring Boot 的状态依次显示「解析依赖中 → 编译中（如有）→ 启动中 → 运行中」，JAR Application 直接进入「启动中」
 4. **Stop**（⌘.）发 SIGTERM；进入「停止中」后出现 **Force Kill**（SIGKILL）。**Restart**（⇧⌘R）= 停掉旧进程后按同一配置重新准备并启动
@@ -31,7 +31,7 @@
 | 中栏 | 配置列表，顶栏为重新扫描 / 打开（图标即动作：默认访达图标，点击直接用访达打开项目目录；从下拉换成其他应用后图标跟着换成该应用并记住，下次点击直接用它打开。下拉列表固定顺序：访达、VS Code、Cursor、Zed、Default app、Terminal、iTerm2、Ghostty、Xcode、IntelliJ IDEA——未安装的置灰，Default app 即用系统默认处理者，访达始终在列表首位）/ 移除；上方摘要条显示构建系统、JDK、模块数、当前 git 分支与三个构建动作。扫描中读不了的文件、损坏的 XML 会在列表上方显示诊断条（数量 + 严重程度，展开可查看文件路径并在访达中定位），不再静默丢配置 |
 
 顶栏垃圾桶（以及侧栏右键菜单的「移除」）都会先弹二次确认，说明「只移除记录、不删磁盘文件」；该项目若有服务在跑，还会提示有几个会被一并停止。确认前不会动任何东西。
-| 右栏 | **信息 / 控制台 / 构建 / 命令行** 四个页签；顶栏分两行——第一行是当前配置名与类型（命令行页签显示项目名），第二行是 `Run` `Stop` `Force Kill` `Restart` 与页签切换 |
+| 右栏 | **信息 / 控制台 / 构建** 三个页签，第一行右侧固定有 **命令行** 按钮；点它把右栏整块切换成命令行模式，左侧项目列表和中栏配置列表保持不变。命令行模式下第一行右侧变成 **返回配置**，命令输入区里也有第二个 **返回配置**，不会出现切不回去的状态 |
 
 配置行右侧的标记：`READY` 可启动、`WARNING` 可启动但有警告、`PLANNED` 已识别但本版本不接管、`UNSUPPORTED` 不接管（§78）。标记由 Core 统一计算（类型、项目构建系统、缺失字段、Before Launch 任务都会影响结果），GUI 与 CLI 不各自判断。运行状态依次为：准备中 / 解析依赖中 / 编译中 / 启动中 / 运行中 / 停止中 / 已退出 (N) / 已停止 / 失败。运行中探测到监听端口时，状态文字左侧会显示 `:8080 :8081` 这样的端口列表（每 3 秒刷新，进程退出即清空），悬停看完整列表。
 
@@ -45,7 +45,7 @@
 
 ## 命令行模式（GUI）
 
-右侧「命令行」页签不依赖 IDEA Run Configuration，也不要求项目里存在 `pom.xml` / `build.gradle`：
+点右侧顶栏的 **命令行** 按钮即可把右栏切换成命令行界面；它不依赖 IDEA Run Configuration，也不要求项目里存在 `pom.xml` / `build.gradle`，左侧项目列表不会消失：
 
 - 输入任意命令（如 `npm run dev`、`python3 app.py`、`./scripts/dev.sh`），回车或点「运行」；输出进入同一套控制台
 - 「工作目录」留空就是项目根，也可以填 `sub`、`$PROJECT_DIR$/sub`、`~` 或绝对路径；「选择…」用文件夹选择器写入绝对路径
@@ -59,7 +59,7 @@
 ## 什么配置能直接启动
 
 **Maven 或 Gradle 项目**里的 **Application**、**Spring Boot**、**Maven**、**JUnit**，**JAR Application**（不要求项目是 Maven / Gradle），以及引用这些配置的 **Compound**。
-不属于这些类型、或者项目本身不是 Java 项目时，改用右侧「命令行」页签手写命令启动；命令行模式不经过 Run Configuration 能力判定。
+不属于这些类型、或者项目本身不是 Java 项目时，改用右侧 **命令行** 模式手写命令启动；命令行模式不经过 Run Configuration 能力判定。
 
 | 标记 | 覆盖范围 |
 | --- | --- |

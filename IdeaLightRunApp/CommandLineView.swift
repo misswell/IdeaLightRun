@@ -2,12 +2,13 @@ import AppKit
 import IdeaLightRunCore
 import SwiftUI
 
-/// 右侧「命令行」页签：项目级、手写命令。
-/// 不走 IDEA Run Configuration，也不要求项目是 Java / Maven / Gradle；
-/// 执行与日志仍然复用 Core 的统一进程管线。
+/// 右侧「命令行模式」：项目级、手写命令。
+/// 它只替换右栏内容，左侧项目列表和中栏配置列表都保持原样；
+/// 顶栏与内容区都提供「返回配置」入口，不会出现退不回配置模式的状态。
 struct CommandLineView: View {
     @ObservedObject var store: AppStore
     let project: ProjectEntry
+    var onExit: () -> Void = {}
 
     @State private var settings: CommandLineSettings = .empty
     @State private var showEnvironment = false
@@ -29,12 +30,12 @@ struct CommandLineView: View {
     var body: some View {
         VStack(spacing: 0) {
             form
+                .layoutPriority(1)
             Divider()
             console
         }
         .task(id: project.id) {
             settings = store.commandLineSettings(forProject: project.id)
-            showEnvironment = !settings.environmentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         .fileImporter(
             isPresented: $showDirectoryPicker,
@@ -47,13 +48,13 @@ struct CommandLineView: View {
         }
     }
 
-    // MARK: - 命令表单
+    // MARK: - 命令行输入区
 
     private var form: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
-                Label("命令", systemImage: "terminal")
-                    .font(.callout.weight(.medium))
+                Label("命令行", systemImage: "terminal")
+                    .font(.headline)
                 if let model = displayModel {
                     statusBadge(model)
                 }
@@ -63,27 +64,45 @@ struct CommandLineView: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
+                Button {
+                    onExit()
+                } label: {
+                    Label("返回配置", systemImage: "chevron.backward")
+                }
+                .controlSize(.small)
+                .help("回到 Run Configuration 的信息 / 控制台 / 构建")
             }
 
+            // 终端输入块：命令是这一行的主体，不再被工作目录、按钮等挤到看不见。
             HStack(spacing: 8) {
-                TextField("例如 npm run dev、python3 app.py、./scripts/dev.sh", text: commandBinding)
-                    .textFieldStyle(.roundedBorder)
+                Text("$")
+                    .font(.system(size: 17, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.green)
+                TextField("输入命令，例如 npm run dev、python3 app.py、./scripts/dev.sh", text: commandBinding)
+                    .textFieldStyle(.plain)
                     .font(.system(.body, design: .monospaced))
                     .onSubmit(run)
                     .help("按回车运行。命令通过登录 zsh 执行，支持管道、&&、变量与别名。")
                 Button(action: run) {
                     Label("运行", systemImage: "play.fill")
                 }
+                .buttonStyle(.borderedProminent)
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(!canRun)
-                .help(canRun ? "在项目目录启动这条命令（⌘R）" : "先输入命令，或等待当前命令结束")
+                .help(canRun ? "启动这条命令（⌘R）" : "先输入命令，或等待当前命令结束")
             }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .background(Color(nsColor: .textBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color(nsColor: .separatorColor))
+            )
 
             HStack(spacing: 8) {
-                Text("工作目录")
-                    .font(.caption)
+                Image(systemName: "folder")
                     .foregroundStyle(.secondary)
-                    .frame(width: 56, alignment: .leading)
                 TextField(project.url.path, text: workingDirectoryBinding)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.caption, design: .monospaced))
@@ -91,7 +110,7 @@ struct CommandLineView: View {
                 Button {
                     showDirectoryPicker = true
                 } label: {
-                    Image(systemName: "folder")
+                    Image(systemName: "folder.badge.gearshape")
                 }
                 .help("选择工作目录")
                 if !settings.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -99,6 +118,23 @@ struct CommandLineView: View {
                         updateSettings { $0.workingDirectory = "" }
                     }
                     .help("恢复为项目根目录")
+                }
+                Button {
+                    showEnvironment = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "slider.horizontal.3")
+                        Text("环境变量")
+                        if !settings.environmentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 5, height: 5)
+                        }
+                    }
+                }
+                .help("设置该命令的环境变量")
+                .popover(isPresented: $showEnvironment, arrowEdge: .bottom) {
+                    environmentEditor
                 }
             }
             .controlSize(.small)
@@ -131,46 +167,52 @@ struct CommandLineView: View {
                 .disabled(restartDisabled)
                 .help("停止旧进程退出后再运行同一条命令（⇧⌘R）")
 
-                Spacer(minLength: 0)
+                Spacer(minLength: 8)
+                Text("登录 zsh · 支持管道与 && · 不支持 sudo 等终端交互")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
             .controlSize(.small)
-
-            DisclosureGroup(isExpanded: $showEnvironment) {
-                VStack(alignment: .leading, spacing: 6) {
-                    TextEditor(text: environmentBinding)
-                        .scrollContentBackground(.hidden)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(minHeight: 64, maxHeight: 96)
-                        .padding(4)
-                        .background(Color(nsColor: .textBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 6)
-                                .stroke(Color(nsColor: .separatorColor))
-                        )
-                    Text("每行一条 KEY=VALUE；支持 # 注释、export 前缀与 ${VAR} 展开。")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.top, 6)
-            } label: {
-                HStack(spacing: 6) {
-                    Text("环境变量")
-                    if !settings.environmentText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        Text("已设置")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-
-            Text("命令在登录 zsh 中后台执行，可使用管道、&&、变量和别名；"
-                + "需要终端输入的命令（如 sudo、交互式登录）请在 Terminal 中运行。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
+        // 右栏再窄也不能把输入区压成只剩一条提示：高度由内容决定，
+        // 剩余高度只分给下面的控制台。
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var environmentEditor: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("环境变量")
+                .font(.headline)
+            Text("每行一条 KEY=VALUE；支持 # 注释、export 前缀与 ${VAR} 展开。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            TextEditor(text: environmentBinding)
+                .scrollContentBackground(.hidden)
+                .font(.system(.caption, design: .monospaced))
+                .frame(width: 360, height: 150)
+                .padding(4)
+                .background(Color(nsColor: .textBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color(nsColor: .separatorColor))
+                )
+            HStack {
+                Button("清空") {
+                    updateSettings { $0.environmentText = "" }
+                }
+                .disabled(settings.environmentText.isEmpty)
+                Spacer()
+                Button("完成") {
+                    showEnvironment = false
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(14)
     }
 
     private func statusBadge(_ model: RunningProcessModel) -> some View {

@@ -143,6 +143,9 @@ struct RootView: View {
     var body: some View {
         NavigationSplitView {
             SidebarView(store: store, showImporter: $showImporter)
+                // 项目列表是导航入口，必须保留最小宽度；不能让右栏内容
+                // 在窄窗口下把整列挤到折叠/空白状态。
+                .navigationSplitViewColumnWidth(min: 190, ideal: 220, max: 320)
         } content: {
             ConfigurationListView(store: store)
                 // 中栏留出「配置名 + 状态」都放得下的最小宽度：压到更窄时
@@ -362,7 +365,7 @@ struct ConfigurationListView: View {
                 if result.configurations.isEmpty {
                     emptyState(
                         icon: "tray",
-                        text: "未发现 Run Configuration\n可在右侧「命令行」页签输入命令启动（Java 与非 Java 项目都支持）"
+                        text: "未发现 Run Configuration\n可在右侧切换命令行模式，输入命令启动（Java 与非 Java 项目都支持）"
                     )
                 } else {
                     List(selection: $store.selectedConfigurationKey) {
@@ -823,12 +826,18 @@ struct ConfigurationDetailView: View {
     @State private var consoleMemberKey: String?
     /// 运行中打开热更新：Agent 只能启动时注入，确认是否立即重启生效。
     @State private var pendingHotReloadRestart = false
+    /// 右栏模式：配置 / 命令行。切换入口始终在顶栏，不依赖某个页签是否可见。
+    @State private var detailMode: DetailMode = .configuration
 
     enum DetailTab: String, CaseIterable {
         case info = "信息"
         case console = "控制台"
         case build = "构建"
-        case commandLine = "命令行"
+    }
+
+    enum DetailMode {
+        case configuration
+        case commandLine
     }
 
     var body: some View {
@@ -848,13 +857,6 @@ struct ConfigurationDetailView: View {
                 }
                 // 开始构建后自动切到构建页，对齐 IDEA 弹出 Build 窗口的行为
                 .onChange(of: store.buildRevision) { _ in detailTab = .build }
-                // 扫描完成且没有任何 Run Configuration 时（典型是非 Java 项目），
-                // 直接落到「命令行」页，而不是让用户停在“选择一个配置”的空页。
-                .onChange(of: project.result?.configurations.count) { count in
-                    if count == 0 {
-                        detailTab = .commandLine
-                    }
-                }
             } else {
                 emptyPane(icon: "doc.text.magnifyingglass", text: "选择一个项目查看配置")
             }
@@ -874,33 +876,46 @@ struct ConfigurationDetailView: View {
 
     @ViewBuilder
     private func detailContent(project: ProjectEntry) -> some View {
-        switch detailTab {
-        case .info:
-            if let config = store.selectedConfiguration, let result = project.result {
-                infoDetail(project: project, config: config, result: result)
-            } else {
-                let hasConfigurations = !(project.result?.configurations.isEmpty ?? true)
-                emptyPane(
-                    icon: hasConfigurations ? "doc.text.magnifyingglass" : "terminal",
-                    text: hasConfigurations
-                        ? "选择一个配置查看详情"
-                        : "未发现 Run Configuration\n可切到「命令行」页签直接输入命令启动项目"
-                )
+        if detailMode == .commandLine {
+            CommandLineView(store: store, project: project) {
+                detailMode = .configuration
             }
-        case .console:
-            if let config = store.selectedConfiguration {
-                consoleDetail(project: project, config: config)
-            } else {
-                emptyPane(icon: "terminal", text: "尚未启动，无运行日志")
+        } else {
+            switch detailTab {
+            case .info:
+                if let config = store.selectedConfiguration, let result = project.result {
+                    infoDetail(project: project, config: config, result: result)
+                } else {
+                    let hasConfigurations = !(project.result?.configurations.isEmpty ?? true)
+                    if hasConfigurations {
+                        emptyPane(icon: "doc.text.magnifyingglass", text: "选择一个配置查看详情")
+                    } else {
+                        emptyPane(
+                            icon: "terminal",
+                            text: "未发现 Run Configuration\n可打开命令行模式，直接输入命令启动项目",
+                            actionTitle: "打开命令行",
+                            action: { detailMode = .commandLine }
+                        )
+                    }
+                }
+            case .console:
+                if let config = store.selectedConfiguration {
+                    consoleDetail(project: project, config: config)
+                } else {
+                    emptyPane(icon: "terminal", text: "尚未启动，无运行日志")
+                }
+            case .build:
+                buildDetail(project: project)
             }
-        case .build:
-            buildDetail(project: project)
-        case .commandLine:
-            CommandLineView(store: store, project: project)
         }
     }
 
-    private func emptyPane(icon: String, text: String) -> some View {
+    private func emptyPane(
+        icon: String,
+        text: String,
+        actionTitle: String? = nil,
+        action: (() -> Void)? = nil
+    ) -> some View {
         VStack(spacing: 10) {
             Image(systemName: icon)
                 .font(.system(size: 32))
@@ -908,6 +923,11 @@ struct ConfigurationDetailView: View {
             Text(text)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .buttonStyle(.borderedProminent)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -1015,7 +1035,7 @@ struct ConfigurationDetailView: View {
                     icon: project.hasBuildSystem ? "hammer" : "terminal",
                     text: project.hasBuildSystem
                         ? "尚未构建。用 ⌘F9 构建项目，或点项目摘要里的「构建」"
-                        : "该项目没有 Maven / Gradle 构建文件，可在「命令行」页签直接启动命令"
+                        : "该项目没有 Maven / Gradle 构建文件，可切到命令行模式直接启动命令"
                 )
             }
         }
@@ -1047,7 +1067,7 @@ struct ConfigurationDetailView: View {
     private func header(project: ProjectEntry) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                if detailTab == .commandLine {
+                if detailMode == .commandLine {
                     Text(project.name)
                         .font(.title3.weight(.semibold))
                         .lineLimit(1)
@@ -1073,20 +1093,37 @@ struct ConfigurationDetailView: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
+                if detailMode == .configuration {
+                    Button {
+                        detailMode = .commandLine
+                    } label: {
+                        Label("命令行", systemImage: "terminal")
+                    }
+                    .help("把右侧切换成命令行，输入任意命令启动当前项目")
+                } else {
+                    Button {
+                        detailMode = .configuration
+                    } label: {
+                        Label("返回配置", systemImage: "chevron.backward")
+                    }
+                    .help("回到 Run Configuration 的信息 / 控制台 / 构建")
+                }
             }
 
-            HStack(spacing: 10) {
-                if detailTab != .commandLine, let config = store.selectedConfiguration {
-                    configActions(config: config, project: project)
-                }
-                Spacer(minLength: 8)
-                Picker("", selection: $detailTab) {
-                    ForEach(DetailTab.allCases, id: \.self) { tab in
-                        Text(tab.rawValue).tag(tab)
+            if detailMode == .configuration {
+                HStack(spacing: 10) {
+                    if let config = store.selectedConfiguration {
+                        configActions(config: config, project: project)
                     }
+                    Spacer(minLength: 8)
+                    Picker("", selection: $detailTab) {
+                        ForEach(DetailTab.allCases, id: \.self) { tab in
+                            Text(tab.rawValue).tag(tab)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .fixedSize()
                 }
-                .pickerStyle(.segmented)
-                .fixedSize()
             }
         }
         .padding(.horizontal, 16)
