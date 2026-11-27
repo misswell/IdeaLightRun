@@ -53,6 +53,7 @@
 - 命令交给登录 zsh（`/bin/zsh -ilc`）后台执行，因此支持管道、`&&`、变量、别名，以及 nvm / volta 等写在 shell 启动文件里的 PATH
 - Run / Stop / Restart 与配置运行共用同一条 Core 进程管线：Stop 发 SIGTERM 整棵进程树，3 秒后升级 SIGKILL；退出应用、移除项目时也会一并停掉。运行状态、PID、端口与左栏状态点同样适用
 - 只适合启动服务/脚本，不支持需要终端输入的命令（如 `sudo`、交互式登录）；这类命令请在 Terminal 中运行
+- 每个项目各自记住右栏停在配置页还是命令行页：给 A 项目切到命令行后，点 B 项目仍是 B 自己的模式，切回 A 还是命令行
 
 命令、工作目录与环境变量按项目保存在 `~/Library/Application Support/IdeaLightRun/command-line.json`，不写用户项目目录。
 
@@ -210,6 +211,7 @@ Compound 按 IDEA 的语义启动：成员按配置里保存的顺序逐个准�
 - `~/Library/Application Support/IdeaLightRun/projects.json` — 添加过的项目路径
 - `~/Library/Application Support/IdeaLightRun/hot-reload.json` — 各 Run Configuration 的热更新设置（默认关闭）
 - `~/Library/Application Support/IdeaLightRun/command-line.json` — 各项目的命令行模式设置（命令、工作目录、环境变量）
+- `~/Library/Application Support/IdeaLightRun/detail-modes.json` — 各项目右栏停在配置页还是命令行页（只记录切到命令行的项目）
 - `~/Library/Caches/IdeaLightRun/` — Maven classpath 缓存
 - `~/Library/Logs/IdeaLightRun/update.log` — 更新日志
 - **不写用户项目的任何文件**；`target/` 里的构建产物由 Maven 自己生成

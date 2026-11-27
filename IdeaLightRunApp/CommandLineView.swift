@@ -8,7 +8,6 @@ import SwiftUI
 struct CommandLineView: View {
     @ObservedObject var store: AppStore
     let project: ProjectEntry
-    var onExit: () -> Void = {}
 
     @State private var settings: CommandLineSettings = .empty
     @State private var showEnvironment = false
@@ -64,13 +63,6 @@ struct CommandLineView: View {
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
-                Button {
-                    onExit()
-                } label: {
-                    Label("返回配置", systemImage: "chevron.backward")
-                }
-                .controlSize(.small)
-                .help("回到 Run Configuration 的信息 / 控制台 / 构建")
             }
 
             // 终端输入块：命令是这一行的主体，不再被工作目录、按钮等挤到看不见。

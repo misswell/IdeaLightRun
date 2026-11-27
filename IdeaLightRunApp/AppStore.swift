@@ -19,6 +19,13 @@ struct ProjectEntry: Identifiable, Equatable {
     }
 }
 
+/// 右栏模式是项目级 UI 状态：每个项目各自记住上次停在配置页还是命令行页。
+/// 只持久化 `commandLine`；没有记录即配置模式，默认行为保持简单。
+enum ProjectDetailMode: String, Codable, Sendable {
+    case configuration
+    case commandLine
+}
+
 /// §98: 用户数据用 Codable + JSON，存 ~/Library/Application Support/IdeaLightRun/。
 /// 不写数据库，不修改用户项目目录。
 @MainActor
@@ -49,6 +56,8 @@ final class AppStore: ObservableObject {
     /// 命令行模式的项目级设置。它不是 Run Configuration，而是用户手写的命令，
     /// 因此不进中栏配置列表，只挂在当前项目右侧的「命令行」页签上。
     private var commandLineSettings: [String: CommandLineSettings] = [:]
+    /// 每个项目右侧停在配置页还是命令行页。键 = 项目路径。
+    @Published private(set) var detailModes: [String: ProjectDetailMode] = [:]
     /// 在线更新（§64 例外：仅用户主动点「检查更新…」时联网）
     let updater: SoftwareUpdater
 
@@ -61,6 +70,9 @@ final class AppStore: ObservableObject {
     private static let commandLineURL = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("IdeaLightRun/command-line.json")
+    private static let detailModesURL = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("IdeaLightRun/detail-modes.json")
 
     private var cancellables: Set<AnyCancellable> = []
 
@@ -73,6 +85,7 @@ final class AppStore: ObservableObject {
         loadProjects()
         loadHotReloadSettings()
         loadCommandLineSettings()
+        loadDetailModes()
     }
 
     var selectedProject: ProjectEntry? {
@@ -510,6 +523,22 @@ final class AppStore: ObservableObject {
         runCommandLine(projectID: projectID)
     }
 
+    // MARK: - 右栏模式（按项目记录）
+
+    func detailMode(forProject projectID: String) -> ProjectDetailMode {
+        detailModes[projectID] ?? .configuration
+    }
+
+    func setDetailMode(_ mode: ProjectDetailMode, forProject projectID: String) {
+        if mode == .configuration {
+            guard detailModes.removeValue(forKey: projectID) != nil else { return }
+        } else {
+            guard detailModes[projectID] != mode else { return }
+            detailModes[projectID] = mode
+        }
+        persistDetailModes()
+    }
+
     // MARK: - 项目级构建（IDEA 的 Build / Rebuild Project）
 
     /// Build Project = 增量 `compile`；Rebuild Project = `clean compile` 全量；
@@ -640,6 +669,7 @@ final class AppStore: ObservableObject {
         }
         builds.removeValue(forKey: id)
         commandLineSettings.removeValue(forKey: id)
+        detailModes.removeValue(forKey: id)
         projects.removeAll { $0.id == id }
         if selectedProjectID == id {
             selectedProjectID = projects.first?.id
@@ -647,6 +677,7 @@ final class AppStore: ObservableObject {
         }
         persistProjects()
         persistCommandLineSettings()
+        persistDetailModes()
     }
 
     func rescan(entryID: String) {
@@ -766,5 +797,20 @@ final class AppStore: ObservableObject {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         guard let data = try? JSONEncoder().encode(commandLineSettings) else { return }
         try? data.write(to: Self.commandLineURL, options: .atomic)
+    }
+
+    private func loadDetailModes() {
+        guard let data = try? Data(contentsOf: Self.detailModesURL),
+              let decoded = try? JSONDecoder().decode([String: ProjectDetailMode].self, from: data) else {
+            return
+        }
+        detailModes = decoded
+    }
+
+    private func persistDetailModes() {
+        let directory = Self.detailModesURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let data = try? JSONEncoder().encode(detailModes) else { return }
+        try? data.write(to: Self.detailModesURL, options: .atomic)
     }
 }

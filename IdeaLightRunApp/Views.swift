@@ -826,8 +826,6 @@ struct ConfigurationDetailView: View {
     @State private var consoleMemberKey: String?
     /// 运行中打开热更新：Agent 只能启动时注入，确认是否立即重启生效。
     @State private var pendingHotReloadRestart = false
-    /// 右栏模式：配置 / 命令行。切换入口始终在顶栏，不依赖某个页签是否可见。
-    @State private var detailMode: DetailMode = .configuration
 
     enum DetailTab: String, CaseIterable {
         case info = "信息"
@@ -835,9 +833,14 @@ struct ConfigurationDetailView: View {
         case build = "构建"
     }
 
-    enum DetailMode {
-        case configuration
-        case commandLine
+    /// 右栏模式按项目保存：切到别的项目时读取那个项目自己的模式，
+    /// 不再让「命令行」像全局开关一样串到所有项目。
+    private func detailMode(for project: ProjectEntry) -> ProjectDetailMode {
+        store.detailMode(forProject: project.id)
+    }
+
+    private func switchDetailMode(_ mode: ProjectDetailMode, projectID: String) {
+        store.setDetailMode(mode, forProject: projectID)
     }
 
     var body: some View {
@@ -876,10 +879,8 @@ struct ConfigurationDetailView: View {
 
     @ViewBuilder
     private func detailContent(project: ProjectEntry) -> some View {
-        if detailMode == .commandLine {
-            CommandLineView(store: store, project: project) {
-                detailMode = .configuration
-            }
+        if detailMode(for: project) == .commandLine {
+            CommandLineView(store: store, project: project)
         } else {
             switch detailTab {
             case .info:
@@ -894,7 +895,7 @@ struct ConfigurationDetailView: View {
                             icon: "terminal",
                             text: "未发现 Run Configuration\n可打开命令行模式，直接输入命令启动项目",
                             actionTitle: "打开命令行",
-                            action: { detailMode = .commandLine }
+                            action: { switchDetailMode(.commandLine, projectID: project.id) }
                         )
                     }
                 }
@@ -1067,7 +1068,7 @@ struct ConfigurationDetailView: View {
     private func header(project: ProjectEntry) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                if detailMode == .commandLine {
+                if detailMode(for: project) == .commandLine {
                     Text(project.name)
                         .font(.title3.weight(.semibold))
                         .lineLimit(1)
@@ -1093,16 +1094,16 @@ struct ConfigurationDetailView: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 0)
-                if detailMode == .configuration {
+                if detailMode(for: project) == .configuration {
                     Button {
-                        detailMode = .commandLine
+                        switchDetailMode(.commandLine, projectID: project.id)
                     } label: {
                         Label("命令行", systemImage: "terminal")
                     }
                     .help("把右侧切换成命令行，输入任意命令启动当前项目")
                 } else {
                     Button {
-                        detailMode = .configuration
+                        switchDetailMode(.configuration, projectID: project.id)
                     } label: {
                         Label("返回配置", systemImage: "chevron.backward")
                     }
@@ -1110,7 +1111,7 @@ struct ConfigurationDetailView: View {
                 }
             }
 
-            if detailMode == .configuration {
+            if detailMode(for: project) == .configuration {
                 HStack(spacing: 10) {
                     if let config = store.selectedConfiguration {
                         configActions(config: config, project: project)

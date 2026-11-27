@@ -77,10 +77,9 @@ struct OpenTarget: Identifiable {
     }
 }
 
-/// 中栏顶栏的「打开」按钮：图标即动作。
-///
-/// 图标本身是按钮——默认用访达打开项目目录；点开下拉选别的应用后，图标换成
-/// 所选应用的图标并记在偏好里，此后点图标就是用它打开。「访达」始终留在列表里。
+/// 中栏顶栏的「打开」菜单：主区域直接用当前应用打开，右侧箭头切换应用。
+/// 图标与文字放在同一个 Menu 里，避免工具栏把「图标按钮 + 菜单」合并成
+/// 双层胶囊，也避免系统箭头和手写箭头同时出现。
 struct OpenWithMenu: View {
     let projectURL: URL
 
@@ -93,59 +92,32 @@ struct OpenWithMenu: View {
     private var resolvedURL: URL? { target.applicationURL }
 
     var body: some View {
-        HStack(spacing: 4) {
-            Button {
-                target.open(projectURL)
-            } label: {
+        Menu {
+            ForEach(OpenTarget.catalog) { candidate in
+                let appURL = candidate.applicationURL
+                Button {
+                    preferredName = candidate.name
+                    candidate.open(projectURL)
+                } label: {
+                    Label {
+                        Text(candidate.name)
+                    } icon: {
+                        Image(nsImage: candidate.icon(for: projectURL, applicationURL: appURL))
+                    }
+                }
+                .disabled(candidate.requiresApp && appURL == nil)
+            }
+        } label: {
+            HStack(spacing: 6) {
                 Image(nsImage: target.icon(for: projectURL, applicationURL: resolvedURL))
                     .frame(width: 16, height: 16)
+                Text("打开")
             }
-            .buttonStyle(OpenIconStyle())
-            .help("用\(target.name)打开项目（点右侧箭头切换应用）")
-
-            Menu {
-                ForEach(OpenTarget.catalog) { candidate in
-                    let appURL = candidate.applicationURL
-                    Button {
-                        preferredName = candidate.name
-                        candidate.open(projectURL)
-                    } label: {
-                        Label {
-                            Text(candidate.name)
-                        } icon: {
-                            Image(nsImage: candidate.icon(for: projectURL, applicationURL: appURL))
-                        }
-                    }
-                    .disabled(candidate.requiresApp && appURL == nil)
-                }
-            } label: {
-                HStack(spacing: 4) {
-                    Text("打开")
-                    Image(systemName: "chevron.down")
-                        .font(.caption2.weight(.semibold))
-                }
-            }
-            .fixedSize()
-            .menuStyle(.borderlessButton)
-            .help("选择用哪个应用打开项目")
+        } primaryAction: {
+            target.open(projectURL)
         }
-    }
-}
-
-/// 图标按钮外观：只在悬停时显示浅灰圆角底，避免在工具栏里出现方形描边。
-private struct OpenIconStyle: ButtonStyle {
-    @Environment(\.isEnabled) private var isEnabled
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .opacity(isEnabled ? (configuration.isPressed ? 0.6 : 1) : 0.4)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 3)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(Color(nsColor: .controlBackgroundColor))
-                    .opacity(configuration.isPressed ? 0 : 0.75)
-            )
-            .contentShape(Rectangle())
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("用\(target.name)打开项目；点箭头切换应用")
     }
 }
